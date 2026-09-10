@@ -8,39 +8,56 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
+
+type ProxyOrigDst struct {
+	_    structs.HostLayout
+	Ip   uint32
+	Port uint16
+	_    [2]byte
+}
+
+type ProxyTupleKey struct {
+	_    structs.HostLayout
+	Ip   uint32
+	Port uint16
+	_    [2]byte
+}
 
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	proxyProgCgroupConnect4 = "cgroup_connect4"
+	ProxyMapOrigdstByCookie = "origdst_by_cookie"
+	ProxyMapOrigdstByTuple  = "origdst_by_tuple"
+	ProxyProgCgroupConnect4 = "cgroup_connect4"
 )
 
-// loadProxy returns the embedded CollectionSpec for proxy.
-func loadProxy() (*ebpf.CollectionSpec, error) {
+// LoadProxy returns the embedded CollectionSpec for Proxy.
+func LoadProxy() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_ProxyBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("can't load proxy: %w", err)
+		return nil, fmt.Errorf("can't load Proxy: %w", err)
 	}
 
 	return spec, err
 }
 
-// loadProxyObjects loads proxy and converts it into a struct.
+// LoadProxyObjects loads Proxy and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
-//	*proxyObjects
-//	*proxyPrograms
-//	*proxyMaps
+//	*ProxyObjects
+//	*ProxyPrograms
+//	*ProxyMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadProxyObjects(obj any, opts *ebpf.CollectionOptions) error {
-	spec, err := loadProxy()
+func LoadProxyObjects(obj any, opts *ebpf.CollectionOptions) error {
+	spec, err := LoadProxy()
 	if err != nil {
 		return err
 	}
@@ -48,74 +65,81 @@ func loadProxyObjects(obj any, opts *ebpf.CollectionOptions) error {
 	return spec.LoadAndAssign(obj, opts)
 }
 
-// proxySpecs contains maps and programs before they are loaded into the kernel.
+// ProxySpecs contains maps and programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type proxySpecs struct {
-	proxyProgramSpecs
-	proxyMapSpecs
-	proxyVariableSpecs
+type ProxySpecs struct {
+	ProxyProgramSpecs
+	ProxyMapSpecs
+	ProxyVariableSpecs
 }
 
-// proxyProgramSpecs contains programs before they are loaded into the kernel.
+// ProxyProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type proxyProgramSpecs struct {
+type ProxyProgramSpecs struct {
 	CgroupConnect4 *ebpf.ProgramSpec `ebpf:"cgroup_connect4"`
 }
 
-// proxyMapSpecs contains maps before they are loaded into the kernel.
+// ProxyMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type proxyMapSpecs struct {
+type ProxyMapSpecs struct {
+	OrigdstByCookie *ebpf.MapSpec `ebpf:"origdst_by_cookie"`
+	OrigdstByTuple  *ebpf.MapSpec `ebpf:"origdst_by_tuple"`
 }
 
-// proxyVariableSpecs contains global variables before they are loaded into the kernel.
+// ProxyVariableSpecs contains global variables before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
-type proxyVariableSpecs struct {
+type ProxyVariableSpecs struct {
 }
 
-// proxyObjects contains all objects after they have been loaded into the kernel.
+// ProxyObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
-type proxyObjects struct {
-	proxyPrograms
-	proxyMaps
-	proxyVariables
+// It can be passed to LoadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
+type ProxyObjects struct {
+	ProxyPrograms
+	ProxyMaps
+	ProxyVariables
 }
 
-func (o *proxyObjects) Close() error {
+func (o *ProxyObjects) Close() error {
 	return _ProxyClose(
-		&o.proxyPrograms,
-		&o.proxyMaps,
+		&o.ProxyPrograms,
+		&o.ProxyMaps,
 	)
 }
 
-// proxyMaps contains all maps after they have been loaded into the kernel.
+// ProxyMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
-type proxyMaps struct {
+// It can be passed to LoadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
+type ProxyMaps struct {
+	OrigdstByCookie *ebpf.Map `ebpf:"origdst_by_cookie"`
+	OrigdstByTuple  *ebpf.Map `ebpf:"origdst_by_tuple"`
 }
 
-func (m *proxyMaps) Close() error {
-	return _ProxyClose()
+func (m *ProxyMaps) Close() error {
+	return _ProxyClose(
+		m.OrigdstByCookie,
+		m.OrigdstByTuple,
+	)
 }
 
-// proxyVariables contains all global variables after they have been loaded into the kernel.
+// ProxyVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
-type proxyVariables struct {
+// It can be passed to LoadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
+type ProxyVariables struct {
 }
 
-// proxyPrograms contains all programs after they have been loaded into the kernel.
+// ProxyPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
-type proxyPrograms struct {
+// It can be passed to LoadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
+type ProxyPrograms struct {
 	CgroupConnect4 *ebpf.Program `ebpf:"cgroup_connect4"`
 }
 
-func (p *proxyPrograms) Close() error {
+func (p *ProxyPrograms) Close() error {
 	return _ProxyClose(
 		p.CgroupConnect4,
 	)
