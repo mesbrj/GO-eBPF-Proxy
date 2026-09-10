@@ -48,7 +48,7 @@ func serveRelay(t *testing.T, r *Resolver) *net.TCPAddr {
 // IT-01.9: the relay resolves the original destination and raw-pipes bytes intact.
 func TestRelay_ResolvesAndPipesIntact(t *testing.T) {
 	up := startEcho(t)
-	od, err := ebpfpkg.OrigDst(netip.MustParseAddr("127.0.0.1"), uint16(up.Port))
+	od, err := ebpfpkg.OrigDst(netip.MustParseAddr("127.0.0.1"), uint16(up.Port)) // #nosec G115 -- TCPAddr.Port is always 0-65535
 	require.NoError(t, err)
 
 	r := NewResolver(&stubLookuper{script: []error{nil}, val: od}, WithRetry(0, 0))

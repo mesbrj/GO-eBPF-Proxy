@@ -16,9 +16,9 @@ import (
 	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
 )
 
-// loadTlsKeylogOrSkip loads the uprobe program's objects with a temp bpffs pin
+// loadTLSKeylogOrSkip loads the uprobe program's objects with a temp bpffs pin
 // dir, skipping (not failing) when the environment is unprivileged.
-func loadTlsKeylogOrSkip(t *testing.T) *bpf.TlsKeylogObjects {
+func loadTLSKeylogOrSkip(t *testing.T) *bpf.TlsKeylogObjects {
 	t.Helper()
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("cannot remove memlock (needs privilege): %v", err)
@@ -44,7 +44,7 @@ func loadTlsKeylogOrSkip(t *testing.T) *bpf.TlsKeylogObjects {
 // IT-02.1/IT-02.2 (load/verify precondition): the uprobe program loads, passes
 // the kernel verifier, and its maps have the expected types/sizes.
 func TestTlsKeylog_LoadsWithExpectedMapsAndProgType(t *testing.T) {
-	objs := loadTlsKeylogOrSkip(t)
+	objs := loadTLSKeylogOrSkip(t)
 
 	require.NotNil(t, objs.UprobeTlsKeylog)
 	assert.Equal(t, ciliumebpf.Kprobe, objs.UprobeTlsKeylog.Type())
@@ -62,10 +62,10 @@ func TestTlsKeylog_LoadsWithExpectedMapsAndProgType(t *testing.T) {
 // not stable ABI) plus CAP_BPF/CAP_PERFMON. That end-to-end path is exercised
 // in the Feature 03 harness where the target build's offsets are supplied.
 func TestTlsKeylog_ConfigWiring(t *testing.T) {
-	objs := loadTlsKeylogOrSkip(t)
+	objs := loadTLSKeylogOrSkip(t)
 
 	cfg := bpf.TlsKeylogTlsConfig{
-		TargetPid:       uint32(os.Getpid()),
+		TargetPid:       uint32(os.Getpid()), // #nosec G115 -- PIDs fit in uint32 on Linux
 		ClientRandomOff: 0,
 		SecretCount:     1,
 		TlsVersion:      0x0304,
