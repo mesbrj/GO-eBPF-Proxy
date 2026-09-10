@@ -113,6 +113,9 @@ func scanMaps(mapsPath, soName string) (string, error) {
 			return path, nil
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("keylog: read %q: %w", mapsPath, err)
+	}
 	return "", ErrLibraryNotFound
 }
 
@@ -137,6 +140,9 @@ func scanLdConfig(lister func() ([]byte, error), soName string) (string, error) 
 		if strings.HasPrefix(m[1], soName) {
 			return m[2], nil
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("keylog: scan ldconfig output: %w", err)
 	}
 	return "", ErrLibraryNotFound
 }
