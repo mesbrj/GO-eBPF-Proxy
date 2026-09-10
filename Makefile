@@ -5,7 +5,7 @@ fmt:
 .PHONY: fmt
 
 lint: fmt
-	golangci-lint run --timeout=5m --enable=errcheck,staticcheck,govet,ineffassign,unused,gosec,revive,bodyclose,misspell
+	golangci-lint run --timeout=5m --build-tags=integration --enable=errcheck,staticcheck,govet,ineffassign,unused,gosec,revive,bodyclose,misspell
 .PHONY: lint
 
 vet: fmt
