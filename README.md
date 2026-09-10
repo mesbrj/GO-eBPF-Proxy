@@ -88,15 +88,15 @@ MVP delivered in three vertical slices:
 | --- | --- | --- |
 | M1 | eBPF transparent redirect (`connect4` + `sockops` + pass-through relay) | ✅ Done |
 | M2 | Uprobe TLS keylog extraction (OpenSSL) | ✅ Done |
-| M3 | Capture harness (pcapng + Podman dev harness + decrypt validation) | ⏳ Planned |
+| M3 | Capture (pcapng + Podman dev environment + decrypt validation) | ⏳ Planned |
 
 ## Requirements
 
 - Linux kernel ≥ 5.10 (BTF/CO-RE, uprobes, BPF ring buffer)
 - `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON`
 - Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs)
-- Rootful Podman (dev harness); a shared PID namespace is required so the sidecar can
-  resolve and attach uprobes to the app's TLS library
+- Rootful Podman (local dev setup); a shared PID namespace is required so the sidecar
+  can resolve and attach uprobes to the app's TLS library
 
 ## Build & test
 
@@ -125,7 +125,7 @@ internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
 internal/keylog/ TLS library discovery, uprobe attach, NSS keylog extraction/writer
 internal/shared/ structured logging, shared infra
 cmd/app/         sidecar entrypoint (wires loader, relay, keylog)
-deploy/podman/   rootful Podman dev harness
+deploy/podman/   rootful Podman dev environment (pod scripts)
 ```
 
 ## Out of scope (MVP)
