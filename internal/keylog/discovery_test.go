@@ -29,8 +29,8 @@ func realLibssl(t *testing.T) string {
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
-	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 }
 
 // UT-02.7: --libssl override is honoured verbatim.
@@ -85,7 +85,7 @@ func TestResolveLibssl_FromLdConfigFallback(t *testing.T) {
 func TestResolveLibssl_StaticBinaryFallsBackToExecutable(t *testing.T) {
 	procRoot := t.TempDir()
 	pidDir := filepath.Join(procRoot, "99")
-	require.NoError(t, os.MkdirAll(pidDir, 0o755))
+	require.NoError(t, os.MkdirAll(pidDir, 0o750))
 	writeFile(t, filepath.Join(pidDir, "maps"), "7f0000000000-7f0000020000 r--p 00000000 08:01 1 /usr/lib/x86_64-linux-gnu/libc.so.6\n")
 	// Symlink exe -> some real file so os.Lstat succeeds.
 	target := filepath.Join(procRoot, "target-bin")

@@ -95,7 +95,7 @@ func resolveLibrary(cfg DiscoveryConfig, soName string) (string, error) {
 // scanMaps looks for a mapped library whose basename starts with soName in a
 // /proc/<pid>/maps-formatted file.
 func scanMaps(mapsPath, soName string) (string, error) {
-	f, err := os.Open(mapsPath)
+	f, err := os.Open(mapsPath) // #nosec G304 -- mapsPath is built from a controlled proc root + pid, not raw user input
 	if err != nil {
 		return "", ErrLibraryNotFound
 	}
