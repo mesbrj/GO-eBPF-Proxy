@@ -2,9 +2,10 @@
 AGENTS.md
 .github
 .specs
-docs/prd
-docs/feasibility-study.md
 docs/technical-design-document.md
+docs/prd/feature-*.md
+docs/prd/product-requirements-document.md
+docs/feasibility-study.md
 
 # Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
 bpf/vmlinux.h

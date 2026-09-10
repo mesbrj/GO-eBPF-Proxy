@@ -130,9 +130,13 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 
 ## Out of scope (MVP)
 
-MITM TLS termination and a forging CA; `sockmap`/`sk_msg` acceleration; IPv6
-(`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band DPI; the TUI;
-TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
+`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band DPI; the TUI; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
+
+## Skills reference
+
+- [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/): Plan and implement the features.
+- [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/): Create (and maintain) the technical design document based on previous researches, decisions and plans.
+- [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior): Manage and track the human tasks/activities.
 
 ## License
 
