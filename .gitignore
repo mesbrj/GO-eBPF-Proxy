@@ -33,3 +33,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
+bpf/vmlinux.h
