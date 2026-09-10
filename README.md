@@ -43,6 +43,43 @@ flowchart LR
     uprobe -- "secret events" --> keylog["keylog consumer<br/>-> NSS keylog"]
 ```
 
+## Pod view
+
+`go-ebpf-proxy` runs as a second container in the same pod as the target app, sharing its
+network, PID, and (host) cgroup namespaces. **Any app container that links OpenSSL's
+`libssl` gets transparent redirection and TLS key extraction with zero changes** — no
+code change, no rebuild, no env var, no trust-store edit. The app container doesn't even
+need to know the sidecar exists.
+
+```mermaid
+flowchart TB
+    subgraph pod["Pod (shared netns + PID ns + host cgroup ns)"]
+        subgraph appc["app container — unmodified, any OpenSSL-linked binary"]
+            app["app process<br/>connect(dst:443)"]
+            libssl["libssl (TLS 1.2/1.3)"]
+        end
+        subgraph sidecar["go-ebpf-proxy container (UID 1337)"]
+            loader["eBPF loader"]
+            relay["pass-through relay<br/>127.0.0.1:15001"]
+            keylog["keylog consumer"]
+        end
+    end
+    kernel["Kernel: connect4 + sockops + uprobe<br/>(attached at the pod's common parent cgroup)"]
+
+    app -- "connect() intercepted" --> kernel
+    kernel -- "redirect to relay" --> relay
+    libssl -. "handshake secrets read via uprobe" .-> kernel
+    kernel -- "secret events" --> keylog
+    loader -. "attach cgroup programs + uprobe(libssl)" .-> kernel
+    relay == "raw pipe (real cert validated by the app)" ==> upstream["Upstream server"]
+    keylog -. "NSS keylog (tmpfs)" .-> disk[("/var/log/sidecar")]
+```
+
+Swap in a different app container image — same or different language, any process that
+links `libssl` — and the sidecar keeps working unchanged: the `connect4`/`sockops`
+programs redirect at the socket layer regardless of what wrote the syscall, and the
+uprobe attaches to the *library*, not to any particular app binary.
+
 ## Status
 
 MVP delivered in three vertical slices:
