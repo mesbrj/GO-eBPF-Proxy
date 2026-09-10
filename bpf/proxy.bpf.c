@@ -77,3 +77,28 @@ int cgroup_connect4(struct bpf_sock_addr *ctx)
 
 	return 1;
 }
+
+SEC("sockops")
+int sockops_prog(struct bpf_sock_ops *ctx)
+{
+	/* Only act once the source port is assigned, before SYN. */
+	if (ctx->op != BPF_SOCK_OPS_TCP_CONNECT_CB)
+		return 0;
+
+	/* Join on the socket cookie set by connect4. */
+	__u64 cookie = bpf_get_socket_cookie(ctx);
+	struct orig_dst *od = bpf_map_lookup_elem(&origdst_by_cookie, &cookie);
+	if (!od)
+		return 0;
+
+	/* Re-key by (src_ip, src_port). local_ip4 is network order; local_port
+	 * is host order (kernel convention) — matching the byte-order contract. */
+	struct tuple_key key = {};
+	key.ip = ctx->local_ip4;
+	key.port = (__u16)ctx->local_port;
+
+	bpf_map_update_elem(&origdst_by_tuple, &key, od, BPF_ANY);
+	bpf_map_delete_elem(&origdst_by_cookie, &cookie);
+
+	return 0;
+}

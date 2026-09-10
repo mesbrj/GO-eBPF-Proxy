@@ -34,6 +34,7 @@ const (
 	ProxyMapOrigdstByCookie = "origdst_by_cookie"
 	ProxyMapOrigdstByTuple  = "origdst_by_tuple"
 	ProxyProgCgroupConnect4 = "cgroup_connect4"
+	ProxyProgSockopsProg    = "sockops_prog"
 )
 
 // LoadProxy returns the embedded CollectionSpec for Proxy.
@@ -79,6 +80,7 @@ type ProxySpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type ProxyProgramSpecs struct {
 	CgroupConnect4 *ebpf.ProgramSpec `ebpf:"cgroup_connect4"`
+	SockopsProg    *ebpf.ProgramSpec `ebpf:"sockops_prog"`
 }
 
 // ProxyMapSpecs contains maps before they are loaded into the kernel.
@@ -137,11 +139,13 @@ type ProxyVariables struct {
 // It can be passed to LoadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ProxyPrograms struct {
 	CgroupConnect4 *ebpf.Program `ebpf:"cgroup_connect4"`
+	SockopsProg    *ebpf.Program `ebpf:"sockops_prog"`
 }
 
 func (p *ProxyPrograms) Close() error {
 	return _ProxyClose(
 		p.CgroupConnect4,
+		p.SockopsProg,
 	)
 }
 
