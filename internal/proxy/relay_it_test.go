@@ -3,9 +3,11 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -76,11 +78,25 @@ func TestRelay_FailsClosedOnMiss(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 
+	// Write a payload: on a fail-open forward it would reach a default upstream
+	// and (for an echo) come back; the fail-closed relay must never echo it.
+	payload := []byte("must-not-be-forwarded")
+	_, _ = c.Write(payload)
+
 	require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
-	buf := make([]byte, 8)
-	n, err := c.Read(buf)
-	assert.Equal(t, 0, n, "no data may be forwarded on a miss")
-	assert.Error(t, err, "relay must close/RST the connection")
+	buf := make([]byte, len(payload))
+	n, rerr := c.Read(buf)
+	assert.Equal(t, 0, n, "no bytes may be forwarded/echoed on a miss")
+	require.Error(t, rerr, "relay must close the connection")
+
+	// Discriminate fail-closed from fail-open: a relay that kept the connection
+	// open (piping to a default) would time out here, not error with a reset.
+	var ne net.Error
+	if errors.As(rerr, &ne) {
+		assert.False(t, ne.Timeout(), "connection must be actively reset, not left open")
+	}
+	// The relay resets via SetLinger(0)+Close, so the peer observes ECONNRESET.
+	assert.ErrorIs(t, rerr, syscall.ECONNRESET, "fail-closed must RST (got %v)", rerr)
 
 	assert.Eventually(t, func() bool { return r.Misses() == 1 }, time.Second, 10*time.Millisecond,
 		"a definitive miss must be recorded")
