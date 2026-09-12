@@ -1,5 +1,3 @@
-// Package capture: tshark pairing helper for offline decryption of a
-// capture file against its paired NSS keylog.
 package capture
 
 import (

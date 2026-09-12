@@ -102,7 +102,7 @@ func TestCleanup_RetainPreservesArtifacts(t *testing.T) {
 // UT-03.6: a group/other-accessible directory is refused as a write target.
 func TestCheckTarget_RefusesWorldAccessibleDir(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.Chmod(dir, 0o755))
+	require.NoError(t, os.Chmod(dir, 0o755)) // #nosec G302 -- deliberately world-accessible to test CheckTarget's refusal
 
 	err := CheckTarget(dir)
 	assert.ErrorIs(t, err, ErrWorldAccessibleTarget)

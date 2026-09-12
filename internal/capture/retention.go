@@ -1,5 +1,3 @@
-// Package capture: bounded, secret-grade retention for capture/keylog
-// artifacts (AD-006: they are plaintext-equivalent secrets).
 package capture
 
 import (

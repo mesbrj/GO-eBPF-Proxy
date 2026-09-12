@@ -1,5 +1,3 @@
-// Package capture: tcpdump fallback/parity backend, plus the in-process
-// gopacket live-capture path Start falls back to when tcpdump is absent.
 package capture
 
 import (

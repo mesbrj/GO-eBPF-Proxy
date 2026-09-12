@@ -1,6 +1,3 @@
-// Package capture: pcapng writer with an embedded TLS Decryption Secrets
-// Block (DSB), so the capture file self-decrypts in tshark/Wireshark without
-// a separate keylog file (AD-005).
 package capture
 
 import (
