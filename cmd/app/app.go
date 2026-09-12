@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/keylog"
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/proxy"
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
 
 // Config configures one run of the sidecar: eBPF redirect + relay, uprobe
@@ -96,7 +98,10 @@ func Start(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("app: listen %q: %w", cfg.RelayListen, err)
 	}
 	a.ln = ln
-	relay := proxy.NewRelay(proxy.NewResolver(loader.OrigDstByTuple()))
+	log := logger.New(os.Stderr)
+	relay := proxy.NewRelay(proxy.NewResolver(loader.OrigDstByTuple()), proxy.WithOnResolved(func(dst netip.AddrPort) {
+		log.Info("connection relayed", map[string]any{"orig_dst": dst.String()})
+	}))
 	go func() { _ = relay.Serve(ln) }()
 
 	layout, err := keylog.Offsets(cfg.OpenSSLVer)

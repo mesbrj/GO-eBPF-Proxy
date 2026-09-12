@@ -15,6 +15,7 @@ type Relay struct {
 	resolver    *Resolver
 	dialTimeout time.Duration
 	onDialErr   func(error)
+	onResolved  func(dst netip.AddrPort)
 }
 
 // RelayOption configures a Relay.
@@ -28,6 +29,13 @@ func WithDialTimeout(d time.Duration) RelayOption {
 // WithOnDialErr registers a callback for upstream dial failures.
 func WithOnDialErr(fn func(error)) RelayOption {
 	return func(r *Relay) { r.onDialErr = fn }
+}
+
+// WithOnResolved registers a callback invoked with the original destination
+// on every successful resolve, before dialing -- the hook operators use to
+// log the correct original destination per connection.
+func WithOnResolved(fn func(dst netip.AddrPort)) RelayOption {
+	return func(r *Relay) { r.onResolved = fn }
 }
 
 // NewRelay builds a Relay backed by the given resolver.
@@ -70,6 +78,9 @@ func (rl *Relay) handle(client net.Conn) {
 	if err != nil {
 		rl.reset(client) // fail-closed: never forward to a default
 		return
+	}
+	if rl.onResolved != nil {
+		rl.onResolved(dst)
 	}
 
 	upstream, err := net.DialTimeout("tcp", dst.String(), rl.dialTimeout)
