@@ -6,6 +6,7 @@ package podman
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,7 +38,7 @@ func buildSidecarBinary(t *testing.T) string {
 	repoRoot := filepath.Join(wd, "..", "..")
 
 	bin := filepath.Join(t.TempDir(), "app")
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/app")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/app") // #nosec G204 -- bin is a test-generated temp path, not external input
 	cmd.Dir = repoRoot
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "build sidecar binary: %s", out)
@@ -59,7 +60,7 @@ type podmanInspect struct {
 
 func inspectContainer(t *testing.T, name string) podmanInspect {
 	t.Helper()
-	out, err := exec.Command("podman", "inspect", name).Output()
+	out, err := exec.Command("podman", "inspect", name).Output() // #nosec G204 -- name is a test-generated container name, not external input
 	require.NoError(t, err)
 	var arr []podmanInspect
 	require.NoError(t, json.Unmarshal(out, &arr))
@@ -81,9 +82,50 @@ func podUp(t *testing.T, podName, sidecarBin string) {
 	})
 }
 
+// podCgroupPath resolves the pod's common parent cgroup path the way
+// pod-up.sh does, for asserting bpftool attachment against the same path.
+func podCgroupPath(t *testing.T, podName string) string {
+	t.Helper()
+	out, err := exec.Command("podman", "pod", "inspect", podName, "--format", "{{.CgroupPath}}").Output() // #nosec G204 -- podName is a test-generated pod name, not external input
+	require.NoError(t, err)
+	return "/sys/fs/cgroup" + strings.TrimSpace(string(out))
+}
+
+// bpftoolCgroupTree returns `bpftool cgroup tree <path>` output listing every
+// program attached at or under path.
+func bpftoolCgroupTree(t *testing.T, cgroupPath string) string {
+	t.Helper()
+	out, err := exec.Command("bpftool", "cgroup", "tree", cgroupPath).Output() // #nosec G204 -- cgroupPath is resolved from podman's own output, not external input
+	require.NoError(t, err, "bpftool cgroup tree %s", cgroupPath)
+	return string(out)
+}
+
+// bpftoolLinkList returns `bpftool link list -j`, one entry per attached link
+// (used to confirm the uprobe landed on the resolved libssl).
+func bpftoolLinkList(t *testing.T) []map[string]any {
+	t.Helper()
+	out, err := exec.Command("bpftool", "-j", "link", "list").Output()
+	require.NoError(t, err, "bpftool link list")
+	var links []map[string]any
+	require.NoError(t, json.Unmarshal(out, &links))
+	return links
+}
+
+// tupleMapEntryCount counts the entries in the pinned origdst_by_tuple map --
+// the observable signal for whether connect4 redirected (and recorded) a
+// given outbound connection.
+func tupleMapEntryCount(t *testing.T, pinDir string) int {
+	t.Helper()
+	out, err := exec.Command("bpftool", "-j", "map", "dump", "pinned", filepath.Join(pinDir, "origdst_by_tuple")).Output() // #nosec G204 -- pinDir is a compiled-in constant, not external input
+	require.NoError(t, err, "bpftool map dump pinned origdst_by_tuple")
+	var entries []json.RawMessage
+	require.NoError(t, json.Unmarshal(out, &entries))
+	return len(entries)
+}
+
 // IT-03.4: the pod comes up healthy with the required namespaces, caps, and
-// mounts -- the precondition for connect4/sockops attach at the pod parent
-// cgroup and uprobes on the app's libssl.
+// mounts; connect4/sockops are attached at the pod parent cgroup, their maps
+// are pinned, and the uprobe is attached to the app's libssl.
 func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
@@ -99,11 +141,41 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 
 	app := inspectContainer(t, podName+"-app")
 	assert.Equal(t, "running", app.State.Status, "app container must be running")
+
+	// Maps pinned (host-visible: /sys/fs/bpf is bind-mounted into the sidecar
+	// at the same path). cmd/app's compiled-in defaults are used since
+	// pod-up.sh does not override --pin-dir/--keylog-pin-dir.
+	for _, pin := range []string{
+		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_cookie",
+		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_tuple",
+		"/sys/fs/bpf/go-ebpf-proxy-keylog/secrets_rb",
+		"/sys/fs/bpf/go-ebpf-proxy-keylog/tls_keylog_config",
+	} {
+		_, err := os.Stat(pin)
+		assert.NoErrorf(t, err, "pin %s must exist once the sidecar has loaded", pin)
+	}
+
+	// Programs attached at the pod's common parent cgroup.
+	tree := bpftoolCgroupTree(t, podCgroupPath(t, podName))
+	assert.Contains(t, tree, "cgroup_connect4", "connect4 must be attached at the pod parent cgroup")
+	assert.Contains(t, tree, "sockops_prog", "sockops must be attached at the pod parent cgroup")
+
+	// Uprobe attached to the app's libssl.
+	var sawUprobe bool
+	for _, l := range bpftoolLinkList(t) {
+		if l["type"] == "perf_event" || strings.Contains(strings.ToLower(fmt.Sprint(l["type"])), "uprobe") {
+			sawUprobe = true
+			break
+		}
+	}
+	assert.True(t, sawUprobe, "a uprobe link must be attached to the app's libssl")
 }
 
-// IT-03.8: the sidecar's own egress runs as UID 1337 -- the identity
-// connect4 skips for loop avoidance (AD-002).
-func TestPodUp_SidecarRunsAsUID1337(t *testing.T) {
+// IT-03.8: the sidecar's own egress (UID 1337) is never redirected by
+// connect4, while the app container's egress (any other UID) is -- the
+// tuple map only gains an entry for the latter. This is the behavioral proof
+// of AD-002's loop avoidance, not just the UID precondition.
+func TestPodUp_SidecarEgressNotRedirected(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
 	podName := "go-ebpf-proxy-it8"
@@ -112,4 +184,18 @@ func TestPodUp_SidecarRunsAsUID1337(t *testing.T) {
 	out, err := exec.Command("podman", "exec", podName+"-sidecar", "id", "-u").Output()
 	require.NoError(t, err)
 	assert.Equal(t, "1337", strings.TrimSpace(string(out)), "sidecar's own processes must run as UID 1337")
+
+	pinDir := "/sys/fs/bpf/go-ebpf-proxy"
+	// TEST-NET-3 (RFC 5737): reserved, never routed; connect4 fires on the
+	// connect() syscall regardless of reachability, so no real traffic is sent.
+	const probe = "http://203.0.113.1/"
+
+	before := tupleMapEntryCount(t, pinDir)
+	_ = exec.Command("podman", "exec", podName+"-sidecar", "wget", "--timeout=2", "-qO-", probe).Run()
+	afterSidecar := tupleMapEntryCount(t, pinDir)
+	assert.Equal(t, before, afterSidecar, "the sidecar's own (UID 1337) egress must not be redirected/recorded")
+
+	_ = exec.Command("podman", "exec", podName+"-app", "wget", "--timeout=2", "-qO-", probe).Run()
+	afterApp := tupleMapEntryCount(t, pinDir)
+	assert.Greater(t, afterApp, afterSidecar, "the app container's egress (non-1337 UID) must be redirected and recorded")
 }

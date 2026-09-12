@@ -53,7 +53,7 @@ func runSmoke(t *testing.T, podName string) string {
 // dump.pcapng (the volume, unlike the keylog tmpfs, is host-visible).
 func volumeCapturePath(t *testing.T, podName string) string {
 	t.Helper()
-	out, err := exec.Command("podman", "volume", "inspect", podName+"-sidecar-logs", "--format", "{{.Mountpoint}}").Output()
+	out, err := exec.Command("podman", "volume", "inspect", podName+"-sidecar-logs", "--format", "{{.Mountpoint}}").Output() // #nosec G204 -- podName is a test-generated pod name, not external input
 	require.NoError(t, err)
 	return filepath.Join(strings.TrimSpace(string(out)), "dump.pcapng")
 }
@@ -61,7 +61,7 @@ func volumeCapturePath(t *testing.T, podName string) string {
 // execFileSize returns the size of path inside container, or 0 if it does
 // not exist yet (the keylog lives on the sidecar's tmpfs, not host-visible).
 func execFileSize(container, path string) int64 {
-	out, err := exec.Command("podman", "exec", container, "stat", "-c%s", path).Output()
+	out, err := exec.Command("podman", "exec", container, "stat", "-c%s", path).Output() // #nosec G204 -- container/path are test-generated, not external input
 	if err != nil {
 		return 0
 	}
@@ -125,7 +125,7 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 
 	// Copy the tmpfs keylog out to a host-visible path for tshark pairing.
 	hostKeylogPath := filepath.Join(t.TempDir(), "sslkeylog.log")
-	cpOut, err := exec.Command("podman", "cp", sidecar+":"+keylogPathInContainer, hostKeylogPath).CombinedOutput()
+	cpOut, err := exec.Command("podman", "cp", sidecar+":"+keylogPathInContainer, hostKeylogPath).CombinedOutput() // #nosec G204 -- sidecar/path are test-generated, not external input
 	require.NoError(t, err, "podman cp keylog: %s", cpOut)
 
 	out, err := capture.DecryptedAppData(capturePath, hostKeylogPath, "http")
