@@ -1,11 +1,12 @@
 # Project harness and specs
-AGENTS.md
 .github
-.specs
-docs/technical-design-document.md
-docs/prd/feature-*.md
-docs/prd/product-requirements-document.md
 docs/feasibility-study.md
+#AGENTS.md
+#.specs
+#docs/technical-design-document.md
+#docs/prd/feature-*.md
+#docs/prd/product-requirements-document.md
+
 
 # Local editor lint config
 /.markdownlint.json
