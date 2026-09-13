@@ -138,6 +138,7 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_BPF")
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_NET_ADMIN")
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_PERFMON")
+	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_SYS_RESOURCE", "needed for cilium/ebpf's RLIMIT_MEMLOCK raise on load")
 
 	app := inspectContainer(t, podName+"-app")
 	assert.Equal(t, "running", app.State.Status, "app container must be running")

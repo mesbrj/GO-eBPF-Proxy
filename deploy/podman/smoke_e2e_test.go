@@ -91,7 +91,7 @@ func TestSmoke_RealCertRequestSucceedsAndArtifactsGrow(t *testing.T) {
 	capturePath := volumeCapturePath(t, podName)
 	sizeBefore := fileSizeOrZero(capturePath)
 	sidecar := podName + "-sidecar"
-	keylogPath := "/var/log/sidecar/keylog/sslkeylog.log"
+	keylogPath := "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log"
 
 	out := runSmoke(t, podName)
 	assert.Contains(t, out, "HTTP 200", "curl (no -k) must succeed end-to-end, validating the real cert")
@@ -119,7 +119,7 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 
 	capturePath := volumeCapturePath(t, podName)
 	sidecar := podName + "-sidecar"
-	keylogPathInContainer := "/var/log/sidecar/keylog/sslkeylog.log"
+	keylogPathInContainer := "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log"
 	require.Eventually(t, func() bool { return execFileSize(sidecar, keylogPathInContainer) > 0 },
 		5*time.Second, 100*time.Millisecond, "keylog must be populated before offline validation")
 

@@ -22,6 +22,10 @@ done
 
 podman pod rm -f "$POD_NAME" >/dev/null 2>&1 || true
 
+# A crashed/killed sidecar may not have run its own graceful pin cleanup;
+# these bpffs pin dirs are pod-up.sh's compiled-in defaults, safe to remove.
+rm -rf /sys/fs/bpf/go-ebpf-proxy /sys/fs/bpf/go-ebpf-proxy-keylog 2>/dev/null || true
+
 if [[ "$RETAIN" == "1" ]]; then
   echo "pod-down: --retain set, keeping volume $LOG_VOLUME"
 else

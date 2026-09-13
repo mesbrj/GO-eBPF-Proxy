@@ -10,6 +10,9 @@ docs/feasibility-study.md
 # Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
 bpf/vmlinux.h
 
+# Locally built sidecar binary (deploy/podman/pod-up.sh expects bin/app)
+/bin/
+
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
