@@ -6,7 +6,6 @@ package podman
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,7 +47,8 @@ func buildSidecarBinary(t *testing.T) string {
 // podmanInspect is the subset of `podman inspect <container>` this suite reads.
 type podmanInspect struct {
 	Config struct {
-		User string `json:"User"`
+		User string   `json:"User"`
+		Env  []string `json:"Env"`
 	} `json:"Config"`
 	HostConfig struct {
 		CapAdd []string `json:"CapAdd"`
@@ -100,17 +100,6 @@ func bpftoolCgroupTree(t *testing.T, cgroupPath string) string {
 	return string(out)
 }
 
-// bpftoolLinkList returns `bpftool link list -j`, one entry per attached link
-// (used to confirm the uprobe landed on the resolved libssl).
-func bpftoolLinkList(t *testing.T) []map[string]any {
-	t.Helper()
-	out, err := exec.Command("bpftool", "-j", "link", "list").Output()
-	require.NoError(t, err, "bpftool link list")
-	var links []map[string]any
-	require.NoError(t, json.Unmarshal(out, &links))
-	return links
-}
-
 // tupleMapEntryCount counts the entries in the pinned origdst_by_tuple map --
 // the observable signal for whether connect4 redirected (and recorded) a
 // given outbound connection.
@@ -125,7 +114,7 @@ func tupleMapEntryCount(t *testing.T, pinDir string) int {
 
 // IT-03.4: the pod comes up healthy with the required namespaces, caps, and
 // mounts; connect4/sockops are attached at the pod parent cgroup, their maps
-// are pinned, and the uprobe is attached to the app's libssl.
+// are pinned, and the app container carries the LD_PRELOAD keylog interposer.
 func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
@@ -137,20 +126,17 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	assert.Equal(t, "1337:1337", sidecar.Config.User, "sidecar must run entirely as UID 1337")
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_BPF")
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_NET_ADMIN")
-	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_PERFMON")
 	assert.Contains(t, sidecar.HostConfig.CapAdd, "CAP_SYS_RESOURCE", "needed for cilium/ebpf's RLIMIT_MEMLOCK raise on load")
 
 	app := inspectContainer(t, podName+"-app")
 	assert.Equal(t, "running", app.State.Status, "app container must be running")
 
 	// Maps pinned (host-visible: /sys/fs/bpf is bind-mounted into the sidecar
-	// at the same path). cmd/app's compiled-in defaults are used since
-	// pod-up.sh does not override --pin-dir/--keylog-pin-dir.
+	// at the same path). cmd/app's compiled-in default is used since pod-up.sh
+	// does not override --pin-dir.
 	for _, pin := range []string{
 		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_cookie",
 		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_tuple",
-		"/sys/fs/bpf/go-ebpf-proxy-keylog/secrets_rb",
-		"/sys/fs/bpf/go-ebpf-proxy-keylog/tls_keylog_config",
 	} {
 		_, err := os.Stat(pin)
 		assert.NoErrorf(t, err, "pin %s must exist once the sidecar has loaded", pin)
@@ -161,15 +147,16 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	assert.Contains(t, tree, "cgroup_connect4", "connect4 must be attached at the pod parent cgroup")
 	assert.Contains(t, tree, "sockops_prog", "sockops must be attached at the pod parent cgroup")
 
-	// Uprobe attached to the app's libssl.
-	var sawUprobe bool
-	for _, l := range bpftoolLinkList(t) {
-		if l["type"] == "perf_event" || strings.Contains(strings.ToLower(fmt.Sprint(l["type"])), "uprobe") {
-			sawUprobe = true
+	// LD_PRELOAD keylog interposer wired into the app container (AD-010: no
+	// uprobe attach, so this is the only TLS-key-extraction hook).
+	var sawLDPreload bool
+	for _, kv := range app.Config.Env {
+		if strings.HasPrefix(kv, "LD_PRELOAD=") {
+			sawLDPreload = true
 			break
 		}
 	}
-	assert.True(t, sawUprobe, "a uprobe link must be attached to the app's libssl")
+	assert.True(t, sawLDPreload, "the app container must be launched with an LD_PRELOAD env var set")
 }
 
 // IT-03.8: the sidecar's own egress (UID 1337) is never redirected by
