@@ -128,7 +128,7 @@ make generate
 
 ## Project layout
 
-```
+```text
 bpf/             eBPF C programs (connect4, sockops) + generated bindings
 internal/ebpf/   loader: load/attach/pin the eBPF programs, map codec
 internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
