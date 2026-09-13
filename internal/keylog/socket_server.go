@@ -141,6 +141,9 @@ func (s *SocketServer) handleConn(conn net.Conn) {
 			atomic.AddInt64(&s.rejected, 1)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		s.log.Warn("keylog: socket server connection read error", map[string]any{"error": err.Error()})
+	}
 }
 
 // RejectedCount reports how many malformed lines have been rejected so far.
