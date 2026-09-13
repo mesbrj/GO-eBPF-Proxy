@@ -2,9 +2,12 @@
 
 A sidecar that transparently redirects an unmodified application's outbound IPv4 TCP
 egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables`/NAT),
-and **passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
-its OpenSSL library — emitting an NSS-format keylog so the captured (still end-to-end
-encrypted) TLS 1.2/1.3 traffic can be decrypted and inspected offline.
+**passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
+its OpenSSL library, and **captures the same egress to a DSB-embedded pcapng** so the
+still end-to-end encrypted TLS 1.2/1.3 traffic can be decrypted and inspected offline
+with Wireshark/tshark. All three milestones (redirect, keylog, capture) are delivered —
+the Podman scripts under `deploy/podman/` bring up a complete, working app+sidecar pod
+end-to-end (see [Quick start](#quick-start)).
 
 **No TLS termination. No MITM. No CA.** The app's handshake stays end-to-end with the
 real server; its certificate validation is never weakened, so certificate pinning is a
@@ -33,16 +36,24 @@ socket layer, and TLS keys read passively from the process that already holds th
    secrets as the app's own libssl derives them, and ships each line over a Unix domain
    socket to the sidecar.
 5. The sidecar's socket server reads those lines, validates and deduplicates them, and
-   writes them as an NSS keylog (`/var/log/sidecar/sslkeylog.log`), which Wireshark/tshark
-   can pair with a capture of the same egress to show decrypted traffic.
+   writes them as an NSS keylog (on tmpfs, `0600`/`0700`).
+6. The sidecar also captures the relay's outbound leg to a pcapng file, embedding the
+   keylog as a Decryption Secrets Block on close — the capture is self-decrypting.
+   Retention is bounded (size + age caps) and ephemeral by default: pod teardown wipes
+   the capture directory unless `--retain` is set.
+7. Offline, `tshark`/Wireshark pairs the pcapng (or its embedded DSB) with the keylog to
+   show the app's real traffic in plaintext — proving the whole pipeline end-to-end.
 
 ```mermaid
 flowchart LR
     app["app process<br/>(unmodified, LD_PRELOAD set)"] -- "connect()" --> kern["connect4 + sockops<br/>(eBPF)"]
     kern -- "redirect" --> relay["pass-through relay<br/>127.0.0.1:15001"]
     relay -- "raw pipe (end-to-end TLS)" --> upstream["Upstream server"]
+    relay -. "outbound leg" .-> capture["capture writer<br/>pcapng, bounded + ephemeral"]
     app -. "libssl handshake" .-> interposer["LD_PRELOAD interposer<br/>(SSL_CTX_new + keylog callback)"]
     interposer -- "NSS lines over unix socket" --> keylog["keylog socket server<br/>-> NSS keylog"]
+    keylog -. "embedded as DSB on close" .-> capture
+    capture -- "dump.pcapng" --> tshark["tshark / Wireshark<br/>offline decrypt"]
 ```
 
 ## Pod view
@@ -66,6 +77,7 @@ flowchart TB
             loader["eBPF loader"]
             relay["pass-through relay<br/>127.0.0.1:15001"]
             keylog["keylog socket server"]
+            capture["capture writer<br/>pcapng + embedded DSB<br/>bounded, ephemeral retention"]
         end
     end
     kernel["Kernel: connect4 + sockops<br/>(attached at the pod's common parent cgroup)"]
@@ -76,7 +88,10 @@ flowchart TB
     interposer -- "NSS lines over<br/>shared unix socket volume" --> keylog
     loader -. "attach cgroup programs" .-> kernel
     relay == "raw pipe (real cert validated by the app)" ==> upstream["Upstream server"]
-    keylog -. "NSS keylog (tmpfs)" .-> disk[("/var/log/sidecar")]
+    relay -. "outbound leg" .-> capture
+    keylog -. "NSS keylog (tmpfs)" .-> capture
+    capture -- "dump.pcapng" --> disk[("/var/log/sidecar<br/>(host-visible volume)")]
+    disk -. "tshark -o tls.keylog_file:..." .-> decrypted(["decrypted plaintext"])
 ```
 
 Swap in a different app container image — same or different language, any process that
@@ -106,6 +121,39 @@ MVP delivered in three vertical slices:
 - Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs), a C
   compiler + OpenSSL headers (for building the `LD_PRELOAD` interposer)
 - Rootful Podman (local dev setup)
+- `tshark` (optional, only needed to run the offline decrypt step in [Quick start](#quick-start))
+
+## Quick start
+
+Brings up the real app+sidecar pod, proves a real end-to-end TLS 1.3 request through the
+relay, and decrypts the resulting capture offline — the complete M1+M2+M3 pipeline in
+one pass. Requires a rootful Linux host with `podman` (see Requirements above); the pod
+scripts must run as root.
+
+```bash
+# 1. Build the sidecar binary and the LD_PRELOAD interposer
+go build -o bin/app ./cmd/app
+make build-preload
+
+# 2. Bring up the pod: sidecar (eBPF redirect + keylog + capture) then the app,
+#    wired with LD_PRELOAD/GOEBPF_PRELOAD_SOCKET automatically
+sudo deploy/podman/pod-up.sh
+
+# 3. Prove it end-to-end: a real HTTPS request through the relay, real cert validated
+sudo deploy/podman/smoke.sh
+# smoke: https://example.com -> HTTP 200
+
+# 4. Decrypt the capture offline, pairing it with the interposer-emitted keylog
+podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
+tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')/dump.pcapng" \
+  -o "tls.keylog_file:/tmp/sslkeylog.log" -Y http
+
+# 5. Tear down — wipes /var/log/sidecar by default; add --retain to keep the capture/keylog
+sudo deploy/podman/pod-down.sh
+```
+
+`POD_NAME`, `APP_IMAGE`, `CAPTURE_IFACE` and friends are all overridable env vars on
+`pod-up.sh` (see the script header); the smoke test targets `URL=${URL:-https://example.com}`.
 
 ## Build & test
 
@@ -133,6 +181,7 @@ bpf/             eBPF C programs (connect4, sockops) + generated bindings
 internal/ebpf/   loader: load/attach/pin the eBPF programs, map codec
 internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
 internal/keylog/ keylog socket server, NSS keylog validation/writer, preload env builder
+internal/capture/ pcapng writer + embedded DSB, tcpdump fallback, tshark pairing, retention
 preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new, ships keylog lines
 internal/shared/ structured logging, shared infra
 cmd/app/         sidecar entrypoint (wires loader, relay, keylog socket server, capture)
