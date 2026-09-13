@@ -300,3 +300,32 @@ func TestPreload_NonOpenSSLBinary_NoCrashNoLines(t *testing.T) {
 	}
 	assert.Empty(t, string(data), "a binary that never calls SSL_CTX_new must emit no keylog lines")
 }
+
+// KEYLOG-08: when the interposer's socket is unreachable (no listener at
+// all), it must retry briefly then silently drop the line -- never block or
+// hang the app. No sidecar/socket server is started for this test at all;
+// the configured socket path never exists.
+func TestPreload_SocketUnreachable_ClientCompletesWithoutBlocking(t *testing.T) {
+	so := requirePreloadSO(t)
+
+	dir := t.TempDir()
+	certPath, keyPath := generateSelfSignedCert(t, dir)
+	addr, stop := startOpenSSLServer(t, certPath, keyPath, "-tls1_3")
+	defer stop()
+
+	unreachableSock := filepath.Join(dir, "sock", "nobody-listening.sock")
+
+	done := make(chan struct{})
+	go func() {
+		runOpenSSLClient(t, addr, "-tls1_3", PreloadEnv(so, unreachableSock))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Completed -- the bounded retry (3 attempts x 20ms backoff per
+		// secret) must never turn into an indefinite block.
+	case <-time.After(3 * time.Second):
+		t.Fatal("client did not complete within 3s; an unreachable keylog socket must never block the app")
+	}
+}
