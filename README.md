@@ -2,9 +2,9 @@
 
 A sidecar that transparently redirects an unmodified application's outbound IPv4 TCP
 egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables`/NAT),
-and **passively extracts the app's TLS session keys via eBPF uprobes** on its TLS
-library — emitting an NSS-format keylog so the captured (still end-to-end encrypted)
-TLS 1.2/1.3 traffic can be decrypted and inspected offline.
+and **passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
+its OpenSSL library — emitting an NSS-format keylog so the captured (still end-to-end
+encrypted) TLS 1.2/1.3 traffic can be decrypted and inspected offline.
 
 **No TLS termination. No MITM. No CA.** The app's handshake stays end-to-end with the
 real server; its certificate validation is never weakened, so certificate pinning is a
@@ -27,58 +27,67 @@ socket layer, and TLS keys read passively from the process that already holds th
    race-free after `accept()`.
 3. The Go relay resolves the original destination and raw-pipes bytes both directions —
    it never parses or terminates TLS.
-4. An eBPF uprobe on the app's TLS library (`libssl`) reads `client_random` and the TLS
-   1.2/1.3 session secrets as the library derives them, and streams them to user space
-   over a ring buffer.
-5. The secrets are validated, deduplicated, and written as an NSS keylog
-   (`/var/log/sidecar/sslkeylog.log`), which Wireshark/tshark can pair with a capture of
-   the same egress to show decrypted traffic.
+4. A small `LD_PRELOAD` interposer (`preload/libkeylogpreload.so`), loaded into the app
+   container's environment, wraps `SSL_CTX_new`/`SSL_CTX_new_ex` and registers an
+   OpenSSL keylog callback, so it observes `client_random` and the TLS 1.2/1.3 session
+   secrets as the app's own libssl derives them, and ships each line over a Unix domain
+   socket to the sidecar.
+5. The sidecar's socket server reads those lines, validates and deduplicates them, and
+   writes them as an NSS keylog (`/var/log/sidecar/sslkeylog.log`), which Wireshark/tshark
+   can pair with a capture of the same egress to show decrypted traffic.
 
 ```mermaid
 flowchart LR
-    app["app process<br/>(unmodified)"] -- "connect()" --> kern["connect4 + sockops<br/>(eBPF)"]
+    app["app process<br/>(unmodified, LD_PRELOAD set)"] -- "connect()" --> kern["connect4 + sockops<br/>(eBPF)"]
     kern -- "redirect" --> relay["pass-through relay<br/>127.0.0.1:15001"]
     relay -- "raw pipe (end-to-end TLS)" --> upstream["Upstream server"]
-    app -. "libssl handshake" .-> uprobe["uprobe on libssl<br/>(eBPF)"]
-    uprobe -- "secret events" --> keylog["keylog consumer<br/>-> NSS keylog"]
+    app -. "libssl handshake" .-> interposer["LD_PRELOAD interposer<br/>(SSL_CTX_new + keylog callback)"]
+    interposer -- "NSS lines over unix socket" --> keylog["keylog socket server<br/>-> NSS keylog"]
 ```
 
 ## Pod view
 
 `go-ebpf-proxy` runs as a second container in the same pod as the target app, sharing its
-network, PID, and (host) cgroup namespaces. **Any app container that links OpenSSL's
-`libssl` gets transparent redirection and TLS key extraction with zero changes** — no
-code change, no rebuild, no env var, no trust-store edit. The app container doesn't even
-need to know the sidecar exists.
+network, IPC and UTS namespaces plus the host's cgroup namespace (no shared PID
+namespace — the interposer needs no PID/inode resolution). **Any app container that
+links OpenSSL's `libssl` and has the interposer's `LD_PRELOAD`/`GOEBPF_PRELOAD_SOCKET`
+env vars set gets transparent redirection and TLS key extraction** — no app code
+change, no rebuild, no trust-store edit.
 
 ```mermaid
 flowchart TB
-    subgraph pod["Pod (shared netns + PID ns + host cgroup ns)"]
-        subgraph appc["app container — unmodified, any OpenSSL-linked binary"]
+    subgraph pod["Pod (shared net/ipc/uts ns + host cgroup ns)"]
+        subgraph appc["app container — LD_PRELOAD=libkeylogpreload.so"]
             app["app process<br/>connect(dst:443)"]
             libssl["libssl (TLS 1.2/1.3)"]
+            interposer["LD_PRELOAD interposer"]
         end
         subgraph sidecar["go-ebpf-proxy container (UID 1337)"]
             loader["eBPF loader"]
             relay["pass-through relay<br/>127.0.0.1:15001"]
-            keylog["keylog consumer"]
+            keylog["keylog socket server"]
         end
     end
-    kernel["Kernel: connect4 + sockops + uprobe<br/>(attached at the pod's common parent cgroup)"]
+    kernel["Kernel: connect4 + sockops<br/>(attached at the pod's common parent cgroup)"]
 
     app -- "connect() intercepted" --> kernel
     kernel -- "redirect to relay" --> relay
-    libssl -. "handshake secrets read via uprobe" .-> kernel
-    kernel -- "secret events" --> keylog
-    loader -. "attach cgroup programs + uprobe(libssl)" .-> kernel
+    libssl -. "handshake secrets read via SSL_CTX keylog callback" .-> interposer
+    interposer -- "NSS lines over<br/>shared unix socket volume" --> keylog
+    loader -. "attach cgroup programs" .-> kernel
     relay == "raw pipe (real cert validated by the app)" ==> upstream["Upstream server"]
     keylog -. "NSS keylog (tmpfs)" .-> disk[("/var/log/sidecar")]
 ```
 
 Swap in a different app container image — same or different language, any process that
-links `libssl` — and the sidecar keeps working unchanged: the `connect4`/`sockops`
-programs redirect at the socket layer regardless of what wrote the syscall, and the
-uprobe attaches to the *library*, not to any particular app binary.
+links `libssl` and carries the interposer env vars — and the sidecar keeps working
+unchanged: the `connect4`/`sockops` programs redirect at the socket layer regardless of
+what wrote the syscall, and the interposer hooks the *library*, not any particular app
+binary.
+
+> **Historical note**: an earlier design (M2) extracted TLS keys via an eBPF uprobe on
+> `libssl`, requiring a shared PID namespace and `CAP_PERFMON`. AD-010 replaced it with
+> the `LD_PRELOAD` interposer described above — no uprobe, no shared PID namespace.
 
 ## Status
 
@@ -87,21 +96,22 @@ MVP delivered in three vertical slices:
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | M1 | eBPF transparent redirect (`connect4` + `sockops` + pass-through relay) | ✅ Done |
-| M2 | Uprobe TLS keylog extraction (OpenSSL) | ✅ Done |
-| M3 | Capture (pcapng + Podman dev environment + decrypt validation) | ⏳ Planned |
+| M2 | TLS keylog extraction (OpenSSL, via the `LD_PRELOAD` interposer) | ✅ Done |
+| M3 | Capture (pcapng + Podman dev environment + decrypt validation) | ✅ Done |
 
 ## Requirements
 
-- Linux kernel ≥ 5.10 (BTF/CO-RE, uprobes, BPF ring buffer)
-- `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_PERFMON`
-- Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs)
-- Rootful Podman (local dev setup); a shared PID namespace is required so the sidecar
-  can resolve and attach uprobes to the app's TLS library
+- Linux kernel ≥ 5.10 (BTF/CO-RE, BPF ring buffer)
+- `CAP_BPF` + `CAP_NET_ADMIN`
+- Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs), a C
+  compiler + OpenSSL headers (for building the `LD_PRELOAD` interposer)
+- Rootful Podman (local dev setup)
 
 ## Build & test
 
 ```bash
 make build             # fmt -> vet -> build
+make build-preload      # build the LD_PRELOAD keylog interposer (.so)
 make test               # unit tests (go test -race ./...)
 make test-integration   # kernel/eBPF-backed tests (build tag `integration`; skip cleanly
                         # without the required capabilities)
@@ -119,12 +129,13 @@ make generate
 ## Project layout
 
 ```
-bpf/             eBPF C programs (connect4, sockops, tls_keylog) + generated bindings
+bpf/             eBPF C programs (connect4, sockops) + generated bindings
 internal/ebpf/   loader: load/attach/pin the eBPF programs, map codec
 internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
-internal/keylog/ TLS library discovery, uprobe attach, NSS keylog extraction/writer
+internal/keylog/ keylog socket server, NSS keylog validation/writer, preload env builder
+preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new, ships keylog lines
 internal/shared/ structured logging, shared infra
-cmd/app/         sidecar entrypoint (wires loader, relay, keylog)
+cmd/app/         sidecar entrypoint (wires loader, relay, keylog socket server, capture)
 deploy/podman/   rootful Podman dev environment (pod scripts)
 ```
 
