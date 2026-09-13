@@ -7,6 +7,9 @@ docs/prd/feature-*.md
 docs/prd/product-requirements-document.md
 docs/feasibility-study.md
 
+# Local editor lint config
+/.markdownlint.json
+
 # Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
 bpf/vmlinux.h
 
