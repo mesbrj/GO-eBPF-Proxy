@@ -20,6 +20,10 @@ build: vet
 	go build ./...
 .PHONY: build
 
+build-preload:
+	$(CC) -shared -fPIC -o preload/libkeylogpreload.so preload/keylog_preload.c -ldl -lssl -lcrypto
+.PHONY: build-preload
+
 test:
 	go test -v -race ./...
 .PHONY: test
