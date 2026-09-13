@@ -19,61 +19,57 @@ import (
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
 
-// Config configures one run of the sidecar: eBPF redirect + relay, uprobe
-// keylog extraction, and capture with bounded, ephemeral-by-default retention.
+// Config configures one run of the sidecar: eBPF redirect + relay, the
+// LD_PRELOAD-interposer keylog socket server, and capture with bounded,
+// ephemeral-by-default retention.
 type Config struct {
-	CgroupPath    string
-	RelayListen   string
-	PinDir        string
-	TargetPID     int
-	LibsslPath    string
-	KeylogPinDir  string
-	KeylogPath    string
-	OpenSSLVer    keylog.OpenSSLVersion
-	TLSVersion    uint16
-	CaptureIface  string
-	CapturePath   string
-	Retain        bool
-	MaxBytes      int64
-	MaxAge        time.Duration
-	RetentionTick time.Duration
+	CgroupPath       string
+	RelayListen      string
+	PinDir           string
+	KeylogSocketPath string
+	KeylogPath       string
+	CaptureIface     string
+	CapturePath      string
+	Retain           bool
+	MaxBytes         int64
+	MaxAge           time.Duration
+	RetentionTick    time.Duration
 }
 
 // DefaultConfig returns a Config populated with the sidecar's compiled-in
 // defaults; the caller must still set CgroupPath and TargetPID.
 func DefaultConfig() Config {
 	return Config{
-		RelayListen:   "127.0.0.1:15001",
-		PinDir:        ebpf.DefaultConfig().PinDir,
-		KeylogPinDir:  "/sys/fs/bpf/go-ebpf-proxy-keylog",
-		KeylogPath:    "/var/log/sidecar/sslkeylog.log",
-		OpenSSLVer:    keylog.OpenSSL3x,
-		TLSVersion:    keylog.TLSVersion13,
-		CaptureIface:  "eth0",
-		CapturePath:   "/var/log/sidecar/dump.pcapng",
-		MaxBytes:      100 * 1024 * 1024,
-		MaxAge:        24 * time.Hour,
-		RetentionTick: 5 * time.Minute,
+		RelayListen:      "127.0.0.1:15001",
+		PinDir:           ebpf.DefaultConfig().PinDir,
+		KeylogSocketPath: "/var/run/sidecar/keylog.sock",
+		KeylogPath:       "/var/log/sidecar/sslkeylog.log",
+		CaptureIface:     "eth0",
+		CapturePath:      "/var/log/sidecar/dump.pcapng",
+		MaxBytes:         100 * 1024 * 1024,
+		MaxAge:           24 * time.Hour,
+		RetentionTick:    5 * time.Minute,
 	}
 }
 
 // App is one running instance of every wired subsystem: the eBPF loader,
-// the pass-through relay, the uprobe keylog consumer, and the DSB-embedded
+// the pass-through relay, the keylog socket server, and the DSB-embedded
 // pcapng capture writer.
 type App struct {
 	cfg       Config
 	loader    *ebpf.Loader
 	ln        net.Listener
-	consumer  *keylog.Consumer
+	keylogSrv *keylog.SocketServer
 	capW      *capture.Writer
 	ethHandle *pcapgo.EthernetHandle
 	retention capture.Retention
 	stopTick  chan struct{}
 }
 
-// Start loads and attaches the eBPF programs, starts the relay, attaches the
-// keylog uprobe, and starts capture. On any failure it tears down whatever
-// was already started before returning the error (never leaks a partial run).
+// Start loads and attaches the eBPF programs, starts the relay, starts the
+// keylog socket server, and starts capture. On any failure it tears down
+// whatever was already started before returning the error (never leaks a
+// partial run).
 func Start(cfg Config) (*App, error) {
 	a := &App{cfg: cfg}
 
@@ -104,25 +100,16 @@ func Start(cfg Config) (*App, error) {
 	}))
 	go func() { _ = relay.Serve(ln) }()
 
-	layout, err := keylog.Offsets(cfg.OpenSSLVer)
-	if err != nil {
-		_ = a.Close()
-		return nil, fmt.Errorf("app: openssl offsets: %w", err)
-	}
-	consumer, err := keylog.NewConsumer(keylog.ConsumerConfig{
-		PID:            cfg.TargetPID,
-		LibsslOverride: cfg.LibsslPath,
-		PinDir:         cfg.KeylogPinDir,
-		Layout:         layout,
-		TLSVersion:     cfg.TLSVersion,
-		KeylogPath:     cfg.KeylogPath,
+	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
+		SocketPath: cfg.KeylogSocketPath,
+		KeylogPath: cfg.KeylogPath,
 	})
 	if err != nil {
 		_ = a.Close()
-		return nil, fmt.Errorf("app: attach keylog consumer: %w", err)
+		return nil, fmt.Errorf("app: start keylog socket server: %w", err)
 	}
-	a.consumer = consumer
-	go func() { _ = consumer.Run() }()
+	a.keylogSrv = keylogSrv
+	go func() { _ = keylogSrv.Run() }()
 
 	captureDir := filepath.Dir(cfg.CapturePath)
 	if err := capture.CheckTarget(captureDir); err != nil {
@@ -197,8 +184,8 @@ func (a *App) Close() error {
 		}
 		errs = append(errs, a.capW.Close())
 	}
-	if a.consumer != nil {
-		errs = append(errs, a.consumer.Close())
+	if a.keylogSrv != nil {
+		errs = append(errs, a.keylogSrv.Close())
 	}
 	if a.ln != nil {
 		errs = append(errs, a.ln.Close())
