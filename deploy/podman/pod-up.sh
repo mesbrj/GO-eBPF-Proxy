@@ -73,21 +73,17 @@ podman volume create "$LOG_VOLUME" >/dev/null 2>&1 || true
 # chmod 0666 on the bound socket file -- NewSocketServer does both itself).
 podman volume create "$KEYLOG_VOLUME" >/dev/null 2>&1 || true
 
-podman run -d \
-  --pod "$POD_NAME" \
-  --name "${POD_NAME}-app" \
-  --replace \
-  --cgroupns=host \
-  --volume "$PRELOAD_SO:/usr/local/lib/libkeylogpreload.so:ro,z" \
-  --volume "${KEYLOG_VOLUME}:${KEYLOG_DIR}" \
-  --env "LD_PRELOAD=/usr/local/lib/libkeylogpreload.so" \
-  --env "GOEBPF_PRELOAD_SOCKET=${KEYLOG_SOCKET}" \
-  "$APP_IMAGE"
-
 # The pod's common parent cgroup under a host-shared cgroup namespace; verify
 # against your podman cgroup manager (cgroupfs vs systemd) if attach fails.
+# Resolved before either container starts -- podman pod inspect only needs
+# the pod itself to exist.
 POD_CGROUP="/sys/fs/cgroup/$(podman pod inspect "$POD_NAME" --format '{{.CgroupPath}}' 2>/dev/null || true)"
 
+# Sidecar starts BEFORE the app container (spec.md: "sidecar listens on the
+# keylog socket before the app container starts" -- the interposer only
+# retries briefly then silently drops a line if the socket isn't reachable
+# yet, so starting the app first would race an early handshake against the
+# sidecar's own listener).
 podman run -d \
   --pod "$POD_NAME" \
   --name "${POD_NAME}-sidecar" \
@@ -113,5 +109,30 @@ podman run -d \
     --keylog-socket="$KEYLOG_SOCKET" \
     --keylog-path=/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log \
     --capture-path=/var/log/sidecar/dump.pcapng
+
+# Wait for the sidecar to actually bind the keylog socket before starting the
+# app container -- the volume's host-visible mountpoint lets us poll for the
+# socket file without needing a shared PID/mount namespace (mirrors how
+# smoke_e2e_test.go's volumeCapturePath already resolves the log volume).
+KEYLOG_VOLUME_MOUNT="$(podman volume inspect "$KEYLOG_VOLUME" --format '{{.Mountpoint}}')"
+for _ in $(seq 1 100); do
+  [[ -S "$KEYLOG_VOLUME_MOUNT/keylog.sock" ]] && break
+  sleep 0.1
+done
+if [[ ! -S "$KEYLOG_VOLUME_MOUNT/keylog.sock" ]]; then
+  echo "pod-up: keylog socket did not appear at $KEYLOG_VOLUME_MOUNT/keylog.sock within 10s" >&2
+  exit 1
+fi
+
+podman run -d \
+  --pod "$POD_NAME" \
+  --name "${POD_NAME}-app" \
+  --replace \
+  --cgroupns=host \
+  --volume "$PRELOAD_SO:/usr/local/lib/libkeylogpreload.so:ro,z" \
+  --volume "${KEYLOG_VOLUME}:${KEYLOG_DIR}" \
+  --env "LD_PRELOAD=/usr/local/lib/libkeylogpreload.so" \
+  --env "GOEBPF_PRELOAD_SOCKET=${KEYLOG_SOCKET}" \
+  "$APP_IMAGE"
 
 echo "pod-up: pod $POD_NAME is up (cgroup $POD_CGROUP)"
