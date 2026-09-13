@@ -55,7 +55,7 @@ type SocketServer struct {
 // app UID can connect), and opens the keylog Writer.
 func NewSocketServer(cfg SocketServerConfig, opts ...SocketServerOption) (*SocketServer, error) {
 	dir := filepath.Dir(cfg.SocketPath)
-	if err := os.MkdirAll(dir, 0o711); err != nil {
+	if err := os.MkdirAll(dir, 0o711); err != nil { // #nosec G301 -- deliberately search-only for group/other (see design.md): the app's (non-1337) UID must traverse to the socket
 		return nil, fmt.Errorf("keylog: create socket dir %q: %w", dir, err)
 	}
 	if err := checkSocketDir(dir); err != nil {

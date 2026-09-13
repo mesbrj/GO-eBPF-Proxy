@@ -139,7 +139,7 @@ func TestSocketServer_ConnectionClosesMidLine_NoCorruption(t *testing.T) {
 // world-writable/readable (perm&0o066 != 0).
 func TestSocketServer_RefusesWorldWritableSocketDir(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.Chmod(dir, 0o777))
+	require.NoError(t, os.Chmod(dir, 0o777)) // #nosec G302 -- deliberately world-writable to exercise the rejection path below
 
 	_, err := NewSocketServer(SocketServerConfig{
 		SocketPath: filepath.Join(dir, "keylog.sock"),

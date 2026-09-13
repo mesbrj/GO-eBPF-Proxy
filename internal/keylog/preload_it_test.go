@@ -237,8 +237,8 @@ func TestPreload_ClientWithoutInterposer_EmitsNoLines(t *testing.T) {
 	// No LD_PRELOAD/GOEBPF_PRELOAD_SOCKET set: real libssl, no interposer.
 	runOpenSSLClient(t, addr, "-tls1_3", nil)
 
-	time.Sleep(300 * time.Millisecond) // let any (unexpected) line arrive
-	data, err := os.ReadFile(keylogPath)
+	time.Sleep(300 * time.Millisecond)   // let any (unexpected) line arrive
+	data, err := os.ReadFile(keylogPath) // #nosec G304 -- test-controlled temp path
 	if err != nil {
 		require.True(t, os.IsNotExist(err), "unexpected error reading keylog: %v", err)
 		return
@@ -267,7 +267,7 @@ func TestPreload_PlainTCPTraffic_EmitsNoLines(t *testing.T) {
 	require.NoError(t, cmd.Run())
 
 	time.Sleep(300 * time.Millisecond)
-	data, err := os.ReadFile(keylogPath)
+	data, err := os.ReadFile(keylogPath) // #nosec G304 -- test-controlled temp path
 	if err != nil {
 		require.True(t, os.IsNotExist(err), "unexpected error reading keylog: %v", err)
 		return
@@ -293,7 +293,7 @@ func TestPreload_NonOpenSSLBinary_NoCrashNoLines(t *testing.T) {
 	assert.NoError(t, err, "a non-OpenSSL binary must run to completion without crashing")
 
 	time.Sleep(200 * time.Millisecond)
-	data, statErr := os.ReadFile(keylogPath)
+	data, statErr := os.ReadFile(keylogPath) // #nosec G304 -- test-controlled temp path
 	if statErr != nil {
 		require.True(t, os.IsNotExist(statErr), "unexpected error reading keylog: %v", statErr)
 		return
