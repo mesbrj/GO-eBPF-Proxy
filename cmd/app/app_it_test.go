@@ -31,6 +31,14 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(cg) })
 
+	// t.TempDir()'s own root is 0755 (a Go testing.T quirk: its numbered
+	// subdirectories are created via os.Mkdir(dir, 0777), umask-adjusted to
+	// 0755), which capture.CheckTarget correctly refuses as world-accessible.
+	// Use a not-yet-existing "sidecar" subdirectory instead, matching the
+	// KeylogSocketPath pattern below, so capture.NewWriter creates it fresh
+	// at the intended 0700 (AD-006) -- a real deployment's capture dir is
+	// always pre-secured this way (e.g. pod-up.sh's volume chmod), never a
+	// pre-existing world-readable directory.
 	dir := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.CgroupPath = cg
@@ -39,7 +47,7 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	cfg.RelayListen = "127.0.0.1:0"
 	cfg.KeylogPath = filepath.Join(dir, "sslkeylog.log")
 	cfg.CaptureIface = "lo"
-	cfg.CapturePath = filepath.Join(dir, "dump.pcapng")
+	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
 	cfg.RetentionTick = 0 // deterministic test: no background ticker
 
 	a, err := Start(cfg)
@@ -78,7 +86,7 @@ func TestApp_CloseWithRetainPreservesArtifacts(t *testing.T) {
 	cfg.RelayListen = "127.0.0.1:0"
 	cfg.KeylogPath = filepath.Join(dir, "sslkeylog.log")
 	cfg.CaptureIface = "lo"
-	cfg.CapturePath = filepath.Join(dir, "dump.pcapng")
+	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
 	cfg.RetentionTick = 0
 	cfg.Retain = true
 

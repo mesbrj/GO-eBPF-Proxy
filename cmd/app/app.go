@@ -56,14 +56,15 @@ func DefaultConfig() Config {
 // the pass-through relay, the keylog socket server, and the DSB-embedded
 // pcapng capture writer.
 type App struct {
-	cfg       Config
-	loader    *ebpf.Loader
-	ln        net.Listener
-	keylogSrv *keylog.SocketServer
-	capW      *capture.Writer
-	ethHandle *pcapgo.EthernetHandle
-	retention capture.Retention
-	stopTick  chan struct{}
+	cfg         Config
+	loader      *ebpf.Loader
+	ln          net.Listener
+	keylogSrv   *keylog.SocketServer
+	capW        *capture.Writer
+	ethHandle   *pcapgo.EthernetHandle
+	captureDone chan struct{}
+	retention   capture.Retention
+	stopTick    chan struct{}
 }
 
 // Start loads and attaches the eBPF programs, starts the relay, starts the
@@ -131,8 +132,18 @@ func Start(cfg Config) (*App, error) {
 		_ = a.Close()
 		return nil, fmt.Errorf("app: open capture interface %q: %w", cfg.CaptureIface, err)
 	}
+	// The MTU-sized default read buffer truncates any GSO/TSO-inflated
+	// frame (common on container veth interfaces), corrupting TLS record
+	// reconstruction for offline decryption (see capture.MaxCaptureLength).
+	if err := eth.SetCaptureLength(capture.MaxCaptureLength); err != nil {
+		_ = eth.Close()
+		_ = a.Close()
+		return nil, fmt.Errorf("app: set capture length on %q: %w", cfg.CaptureIface, err)
+	}
 	a.ethHandle = eth
+	a.captureDone = make(chan struct{})
 	go func() {
+		defer close(a.captureDone)
 		for {
 			data, ci, rerr := eth.ReadPacketData()
 			if rerr != nil {
@@ -177,6 +188,13 @@ func (a *App) Close() error {
 	}
 	if a.ethHandle != nil {
 		errs = append(errs, a.ethHandle.Close())
+	}
+	if a.captureDone != nil {
+		// Wait for the packet-reading goroutine to observe ethHandle.Close()
+		// and exit before touching capW: otherwise EmbedKeylog/capW.Close
+		// below can race with a concurrent capW.WritePacket call in that
+		// goroutine (data race on capW's internal bufio.Writer).
+		<-a.captureDone
 	}
 	if a.capW != nil {
 		if lines, err := readKeylogLines(a.cfg.KeylogPath); err == nil {

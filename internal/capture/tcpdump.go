@@ -67,7 +67,17 @@ func startGopacket(iface, path string) (stop func() error, err error) {
 		_ = w.Close()
 		return nil, fmt.Errorf("capture: open %q: %w", iface, err)
 	}
+	// The MTU-sized default read buffer truncates any GSO/TSO-inflated
+	// frame (common on container veth interfaces), corrupting TLS record
+	// reconstruction for offline decryption (see MaxCaptureLength).
+	if err := h.SetCaptureLength(MaxCaptureLength); err != nil {
+		_ = h.Close()
+		_ = w.Close()
+		return nil, fmt.Errorf("capture: set capture length on %q: %w", iface, err)
+	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for {
 			data, ci, rerr := h.ReadPacketData()
 			if rerr != nil {
@@ -77,6 +87,12 @@ func startGopacket(iface, path string) (stop func() error, err error) {
 		}
 	}()
 	return func() error {
-		return errors.Join(h.Close(), w.Close())
+		hErr := h.Close()
+		// Wait for the reader goroutine to observe h.Close() and exit
+		// before touching w: otherwise w.Close() below can race with a
+		// concurrent w.WritePacket call in that goroutine (data race on
+		// w's internal bufio.Writer, caught by -race).
+		<-done
+		return errors.Join(hErr, w.Close())
 	}, nil
 }

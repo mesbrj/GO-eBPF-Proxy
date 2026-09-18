@@ -66,6 +66,33 @@ func TestWriter_RoundTripsPacketBytesAndLinkType(t *testing.T) {
 	}
 }
 
+// UT-03.1/CAPTURE-01 regression: a CaptureInfo whose InterfaceIndex reflects
+// the OS's real ifindex (e.g. "lo"=1, "eth0"=2 in a container netns, as
+// pcapgo.EthernetHandle.ReadPacketData populates it) must still be accepted
+// and round-trip correctly. Before this fix, WritePacket passed a nonzero
+// InterfaceIndex straight through to pcapgo.NgWriter (which only ever has
+// interface 0 registered), so it always failed -- meaning any real interface
+// capture silently wrote zero packets, leaving only the SHB/IDB header on
+// disk (indistinguishable from an empty/broken capture).
+func TestWriter_NormalizesNonZeroInterfaceIndexFromRealIfindex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+
+	data := []byte{0x01, 0x02, 0x03}
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now(), InterfaceIndex: 1}, data))
+	require.NoError(t, w.Close())
+
+	f, err := os.Open(path) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
+	require.NoError(t, err)
+	got, _, err := r.ReadPacketData()
+	require.NoError(t, err, "packet with a nonzero OS ifindex must still be written and re-readable")
+	assert.Equal(t, data, got)
+}
+
 // UT-03.1/CAPTURE-02: a packet with a zero Timestamp is stamped from the
 // Writer's injected Clock, tying capture timestamps to the shared source.
 func TestWriter_DefaultsTimestampToInjectedClock(t *testing.T) {
@@ -131,4 +158,30 @@ func TestWriter_EmbedKeylog_EmptyIsNoop(t *testing.T) {
 
 	assert.NoError(t, w.EmbedKeylog(nil))
 	assert.NoError(t, w.EmbedKeylog([]string{}))
+}
+
+// CAPTURE-01/CAPTURE-11 regression: the file on disk must be non-empty right
+// after NewWriter (the SHB/IDB header), and must grow after each WritePacket
+// -- all WITHOUT calling Close. pcapgo.NgWriter buffers internally (bufio),
+// so a missing Flush left the file at 0 bytes for an entire live session
+// (only visible once the sidecar was torn down), which is what a real
+// end-to-end smoke test run surfaced as an apparently-empty dump.pcapng.
+func TestWriter_FileVisibleOnDiskWithoutClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	sizeAfterOpen := fileSize(t, path)
+	assert.Positive(t, sizeAfterOpen, "file must contain the SHB/IDB header on disk before any packet is written")
+
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0x01, 0x02, 0x03}))
+	assert.Greater(t, fileSize(t, path), sizeAfterOpen, "file must grow on disk after WritePacket, without Close")
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info.Size()
 }
