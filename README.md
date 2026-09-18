@@ -131,8 +131,9 @@ one pass. Requires a rootful Linux host with `podman` (see Requirements above); 
 scripts must run as root.
 
 ```bash
-# 1. Build the sidecar binary and the LD_PRELOAD interposer
-go build -o bin/app ./cmd/app
+# 1. Build the sidecar binary (statically, for the musl/alpine sidecar image)
+#    and the LD_PRELOAD interposer
+make build LINK_MODE=static
 make build-preload
 
 # 2. Bring up the pod: sidecar (eBPF redirect + keylog + capture) then the app,
@@ -146,7 +147,9 @@ sudo deploy/podman/smoke.sh
 # 4. Decrypt the capture offline, pairing it with the interposer-emitted keylog
 podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
 tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')/dump.pcapng" \
-  -o "tls.keylog_file:/tmp/sslkeylog.log" -Y http
+  -o "tls.keylog_file:/tmp/sslkeylog.log" -Y http -V
+# -V (full protocol detail) is required to see the actual decrypted body text --
+# -Y alone only prints a one-line protocol summary per matching packet.
 
 # 5. Tear down — wipes /var/log/sidecar by default; add --retain to keep the capture/keylog
 sudo deploy/podman/pod-down.sh

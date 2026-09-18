@@ -1,5 +1,21 @@
 .DEFAULT_GOAL := build
 
+# LINK_MODE selects how bin/app is linked:
+#   dynamic (default) - CGO_ENABLED=1, dynamically linked against glibc;
+#                        for glibc-based container images (e.g. debian/ubuntu).
+#   static             - CGO_ENABLED=0, statically linked; required for
+#                        musl-based container images (e.g. alpine), which
+#                        have no glibc interpreter/libc.so.6 to exec against
+#                        (see deploy/podman/pod-up.sh's sidecar image).
+LINK_MODE ?= dynamic
+ifeq ($(LINK_MODE),static)
+  CGO_ENABLED_APP := 0
+else ifeq ($(LINK_MODE),dynamic)
+  CGO_ENABLED_APP := 1
+else
+  $(error LINK_MODE must be "dynamic" or "static", got "$(LINK_MODE)")
+endif
+
 fmt:
 	go fmt ./...
 .PHONY: fmt
@@ -18,6 +34,7 @@ vet: fmt
 
 build: vet
 	go build ./...
+	CGO_ENABLED=$(CGO_ENABLED_APP) go build -o bin/app ./cmd/app
 .PHONY: build
 
 build-preload:

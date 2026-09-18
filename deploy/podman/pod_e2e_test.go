@@ -29,7 +29,10 @@ func requireRootfulPodman(t *testing.T) {
 }
 
 // buildSidecarBinary compiles cmd/app fresh so the pod always tests the
-// current tree, not a stale binary.
+// current tree, not a stale binary. Always statically linked (CGO_ENABLED=0)
+// regardless of this host's ambient Go env default, since the sidecar image
+// (alpine, musl) has no glibc interpreter to exec a dynamically-linked
+// binary against (mirrors Makefile's `LINK_MODE=static`).
 func buildSidecarBinary(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -39,6 +42,7 @@ func buildSidecarBinary(t *testing.T) string {
 	bin := filepath.Join(t.TempDir(), "app")
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/app") // #nosec G204 -- bin is a test-generated temp path, not external input
 	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "build sidecar binary: %s", out)
 	return bin
@@ -84,11 +88,15 @@ func podUp(t *testing.T, podName, sidecarBin string) {
 
 // podCgroupPath resolves the pod's common parent cgroup path the way
 // pod-up.sh does, for asserting bpftool attachment against the same path.
+// podman pod inspect's CgroupPath has no leading slash, unlike pod-up.sh's
+// own POD_CGROUP resolution -- must prepend "/sys/fs/cgroup/" (with the
+// separating slash) or the two paths silently diverge (e.g.
+// "/sys/fs/cgroupmachine.slice/..." instead of "/sys/fs/cgroup/machine.slice/...").
 func podCgroupPath(t *testing.T, podName string) string {
 	t.Helper()
 	out, err := exec.Command("podman", "pod", "inspect", podName, "--format", "{{.CgroupPath}}").Output() // #nosec G204 -- podName is a test-generated pod name, not external input
 	require.NoError(t, err)
-	return "/sys/fs/cgroup" + strings.TrimSpace(string(out))
+	return "/sys/fs/cgroup/" + strings.TrimSpace(string(out))
 }
 
 // bpftoolCgroupTree returns `bpftool cgroup tree <path>` output listing every
