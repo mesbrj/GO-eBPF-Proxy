@@ -1,11 +1,11 @@
 # Project harness and specs
 .github
 docs/feasibility-study.md
-#AGENTS.md
-#.specs
-#docs/technical-design-document.md
-#docs/prd/feature-*.md
-#docs/prd/product-requirements-document.md
+# AGENTS.md
+# .specs
+# docs/technical-design-document.md
+# docs/prd/feature-*.md
+# docs/prd/product-requirements-document.md
 
 
 # Local editor lint config

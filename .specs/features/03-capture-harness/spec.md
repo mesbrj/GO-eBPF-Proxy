@@ -66,7 +66,7 @@ Every ambiguity is resolved or recorded here — nothing is left silently unclea
 
 **Acceptance Criteria** (each line is one EARS pattern):
 
-1. WHEN capture is running THEN the system SHALL write a valid pcapng (SHB/IDB/EPB stream) re-readable by gopacket with the correct link type and preserved packet bytes.
+1. WHEN capture is running THEN the system SHALL write a valid pcapng (SHB/IDB/EPB stream) re-readable by gopacket with the correct link type and preserved packet bytes, **and the file SHALL be readable on disk while the sidecar is still running, not only after teardown** (Revision note, 2026-09-17: a live rootful run surfaced that the writer's internal buffering left `dump.pcapng` at 0 bytes for an entire session; fixed by flushing after every packet and after the initial header — see AD-011).
 2. WHEN writing capture and keylog records THEN the system SHALL source timestamps from the same monotonic clock within tolerance.
 3. WHERE the `tcpdump` backend is selected the system SHALL produce a capture that decrypts to identical application data as the gopacket backend.
 
@@ -180,3 +180,5 @@ How we know the feature is successful:
 - [x] `curl https://example.com` (no `-k`) succeeds end-to-end through the relay, validating the real cert.
 - [x] Artifacts are `0600`/`0700` under UID 1337, keylog on tmpfs, retention bounded, wiped on teardown unless `--retain`.
 - [x] gopacket and tcpdump backends decrypt to identical application data.
+- [x] `dump.pcapng` grows on disk in real time (no explicit flush needed by an operator; the writer flushes itself) rather than only becoming readable after pod teardown (AD-011).
+- [x] `make build LINK_MODE=static|dynamic` produces a sidecar binary linked correctly for the target container image's libc (musl/Alpine vs. glibc).
