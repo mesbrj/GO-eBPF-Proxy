@@ -5,6 +5,7 @@ package capture
 import (
 	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -61,9 +65,174 @@ func TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
 	require.NoError(t, stop())
 	require.NoError(t, kw.Close())
 
-	out, err := DecryptedAppData(pcapPath, keylogPath, "http")
+	out, err := DecryptedAppData(pcapPath, keylogPath, AppDataFilter)
 	require.NoError(t, err)
 	assert.Contains(t, out, body, "tshark must decrypt the HTTP response body")
+}
+
+// IT-03.1 (Acceptance, ALPN coverage): the same guarantee over an HTTP/2
+// session, which is what ALPN actually negotiates for any modern client and
+// server (curl, Go's own transport, every browser) -- an h2 session's
+// plaintext must be just as reachable as an HTTP/1.1 one's. tshark dissects
+// h2 with a separate "http2" dissector that a plain "http" display filter
+// never matches, so filtering on "http" alone reports zero frames for a
+// perfectly captured, perfectly decrypting h2 session.
+func TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing.T) {
+	if _, err := exec.LookPath("tshark"); err != nil {
+		t.Skip("tshark not installed; cannot assert decrypted application data")
+	}
+
+	dir := t.TempDir()
+	pcapPath := filepath.Join(dir, "dump.pcapng")
+	keylogPath := filepath.Join(dir, "sslkeylog.log")
+
+	stop, err := startGopacket("lo", pcapPath)
+	if err != nil {
+		t.Skipf("loopback capture not permitted in this environment: %v", err)
+	}
+	defer func() { _ = stop() }()
+
+	kw, err := os.Create(keylogPath) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	defer func() { _ = kw.Close() }()
+
+	const body = "hello-from-http2-capture-test"
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	srv.EnableHTTP2 = true
+	srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13, KeyLogWriter: kw}
+	srv.StartTLS()
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL)
+	require.NoError(t, err)
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, "HTTP/2.0", resp.Proto, "this test is only meaningful over a negotiated h2 session")
+	require.Equal(t, body, string(respBody))
+
+	time.Sleep(100 * time.Millisecond) // let the capture goroutine drain the flow
+	require.NoError(t, stop())
+	require.NoError(t, kw.Close())
+
+	out, err := DecryptedAppData(pcapPath, keylogPath, AppDataFilter)
+	require.NoError(t, err)
+	assert.Contains(t, out, body, "tshark must decrypt the h2 response body")
+}
+
+// IT-03.1 (Acceptance, out-of-order segments): a capture that recorded the
+// server's TCP segments out of sequence must still decrypt to the response
+// body. This is not a hypothetical: on a real rootful Podman pod roughly a
+// third of otherwise-perfect TLS 1.3 sessions land in the capture with the
+// server's segments jumbled (their IP IDs prove the server sent them in
+// order), and a simultaneous tcpdump -- an mmap'd AF_PACKET ring buffer --
+// records exactly the same reordering, so no capture backend escapes it.
+// tshark abandons TCP reassembly at the first gap unless told otherwise, and
+// an abandoned stream decrypts to nothing at all, which is indistinguishable
+// from lost packets or a mismatched key.
+func TestDecryptedAppData_OutOfOrderServerSegmentsStillDecrypt(t *testing.T) {
+	if _, err := exec.LookPath("tshark"); err != nil {
+		t.Skip("tshark not installed; cannot assert decrypted application data")
+	}
+
+	dir := t.TempDir()
+	pcapPath := filepath.Join(dir, "dump.pcapng")
+	keylogPath := filepath.Join(dir, "sslkeylog.log")
+
+	stop, err := startGopacket("lo", pcapPath)
+	if err != nil {
+		t.Skipf("loopback capture not permitted in this environment: %v", err)
+	}
+	defer func() { _ = stop() }()
+
+	kw, err := os.Create(keylogPath) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	defer func() { _ = kw.Close() }()
+
+	const body = "hello-from-out-of-order-capture-test"
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13, KeyLogWriter: kw}
+	srv.StartTLS()
+	defer srv.Close()
+	serverPort := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	resp, err := srv.Client().Get(srv.URL)
+	require.NoError(t, err)
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, body, string(respBody))
+
+	time.Sleep(100 * time.Millisecond) // let the capture goroutine drain the flow
+	require.NoError(t, stop())
+	require.NoError(t, kw.Close())
+
+	jumbled := filepath.Join(dir, "jumbled.pcapng")
+	reordered := rewriteWithServerSegmentsReversed(t, pcapPath, jumbled, serverPort)
+	require.GreaterOrEqual(t, reordered, 2, "the capture must hold several server segments for reordering them to mean anything")
+
+	out, err := DecryptedAppData(jumbled, keylogPath, AppDataFilter)
+	require.NoError(t, err)
+	assert.Contains(t, out, body, "a capture whose server segments arrived out of sequence must still decrypt")
+}
+
+// rewriteWithServerSegmentsReversed copies the capture at src to dst with the
+// server's payload-carrying segments in reverse order among themselves --
+// every other packet, and every timestamp, left exactly where it was. That
+// reproduces what a real capture records: ascending timestamps in file order,
+// but the server's segments no longer in sequence order, with the stream's
+// first segment arriving last. It returns how many segments it reordered.
+func rewriteWithServerSegmentsReversed(t *testing.T, src, dst string, serverPort int) int {
+	t.Helper()
+
+	f, err := os.Open(src) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
+	require.NoError(t, err)
+
+	type captured struct {
+		ci   gopacket.CaptureInfo
+		data []byte
+	}
+	var packets []captured
+	var fromServer []int
+	for {
+		data, ci, err := r.ReadPacketData()
+		if err != nil {
+			break
+		}
+		packets = append(packets, captured{ci: ci, data: data})
+		p := gopacket.NewPacket(data, r.LinkType(), gopacket.Default)
+		if tcp, ok := p.Layer(layers.LayerTypeTCP).(*layers.TCP); ok && int(tcp.SrcPort) == serverPort && len(tcp.Payload) > 0 {
+			fromServer = append(fromServer, len(packets)-1)
+		}
+	}
+
+	// Move whole frames (their lengths travel with them), then restore each
+	// slot's original timestamp, so the file still reads back in ascending
+	// time order -- exactly as a real out-of-order capture does.
+	timestamps := make([]time.Time, len(packets))
+	for i, p := range packets {
+		timestamps[i] = p.ci.Timestamp
+	}
+	for i, j := 0, len(fromServer)-1; i < j; i, j = i+1, j-1 {
+		a, b := fromServer[i], fromServer[j]
+		packets[a], packets[b] = packets[b], packets[a]
+	}
+
+	w, err := NewWriter(dst, Options{LinkType: r.LinkType()})
+	require.NoError(t, err)
+	for i, p := range packets {
+		p.ci.Timestamp = timestamps[i]
+		require.NoError(t, w.WritePacket(p.ci, p.data))
+	}
+	require.NoError(t, w.Close())
+	return len(fromServer)
 }
 
 // IT-03.2: a keylog that does not correspond to the captured session (as if
@@ -107,7 +276,7 @@ func TestDecryptedAppData_MismatchedKeylogFailsToDecrypt(t *testing.T) {
 	bogusLine := "SERVER_HANDSHAKE_TRAFFIC_SECRET " + strings.Repeat("00", 32) + " " + strings.Repeat("00", 32) + "\n"
 	require.NoError(t, os.WriteFile(wrongKeylogPath, []byte(bogusLine), 0o600))
 
-	out, err := DecryptedAppData(pcapPath, wrongKeylogPath, "http")
+	out, err := DecryptedAppData(pcapPath, wrongKeylogPath, AppDataFilter)
 	// tshark does not error on a non-matching keylog; decryption silently
 	// fails, so the HTTP application-data never materialises.
 	require.NoError(t, err)

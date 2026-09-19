@@ -2,6 +2,7 @@ package capture
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,16 @@ type Writer struct {
 	ng        *pcapgo.NgWriter
 	clock     Clock
 	lastFlush time.Time
+	// path, linkType and headerLen let Close re-emit the capture with the
+	// Decryption Secrets Block ahead of the packet blocks (see EmbedKeylog):
+	// headerLen is the byte offset at which the initial SHB/IDB end, i.e.
+	// where the packet blocks that have to be copied over begin.
+	path      string
+	linkType  layers.LinkType
+	headerLen int64
+	// secrets accumulates the NSS keylog lines EmbedKeylog was given, for
+	// emission as a single DSB by Close.
+	secrets []string
 }
 
 // NewWriter creates (or truncates) the pcapng file at path, creating its
@@ -84,11 +95,20 @@ func NewWriter(path string, opts Options) (*Writer, error) {
 		return nil, fmt.Errorf("capture: flush initial pcapng headers: %w", err)
 	}
 
+	// Record where the SHB/IDB end. Close streams the packet blocks written
+	// after them into a re-emitted, secrets-first capture, and must not
+	// duplicate the headers it already wrote.
+	headerLen, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("capture: locate end of pcapng headers in %q: %w", path, err)
+	}
+
 	clock := opts.Clock
 	if clock == nil {
 		clock = SystemClock{}
 	}
-	return &Writer{f: f, ng: ng, clock: clock}, nil
+	return &Writer{f: f, ng: ng, clock: clock, path: path, linkType: linkType, headerLen: headerLen}, nil
 }
 
 // WritePacket appends one packet as an Enhanced Packet Block. A zero
@@ -131,25 +151,98 @@ func (w *Writer) WritePacket(ci gopacket.CaptureInfo, data []byte) error {
 	return w.ng.Flush()
 }
 
-// EmbedKeylog writes lines -- already-validated NSS keylog lines -- as a
-// single TLS Decryption Secrets Block, so tshark/Wireshark decrypt the
-// capture without pairing a separate keylog file. A nil/empty lines is a
-// no-op: there is nothing to embed.
+// EmbedKeylog records lines -- already-validated NSS keylog lines -- for
+// emission as a single TLS Decryption Secrets Block, so tshark/Wireshark
+// decrypt the capture without pairing a separate keylog file. Close emits the
+// block, positioned ahead of every packet block: pcapng scopes a DSB to the
+// blocks that FOLLOW it, and readers (tshark and Wireshark included) consume
+// a capture strictly sequentially, so secrets appended after the encrypted
+// packets arrive too late to decrypt any of them -- the capture then decrypts
+// to nothing at all even though the keys are demonstrably inside it.
+// Repeated calls accumulate into that one block; nil/empty lines add nothing.
 func (w *Writer) EmbedKeylog(lines []string) error {
-	if len(lines) == 0 {
-		return nil
-	}
-	payload := []byte(strings.Join(lines, "\n") + "\n")
-	return w.ng.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, payload)
+	w.secrets = append(w.secrets, lines...)
+	return nil
 }
 
-// Close flushes buffered blocks and closes the underlying file. The
-// pcapgo.NgWriter buffers internally, so Close must be called before the
-// file is considered complete.
+// Close flushes buffered blocks, closes the underlying file and, when
+// EmbedKeylog supplied any secrets, re-emits the capture with the Decryption
+// Secrets Block ahead of the packet blocks. The pcapgo.NgWriter buffers
+// internally, so Close must be called before the file is considered complete.
 func (w *Writer) Close() error {
 	if err := w.ng.Flush(); err != nil {
 		_ = w.f.Close()
 		return fmt.Errorf("capture: flush pcapng: %w", err)
 	}
-	return w.f.Close()
+	if err := w.f.Close(); err != nil {
+		return fmt.Errorf("capture: close %q: %w", w.path, err)
+	}
+	if len(w.secrets) == 0 {
+		return nil
+	}
+	return w.embedSecrets()
+}
+
+// embedSecrets re-emits the capture as SHB -> IDB -> DSB -> packet blocks: it
+// writes a fresh header plus the Decryption Secrets Block into a sibling
+// temporary file, streams the packet blocks already on disk after it, then
+// renames that file over the capture, so a concurrent reader only ever sees
+// the old or the new capture, never a half-rewritten one. The packet blocks
+// are copied as opaque bytes and never held in memory -- a capture routinely
+// outgrows RAM -- which is sound because an Enhanced Packet Block is
+// position-independent: it refers to its interface only by the id 0 that the
+// re-emitted Interface Description Block registers identically.
+func (w *Writer) embedSecrets() error {
+	src, err := os.Open(w.path) // #nosec G304 -- the very path this Writer created and just closed, not raw user input
+	if err != nil {
+		return fmt.Errorf("capture: reopen %q to embed keylog: %w", w.path, err)
+	}
+	defer func() { _ = src.Close() }()
+	if _, err := src.Seek(w.headerLen, io.SeekStart); err != nil {
+		return fmt.Errorf("capture: seek past pcapng headers in %q: %w", w.path, err)
+	}
+
+	// os.CreateTemp creates 0600, the secret-grade mode the capture itself is
+	// held at (AD-006) and the mode the rename carries over to it.
+	tmp, err := os.CreateTemp(filepath.Dir(w.path), ".dsb-*.pcapng")
+	if err != nil {
+		return fmt.Errorf("capture: create temp capture beside %q: %w", w.path, err)
+	}
+	if err := writeSecretsFirst(tmp, src, w.linkType, w.secrets); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("capture: close temp capture %q: %w", tmp.Name(), err)
+	}
+	if err := os.Rename(tmp.Name(), w.path); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("capture: replace %q with the secrets-first capture: %w", w.path, err)
+	}
+	return nil
+}
+
+// writeSecretsFirst writes a fresh SHB/IDB for linkType to dst, then lines as
+// one TLS Decryption Secrets Block, then every packet block read from packets.
+func writeSecretsFirst(dst io.Writer, packets io.Reader, linkType layers.LinkType, lines []string) error {
+	ng, err := pcapgo.NewNgWriter(dst, linkType)
+	if err != nil {
+		return fmt.Errorf("capture: re-emit pcapng headers: %w", err)
+	}
+	payload := []byte(strings.Join(lines, "\n") + "\n")
+	if err := ng.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, payload); err != nil {
+		return fmt.Errorf("capture: write decryption secrets block: %w", err)
+	}
+	// Flush before copying: the packet blocks go straight to dst, bypassing
+	// the NgWriter's own buffer, so anything still buffered would land after
+	// them (exactly the ordering bug this whole path exists to avoid).
+	if err := ng.Flush(); err != nil {
+		return fmt.Errorf("capture: flush pcapng headers and secrets: %w", err)
+	}
+	if _, err := io.Copy(dst, packets); err != nil {
+		return fmt.Errorf("capture: copy packet blocks: %w", err)
+	}
+	return nil
 }

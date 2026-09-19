@@ -124,39 +124,74 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 	keylogPathInContainer := "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log"
 	hostKeylogPath := filepath.Join(t.TempDir(), "sslkeylog.log")
 
-	// The in-process gopacket capture backend (a raw, non-mmap'd AF_PACKET
-	// socket -- see internal/capture.MaxCaptureLength's doc comment) can
-	// miss a TCP segment during a real TLS handshake/response's burst of
-	// back-to-back frames on a real container bridge interface, which
-	// breaks TLS record reassembly for that request. This has been observed
-	// to reproduce on every attempt on some hosts (not just intermittently)
-	// -- a real, disclosed capacity limitation of this capture backend
-	// under real network conditions (tracked as a follow-up: a proper fix
-	// needs a mmap'd AF_PACKET ring buffer capture, e.g.
-	// github.com/gopacket/gopacket/afpacket, not a small patch). Retry a
-	// bounded number of times in case it's transient on this host; skip
-	// (not fail) if every attempt still shows the loss, rather than
-	// asserting a capability this backend cannot currently guarantee.
-	const maxAttempts = 5
+	runSmoke(t, podName)
+
+	require.Eventually(t, func() bool { return execFileSize(sidecar, keylogPathInContainer) > 0 },
+		5*time.Second, 100*time.Millisecond, "keylog must be populated before offline validation")
+
+	// Copy the tmpfs keylog out to a host-visible path for tshark pairing.
+	cpOut, err := exec.Command("podman", "cp", sidecar+":"+keylogPathInContainer, hostKeylogPath).CombinedOutput() // #nosec G204 -- sidecar/path are test-generated, not external input
+	require.NoError(t, err, "podman cp keylog: %s", cpOut)
+
+	// The capture writer flushes on a bounded interval (internal/capture's
+	// flushInterval, 200ms) rather than per packet, so the response's last
+	// frames can still be buffered when smoke.sh returns: give that flush a
+	// bounded window to land. Note the filter must be ALPN-agnostic --
+	// curl/example.com negotiate h2, which tshark's "http" dissector does not
+	// match at all.
 	var out string
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		runSmoke(t, podName)
-
-		require.Eventually(t, func() bool { return execFileSize(sidecar, keylogPathInContainer) > 0 },
-			5*time.Second, 100*time.Millisecond, "keylog must be populated before offline validation")
-
-		// Copy the tmpfs keylog out to a host-visible path for tshark pairing.
-		cpOut, err := exec.Command("podman", "cp", sidecar+":"+keylogPathInContainer, hostKeylogPath).CombinedOutput() // #nosec G204 -- sidecar/path are test-generated, not external input
-		require.NoError(t, err, "podman cp keylog: %s", cpOut)
-
-		out, lastErr = capture.DecryptedAppData(capturePath, hostKeylogPath, "http")
-		if lastErr == nil && strings.Contains(strings.ToLower(out), "example") {
-			return
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		out, err = capture.DecryptedAppData(capturePath, hostKeylogPath, capture.AppDataFilter)
+		if (err == nil && strings.Contains(strings.ToLower(out), "example")) || time.Now().After(deadline) {
+			break
 		}
-		t.Logf("attempt %d/%d: decrypted output did not yet contain the expected plaintext (err=%v); retrying", attempt, maxAttempts, lastErr)
+		time.Sleep(500 * time.Millisecond)
 	}
-	t.Skipf("gopacket capture backend lost TCP segments on all %d attempts on this host (known capacity limitation, see comment above); last err=%v, last output=%q", maxAttempts, lastErr, out)
+	require.NoError(t, err)
+	assert.Contains(t, strings.ToLower(out), "example",
+		"pairing the harness's own capture with its own keylog must yield the request's decrypted plaintext")
+}
+
+// IT-03.7 (Acceptance, embedded DSB): the retained capture must decrypt on
+// its own, with NO external keylog paired -- the "self-decrypting capture"
+// the sidecar advertises. Two things make that observable: a graceful stop
+// (SIGTERM -> App.Close, which is what embeds the Decryption Secrets Block;
+// pod-down.sh's `pod rm -f` SIGKILLs and never gets there) and RETAIN=1, so
+// that same graceful shutdown's ephemeral-by-default cleanup keeps the
+// artifact instead of wiping it.
+func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
+	requireRootfulPodman(t)
+	requireInternetEgress(t)
+	if _, err := exec.LookPath("tshark"); err != nil {
+		t.Skip("tshark not installed; cannot assert decrypted application data")
+	}
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-it7dsb"
+	podUpNoCleanup(t, podName, bin, "RETAIN=1")
+	t.Cleanup(func() {
+		// No --retain here: the volume (a plaintext-equivalent secret once
+		// the keylog is embedded in it) goes away with the pod.
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(os.Environ(), "POD_NAME="+podName)
+		_ = down.Run()
+	})
+
+	capturePath := volumeCapturePath(t, podName)
+	runSmoke(t, podName)
+
+	stopOut, err := exec.Command("podman", "stop", "-t", "30", podName+"-sidecar").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
+	require.NoError(t, err, "podman stop sidecar (graceful, so App.Close runs): %s", stopOut)
+
+	// An empty keylog stands in for "no keylog": whatever decrypts can then
+	// only have come from the capture's own embedded secrets.
+	emptyKeylog := filepath.Join(t.TempDir(), "empty-sslkeylog.log")
+	require.NoError(t, os.WriteFile(emptyKeylog, nil, 0o600))
+
+	out, err := capture.DecryptedAppData(capturePath, emptyKeylog, capture.AppDataFilter)
+	require.NoError(t, err)
+	assert.Contains(t, strings.ToLower(out), "example",
+		"the capture's embedded Decryption Secrets Block must decrypt the session unaided; a DSB written after the packet blocks never can, since tshark reads a capture sequentially")
 }
 
 // IT-03.9: default teardown wipes /var/log/sidecar (the keylog tmpfs and the

@@ -82,9 +82,9 @@ func TestBackendParity_TcpdumpAndGopacketDecryptIdentically(t *testing.T) {
 	require.NoError(t, stopGp())
 	require.NoError(t, kw.Close())
 
-	tcpdumpOut, err := DecryptedAppData(tcpdumpPath, keylogPath, "http")
+	tcpdumpOut, err := DecryptedAppData(tcpdumpPath, keylogPath, AppDataFilter)
 	require.NoError(t, err)
-	gopacketOut, err := DecryptedAppData(gopacketPath, keylogPath, "http")
+	gopacketOut, err := DecryptedAppData(gopacketPath, keylogPath, AppDataFilter)
 	require.NoError(t, err)
 
 	assert.Contains(t, tcpdumpOut, body, "tcpdump backend must decrypt the HTTP response body")
