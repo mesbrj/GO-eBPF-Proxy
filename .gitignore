@@ -1,11 +1,13 @@
 # Project harness and specs
 .github
-docs/feasibility-study.md
+.claude
+.mcp.json
 # AGENTS.md
 # .specs
 # docs/technical-design-document.md
 # docs/prd/feature-*.md
 # docs/prd/product-requirements-document.md
+docs/feasibility-study.md
 
 
 # Local editor lint config
