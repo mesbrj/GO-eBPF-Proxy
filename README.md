@@ -5,9 +5,8 @@ egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables
 **passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
 its OpenSSL library, and **captures the same egress to a DSB-embedded pcapng** so the
 still end-to-end encrypted TLS 1.2/1.3 traffic can be decrypted and inspected offline
-with Wireshark/tshark. All three milestones (redirect, keylog, capture) are delivered —
-the Podman scripts under `deploy/podman/` bring up a complete, working app+sidecar pod
-end-to-end (see [Quick start](#quick-start)).
+with Wireshark/tshark. The Podman scripts under `deploy/podman/` bring up a complete
+app+sidecar pod end-to-end (see [Quick start](#quick-start)).
 
 **No TLS termination. No MITM. No CA.** The app's handshake stays end-to-end with the
 real server; its certificate validation is never weakened, so certificate pinning is a
@@ -100,40 +99,28 @@ unchanged: the `connect4`/`sockops` programs redirect at the socket layer regard
 what wrote the syscall, and the interposer hooks the *library*, not any particular app
 binary.
 
-> **Historical note**: an earlier design (M2) extracted TLS keys via an eBPF uprobe on
-> `libssl`, requiring a shared PID namespace and `CAP_PERFMON`. AD-010 replaced it with
-> the `LD_PRELOAD` interposer described above — no uprobe, no shared PID namespace.
-
-## Status
-
-MVP delivered in three vertical slices:
-
-| Milestone | Scope | Status |
-| --- | --- | --- |
-| M1 | eBPF transparent redirect (`connect4` + `sockops` + pass-through relay) | ✅ Done |
-| M2 | TLS keylog extraction (OpenSSL, via the `LD_PRELOAD` interposer) | ✅ Done |
-| M3 | Capture (pcapng + Podman dev environment + decrypt validation) | ✅ Done |
-
 ## Requirements
 
-- Linux kernel ≥ 5.10 (BTF/CO-RE, BPF ring buffer)
-- `CAP_BPF` + `CAP_NET_ADMIN`
+- Linux kernel ≥ 5.10 (BTF/CO-RE)
+- `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_SYS_RESOURCE` (raises `RLIMIT_MEMLOCK` on eBPF load)
+  and `CAP_NET_RAW` (opens the capture socket) — on the sidecar container only
 - Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs), a C
   compiler + OpenSSL headers (for building the `LD_PRELOAD` interposer)
 - Rootful Podman (local dev setup)
+- Supported platforms: Ubuntu 24.04 LTS is the reference platform — see the
+  [technical design document](docs/technical-design-document.md) for the full supported-platform matrix
 - `tshark` (optional, only needed to run the offline decrypt step in [Quick start](#quick-start))
 
 ## Quick start
 
 Brings up the real app+sidecar pod, proves a real end-to-end TLS 1.3 request through the
-relay, and decrypts the resulting capture offline — the complete M1+M2+M3 pipeline in
-one pass. Requires a rootful Linux host with `podman` (see Requirements above); the pod
-scripts must run as root.
+relay, and decrypts the resulting capture offline. Requires a rootful Linux host with
+`podman` (see Requirements above); the pod scripts must run as root.
 
 ```bash
-# 1. Build the sidecar binary (statically, for the musl/alpine sidecar image)
-#    and the LD_PRELOAD interposer
-make build LINK_MODE=static
+# 1. Build the sidecar binary (statically by default, for the musl/alpine sidecar
+#    image) and the LD_PRELOAD interposer
+make build
 make build-preload
 
 # 2. Bring up the pod: sidecar (eBPF redirect + keylog + capture) then the app,
@@ -147,7 +134,13 @@ sudo deploy/podman/smoke.sh
 # 4. Decrypt the capture offline, pairing it with the interposer-emitted keylog
 podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
 tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')/dump.pcapng" \
-  -o "tls.keylog_file:/tmp/sslkeylog.log" -Y http -V
+  -o "tls.keylog_file:/tmp/sslkeylog.log" -o tcp.reassemble_out_of_order:TRUE \
+  -Y 'http or http2' -V
+# -Y 'http or http2' matches whichever protocol the session negotiated over ALPN:
+# curl picks HTTP/2, which tshark dissects with a separate "http2" dissector that
+# a plain "http" filter never matches.
+# -o tcp.reassemble_out_of_order:TRUE reassembles TCP segments the capture recorded
+# out of sequence, which tshark does not do by default.
 # -V (full protocol detail) is required to see the actual decrypted body text --
 # -Y alone only prints a one-line protocol summary per matching packet.
 

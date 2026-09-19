@@ -37,7 +37,7 @@ Every ambiguity is resolved or recorded here — nothing is left silently unclea
 
 | Assumption / decision | Chosen default | Rationale | Confirmed? |
 | --------------------- | -------------- | --------- | ---------- |
-| cgroup attach target | Pod common parent cgroup v2 | AD-002: single parent covers both containers; sidecar self-locates via `/proc/self/cgroup` | y |
+| cgroup attach target | Pod common parent cgroup v2 | AD-002: a single parent cgroup covers both containers. The path is **passed in**, not self-located: `cmd/app` requires `--cgroup-path`, resolved by `deploy/podman/pod-up.sh` from `podman pod inspect` | y |
 | Loop avoidance mechanism | Whole sidecar runs as UID 1337 + `connect4` skips UID 1337 | AD-002: parent-scoped hook also covers the sidecar, so the UID skip is load-bearing | y |
 | Original-dst correlation | `connect4` records by socket cookie; `sockops` re-keys by `(src_ip, src_port)` | AD-003: accepted socket has a different cookie; tuple bridge is race-free before SYN | y |
 | Resolver miss policy | Fail-closed: bounded retry then RST, never a default forward | AD-004: no safe default; forwarding would be an open-relay/SSRF bypass | y |
@@ -64,7 +64,7 @@ Every ambiguity is resolved or recorded here — nothing is left silently unclea
 4. WHILE a connection originates from UID 1337 the system SHALL leave it unchanged and record no map entry.
 5. The system SHALL rewrite only `IPPROTO_TCP`, IPv4, non-loopback destinations.
 
-**Independent Test**: Feed `connect4` a crafted `{TCP, dst 93.184.216.34:443}` context via `BPF_PROG_TEST_RUN`; assert the context is rewritten to `127.0.0.1:15001` and `origdst_by_cookie[cookie] == {dst,443}`.
+**Independent Test**: Feed `connect4` a crafted `{TCP, dst 93.184.216.34:443}` context via `BPF_PROG_TEST_RUN`; assert the context is rewritten to `127.0.0.1:15001` and `origdst_by_cookie[cookie] == {dst,443}`. Note: `BPF_PROG_TEST_RUN` is unsupported for `cgroup/connect4` on current kernels, so this test `t.Skip`s — the rewrite behaviour is proven instead by the Feature 03 Podman e2e suite.
 
 ---
 

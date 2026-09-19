@@ -9,7 +9,7 @@
 | Design/Refs     | [PRD](prd/product-requirements-document.md), [Feasibility study](feasibility-study.md), [Feature 01](prd/feature-01.md), [Feature 02](prd/feature-02.md), [Feature 03](prd/feature-03.md) |
 | Status          | Approved                                                   |
 | Created         | 2026-08-30                                                  |
-| Last Updated    | 2026-09-13 (AD-010: TLS key extraction moved from eBPF uprobes to an `LD_PRELOAD` interposer; added Architectural Principles, consolidated from AGENTS.md) |
+| Last Updated    | 2026-09-19 (AD-013: supported-platform tiers added — all `Planned`, none verified). Previously 2026-09-18 (AD-011/AD-012: pcapng flush interval, `ci.InterfaceIndex`/GSO `SetCaptureLength(65536)` fixes, CAPTURE-04 segment-loss limitation disclosed, `LINK_MODE=static` default) |
 
 ---
 
@@ -24,8 +24,9 @@ and inspected offline. There is **no TLS termination, no man-in-the-middle, and 
 app's handshake stays end-to-end with the real server, and its certificate validation is never
 weakened.
 
-**Background**: The workspace is currently a scaffold (empty `internal/*` packages,
-`bpf/`, `cmd/app/`, `deploy/podman/`). This TDD documents the authoritative,
+**Background**: The MVP is implemented across `internal/{ebpf,proxy,keylog,capture}`, `bpf/`,
+`preload/`, `cmd/app/`, and `deploy/podman/`; `internal/{convert,analisys}`, `internal/shared/db`
+and `pkg/tui` remain empty post-MVP placeholders. This TDD documents the authoritative,
 technically-reviewed MVP direction. The chosen model is **eBPF `cgroup/connect4` transparent
 redirection to a raw L4 relay (a single capture choke point) + passive TLS key extraction via
 an `LD_PRELOAD` interposer** — deliberately *no* MITM/CA and *no* sockmap acceleration in the
@@ -100,7 +101,8 @@ application's encrypted egress **without modifying the app**, **without `iptable
 - **Passive TLS 1.2/1.3 session-secret extraction** from the app's TLS library (OpenSSL
   `libssl` MVP) via an `LD_PRELOAD` interposer that registers OpenSSL's own
   `SSL_CTX_set_keylog_callback`, shipped over a Unix domain socket to the sidecar and written
-  as NSS keylog lines to `/var/log/sidecar/sslkeylog.log` (deduplicated).
+  as NSS keylog lines to a sidecar-only **tmpfs** keylog at
+  `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` (deduplicated).
 - Outbound capture (`eth0`) via **in-process gopacket (pcapng, default) with an embedded
   Decryption Secrets Block (DSB)**; `tcpdump` retained as an optional fallback/parity backend.
 - Secret-grade artifact handling: `0600`/`0700` under the sidecar UID, keylog on **tmpfs**,
@@ -118,7 +120,7 @@ application's encrypted egress **without modifying the app**, **without `iptable
 - UDP / QUIC / HTTP-3.
 - Production Kubernetes manifests / multi-host.
 - Live in-band DPI and the TUI.
-- TLS-library modules beyond OpenSSL (BoringSSL, GnuTLS, NSS/NSPR, GoTLS) — interfaces only.
+- TLS-library modules beyond OpenSSL (BoringSSL, GnuTLS, NSS/NSPR, GoTLS) — not implemented; a future interposer variant per library.
 
 ### 🔮 Future Considerations (V2+)
 
@@ -150,7 +152,7 @@ from the interposer over a Unix domain socket, and captures the outbound leg.
 
 - `internal/ebpf` — loader, map wrappers, cgroup attach (`cilium/ebpf`); owns the redirect
   programs compiled from `bpf/` via `bpf2go`.
-- `bpf/` — `connect4.bpf.c` (redirect + record), `sockops.bpf.c` (cookie→tuple re-key).
+- `bpf/` — `proxy.bpf.c`: `cgroup/connect4` (redirect + record) and `sockops` (cookie→tuple re-key) in one translation unit, plus generated `proxy_bpfel.go`/`proxy_bpfeb.go`.
 - `preload/` — `keylog_preload.c`: the `LD_PRELOAD` interposer, built with `clang`/`gcc` (not
   part of the Go build); wraps `SSL_CTX_new`/`SSL_CTX_new_ex` and registers OpenSSL's own
   `SSL_CTX_set_keylog_callback`.
@@ -193,8 +195,8 @@ flowchart LR
     preload -- "NSS line (unix socket)" --> keylog
     relay -- "getpeername -> map lookup<br/>(original dst)" --> kern
     relay == "raw pipe (end-to-end TLS)" ==> internet["Upstream server"]
-    cap -. "pcapng(eth0)+DSB" .-> disk[("/var/log/sidecar")]
-    keylog -. "sslkeylog (tmpfs)" .-> disk
+    cap -. "pcapng(eth0)+DSB" .-> disk[("/var/log/sidecar<br/>(disk-backed volume)")]
+    keylog -. "sslkeylog.log" .-> ktmpfs[("/var/log/sidecar-keylog-tmpfs/keylog<br/>(tmpfs, never on disk)")]
 ```
 
 ### Data Flow
@@ -202,7 +204,7 @@ flowchart LR
 1. App calls `connect(dst:443)`; the kernel invokes `cgroup/connect4`.
 2. `connect4` (TCP, IPv4, non-loopback, non-proxy-UID) records `origdst_by_cookie[cookie] = {dst_ip, dst_port}` and rewrites the destination to `127.0.0.1:15001`.
 3. `sockops` fires on `BPF_SOCK_OPS_TCP_CONNECT_CB` (after the source port is assigned, before SYN): it re-keys the entry to `origdst_by_tuple[(src_ip, src_port)]` and deletes the cookie key.
-4. The relay `accept()`s the redirected connection, reads `(src_ip, src_port)` via `getpeername()`, and looks up the original destination in `origdst_by_tuple`. On a miss it applies a bounded retry, then **fails closed (RST)** and records a miss metric — it never forwards to a default.
+4. The relay `accept()`s the redirected connection, reads `(src_ip, src_port)` via `getpeername()`, and looks up the original destination in `origdst_by_tuple`. On a miss it applies a bounded retry, then **fails closed (RST)** — it never forwards to a default. (A miss counter is planned; today the resolver only counts misses in-process.)
 5. The relay dials the **original destination** and raw-pipes bytes both directions. It does **not** parse or terminate TLS; the app's handshake completes **end-to-end** with the real server (real certificate validated by the app).
 6. Independently: when the app calls `SSL_CTX_new`/`SSL_CTX_new_ex`, the preloaded interposer's wrapper runs first, calls through to the real OpenSSL function, then calls `SSL_CTX_set_keylog_callback()` on the returned context with its own callback, before returning the context to the app unmodified.
 7. As OpenSSL derives each session secret during the handshake, it calls the registered callback with the `SSL *` and the **already NSS-formatted line**; the interposer forwards that line, verbatim, over a Unix domain socket to the sidecar.
@@ -217,8 +219,8 @@ on-disk artifacts rather than REST endpoints.
 | -------------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
 | BPF map ABI (`origdst_by_tuple`) | kernel → `internal/proxy`      | Key/value byte layout shared between C and Go; the original-dst lookup path |
 | Original-dst resolver            | `internal/proxy` internal      | `(srcIP, srcPort) → (dstIP, dstPort)`, or a typed "not found" error (fail-closed) |
-| NSS line (preload socket)        | `preload/keylog_preload.so` → `internal/keylog` | Newline-delimited, already-formatted NSS lines over a Unix domain socket |
-| Keylog file (NSS)                | `internal/keylog` → Wireshark  | Append-only NSS keylog lines at `/var/log/sidecar/sslkeylog.log` (tmpfs)    |
+| NSS line (preload socket)        | `preload/libkeylogpreload.so` → `internal/keylog` | Newline-delimited, already-formatted NSS lines over a Unix domain socket |
+| Keylog file (NSS)                | `internal/keylog` → Wireshark  | Append-only NSS keylog lines on **tmpfs** at `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` |
 | Capture file (pcapng+DSB)        | `internal/capture` → tshark    | Outbound-leg pcapng at `/var/log/sidecar/dump.pcapng`, keylog embedded as a DSB |
 
 **Original-destination lookup contract** (relay, per accepted connection):
@@ -226,7 +228,7 @@ on-disk artifacts rather than REST endpoints.
 ```text
 getpeername(accepted) -> (127.0.0.1, srcPort)
 origdst_by_tuple.Lookup({ip: srcIP, port: srcPort}) -> {dstIP, dstPort}   // or ErrNotFound
-// on ErrNotFound: bounded retry (few ms); still missing -> RST + miss metric (fail-closed, never a default)
+// on ErrNotFound: bounded retry (few ms); still missing -> RST (fail-closed, never a default; a miss counter is planned)
 ```
 
 **Preload interposer contract** (keylog, per OpenSSL-linked process):
@@ -249,8 +251,8 @@ cb(ssl, line) -> write `line` (already NSS-formatted by OpenSSL) to the sidecar'
 ```text
 # DSB-embedded pcapng (default): the keylog travels in the file, decrypts automatically
 tshark -r dump.pcapng -Y http                                    -> shows decrypted HTTP app-data
-# split mode (pcap + separate keylog):
-tshark -r dump.pcap -o "tls.keylog_file:sslkeylog.log" -Y http    -> shows decrypted HTTP app-data
+# explicit keylog pairing (also the shape a descoped pcap + separate keylog mode would use):
+tshark -r dump.pcapng -o "tls.keylog_file:sslkeylog.log" -Y http -V  -> shows decrypted HTTP app-data
 ```
 
 ### Data Schemas — BPF maps & on-disk artifacts
@@ -271,12 +273,20 @@ Contract invariants:
   trailing padding) — guarded by a unit test to catch CO-RE drift.
 - IPv4/`AF_INET` only; IPv6 values are rejected.
 
-**On-disk artifacts** (sidecar, `/var/log/sidecar/`):
+**Runtime artifacts** (sidecar) — deliberately **two separate mounts**: the capture volume is
+disk-backed, the keylog is RAM-only.
 
-- `sslkeylog.log` — NSS keylog, append-only, mode `0600`, on **tmpfs** (secret material; see Security).
+*Capture volume `/var/log/sidecar/`* — a disk-backed named volume, holding only:
+
 - `dump.pcapng` — outbound-leg capture (default), keylog embedded as a **DSB** so the file is
   self-decrypting; mode `0600`, timestamps aligned with the keylog. A `pcap + separate keylog`
-  split mode is available for independent retention.
+  split mode is **descoped from the MVP** (AD-005 — no code path) and deferred to a follow-on,
+  so DSB-embedded pcapng is the only mode that ships.
+
+*Keylog tmpfs `/var/log/sidecar-keylog-tmpfs/keylog/`* — a sidecar-only tmpfs, holding only:
+
+- `sslkeylog.log` — NSS keylog, append-only, mode `0600`, on **tmpfs**; key material never
+  reaches disk and is gone when the pod stops (secret material; see Security).
 
 ### Build & runtime configuration
 
@@ -284,10 +294,47 @@ Contract invariants:
 | --------------- | --------------------------------------------------------------------------------------------------- |
 | Kernel          | ≥ 5.10 LTS recommended (≥ 5.7 for `bpf_get_socket_cookie(sock_addr)`, ≥ 5.8 for `CAP_BPF`); no kernel floor for the preload interposer |
 | Kconfig         | `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`, `CONFIG_CGROUP_BPF`, `CONFIG_DEBUG_INFO_BTF` (redirect only; the interposer needs no kernel config) |
-| Caps (sidecar)  | `CAP_BPF` + `CAP_NET_ADMIN` (redirect; ≥ 5.8), else `CAP_SYS_ADMIN`. No `CAP_PERFMON` — was uprobe-attach-only |
-| Mounts (sidecar)| `/sys/fs/bpf` (rw, map/prog pinning), `/sys/fs/cgroup` (attach point), **tmpfs** for the keylog + preload socket. No `debugfs` |
-| Runtime         | Rootful Podman pod; app + sidecar share netns + host cgroup ns (no shared PID ns — uprobe-attach-only); sidecar runs entirely as UID 1337; app container launched with `LD_PRELOAD=<interposer.so>` |
-| Build toolchain | Go ≥ 1.22, `clang`/`llvm` ≥ 14 or `gcc` (compiles both the eBPF objects and the preload interposer `.so`), `bpftool` (for `vmlinux.h`), `cilium/ebpf` `bpf2go`                 |
+| Caps (sidecar)  | `--cap-drop ALL` then `CAP_BPF` + `CAP_NET_ADMIN` (cgroup attach; ≥ 5.8), `CAP_SYS_RESOURCE` (RLIMIT_MEMLOCK raise on load), `CAP_NET_RAW` (AF_PACKET capture socket); plus `--security-opt apparmor=unconfined,seccomp=unconfined` on this host (AD-009). No `CAP_PERFMON` — was uprobe-attach-only |
+| Mounts (sidecar)| `/sys/fs/bpf` (rw, map/prog pinning), `/sys/fs/cgroup` (attach point), a **tmpfs** for the keylog file, and named volumes for `/var/log/sidecar` (capture) and the `0711` shared socket dir. No `debugfs` |
+| Runtime         | Rootful Podman pod `--share net,ipc,uts` + `--cgroupns=host` (no shared PID ns — uprobe-attach-only); sidecar runs entirely as UID 1337 with `--cap-drop ALL`; app container launched with `LD_PRELOAD=<interposer.so>` + `GOEBPF_PRELOAD_SOCKET=<socket>` |
+| Build toolchain | Go ≥ 1.25 (`go.mod`: `go 1.25.0`), `clang`/`llvm` ≥ 14 or `gcc` (compiles both the eBPF objects and the preload interposer `.so`), `bpftool` (for `vmlinux.h`), `cilium/ebpf` `bpf2go`                 |
+| Supported platforms | Kubernetes worker nodes and local Podman dev, in priority order (AD-013): Ubuntu 24.04 LTS (reference) → Bottlerocket → Flatcar → Talos → Fedora CoreOS → Rocky Linux. See **Supported platforms** below — none verified yet |
+
+### Supported platforms
+
+Target platforms for Kubernetes worker nodes and local Podman development, in priority order
+(AD-013). Tier 1 is the **reference platform** and gates release.
+
+| # | Distribution | Role | LSM | Kernel (expected) | Status |
+| - | ------------ | ---- | --- | ----------------- | ------ |
+| 1 | Ubuntu 24.04 LTS (→ 26.04 LTS) | k8s worker node + local dev | AppArmor | 6.8 GA; newer via HWE | Planned (reference) |
+| 2 | Bottlerocket | k8s worker node (EKS) | SELinux | 6.1+ (variant-dependent) | Planned |
+| 3 | Flatcar Container Linux | k8s worker node | SELinux | 6.6 LTS (stable channel) | Planned |
+| 4 | Talos Linux | k8s worker node | KSPP-hardened; API-only, no shell | 6.12+ | Planned |
+| 5 | Fedora CoreOS | k8s worker node | SELinux | newest mainline | Planned |
+| 6 | Rocky Linux 9 | k8s worker node | SELinux | 5.14 + EL9 backports | Planned |
+
+> **Unverified.** Every kernel value above is *expected*, not measured, and every row is
+> `Planned`: no tier has been validated on a clean VM. All work to date ran on a single
+> developer workstation (kernel `7.0.0-31-generic`), which is **not** a supported-platform
+> claim. A row moves to `Verified` only when the `deploy/podman` e2e suite passes on it.
+
+Acceptance probes — run these before trusting a candidate node:
+
+```bash
+uname -r                                     # want >= 5.10
+ls /sys/kernel/btf/vmlinux                   # BTF present (CO-RE)
+stat -fc %T /sys/fs/cgroup                   # want "cgroup2fs"
+bpftool feature probe | grep -iE 'cgroup_sock_addr|sock_ops'   # bpftool prints "sock_ops", not "sockops"
+```
+
+**Portability risk (the main one)**: AD-009's confinement workaround
+(`--security-opt apparmor=unconfined`) is AppArmor-specific, so it covers Tier 1 only. Tiers 2,
+3, 5 and 6 run SELinux and need an equivalent policy decision rather than the same flag; Talos
+is API-only, so the harness must be driven through its API instead of a shell. Note also that
+`BPF_PROG_TEST_RUN` support for `CGroupSockAddr` varies by kernel build — it is unsupported on
+the current development host — so per-platform coverage must come from the e2e suite, not that
+test. This work is tracked as the `04-platform-support` feature.
 
 ### Architectural Principles
 
@@ -309,7 +356,7 @@ independent, loosely-coupled slices below, rather than a layered structure.
 
 ```text
 cmd/app/          # entrypoint: load+attach eBPF (cgroup), run relay, run keylog socket server, run capture
-bpf/              # *.bpf.c (connect4, sockops) + generated bpf2go
+bpf/              # proxy.bpf.c (connect4 + sockops, one TU) + generated bpf2go
 preload/          # keylog_preload.c: the LD_PRELOAD interposer (built with clang/gcc, not Go)
 internal/
   ebpf/           # loader, map wrappers, cgroup attach (cilium/ebpf)
@@ -318,7 +365,7 @@ internal/
   capture/        # in-process gopacket pcapng + DSB writer, retention
   convert/        # pcapng->IPFIX/flow (post-MVP)
   analisys/       # DPI / decryption validation (post-MVP)
-  shared/db/      # storage (existing)
+  shared/db/      # storage (placeholder, empty)
   shared/logger/  # logging (existing)
 pkg/tui/          # terminal UI (post-MVP)
 deploy/podman/    # pod create + run scripts (shared netns, host cgroup ns, caps, mounts, app LD_PRELOAD wiring)
@@ -339,7 +386,7 @@ deploy/podman/    # pod create + run scripts (shared netns, host cgroup ns, caps
 | Capture/keylog timestamp skew → offline decryption fails | Medium | Low | Single clock source; DSB embeds the keylog in the pcapng; alignment invariant test (IT-03.2) |
 | LRU eviction under churn evicts a tuple before `accept()` → connection fails closed | Medium | Low | `sockops` writes before SYN (race-free); size maps; bounded resolve-retry; monitor miss rate |
 | Silent gap: IPv6/UDP/QUIC egress not intercepted | Medium | Medium | Explicitly out of scope; document; consider `connect6`/QUIC handling in V2 |
-| Rootful privileges / over-broad capabilities | Medium | Medium | Scope to `CAP_BPF` + `CAP_NET_ADMIN` (redirect only — no `CAP_PERFMON` needed since key extraction is no longer uprobe-based); avoid `SYS_ADMIN` where the kernel allows |
+| Rootful privileges / over-broad capabilities | Medium | Medium | After `--cap-drop ALL`, scope to `CAP_BPF` + `CAP_NET_ADMIN` (redirect), `CAP_SYS_RESOURCE` (RLIMIT_MEMLOCK) and `CAP_NET_RAW` (AF_PACKET capture) — no `CAP_PERFMON` needed since key extraction is no longer uprobe-based; avoid `SYS_ADMIN` where the kernel allows |
 
 **Risk Scoring** — Impact: High (breaks interception/decryption, or leaks secrets) / Medium
 (degraded UX or partial coverage) / Low (minor). Probability: High (>50%) / Medium (20–50%) /
@@ -353,18 +400,19 @@ Milestones are vertical slices from the PRD (M1 redirect-only → M2 TLS+keylog 
 
 | Phase | Task | Description | Owner | Status | Estimate |
 | --- | --- | --- | --- | --- | --- |
-| **Phase 0 — Toolchain** | Scaffolding & Makefile | `go.mod`, Makefile (fmt/lint/vet/build/test), `bpf2go` wiring, `vmlinux.h` via `bpftool` | mesbrj | TODO | 2d |
-| **Phase 1 — M1 Redirect** | eBPF programs | `connect4.bpf.c` + `sockops.bpf.c`; maps `origdst_by_cookie`, `origdst_by_tuple` | mesbrj | TODO | 4d |
-|  | Loader & attach | `internal/ebpf` load, cgroup attach at pod parent, pin/unpin under `/sys/fs/bpf` | mesbrj | TODO | 3d |
-|  | Pass-through relay | `internal/proxy` accept, `getpeername`→tuple lookup (fail-closed + bounded retry), log orig-dst, raw-pipe | mesbrj | TODO | 3d |
-| **Phase 2 — M2 Preload keylog** | Preload interposer | `preload/keylog_preload.c`: interpose `SSL_CTX_new`/`SSL_CTX_new_ex`, register `SSL_CTX_set_keylog_callback` | mesbrj | TODO | 2d |
-|  | Keylog socket server | `internal/keylog` unix-socket server: accept, read newline-delimited lines, validate/dedup/append (reuses existing NSS pipeline) | mesbrj | TODO | 2d |
-|  | Preload env wiring | `cmd/app`/`deploy/podman` wiring: build the `.so`, set `LD_PRELOAD` + socket-path env vars on the app container | mesbrj | TODO | 2d |
-| **Phase 3 — M3 Capture harness** | Capture | `internal/capture` in-process gopacket pcapng + DSB to `/var/log/sidecar/dump.pcapng` (tcpdump fallback) | mesbrj | TODO | 3d |
-|  | Retention/cleanup | Bounded size/age caps, rotation, tmpfs keylog, teardown wipe / `--retain` | mesbrj | TODO | 1d |
-|  | Offline validation | tshark decrypts the DSB pcapng; assert decrypted HTTP app-data | mesbrj | TODO | 2d |
-|  | Podman harness | `deploy/podman` pod (shared netns, host cgroup ns), caps/mounts, app container `LD_PRELOAD` wiring, `curl https://example.com` smoke test | mesbrj | TODO | 3d |
-| **Phase 4 — Test & harden** | Unit + integration + e2e | `testify` suites; `integration`/`e2e` build tags (see Testing Strategy) | mesbrj | TODO | 4d |
+| **Phase 0 — Toolchain** | Scaffolding & Makefile | `go.mod`, Makefile (fmt/generate/lint/vet/build/build-preload/test/test-integration/test-coverage/tidy/clean/check; `LINK_MODE ?= static` → `CGO_ENABLED=0`), `bpf2go` wiring, `vmlinux.h` via `bpftool` | mesbrj | ✅ Done | 2d |
+| **Phase 1 — M1 Redirect** | eBPF programs | `proxy.bpf.c` (`cgroup/connect4` + `sockops`); maps `origdst_by_cookie`, `origdst_by_tuple` | mesbrj | ✅ Done | 4d |
+|  | Loader & attach | `internal/ebpf` load, cgroup attach at pod parent, pin/unpin under `/sys/fs/bpf` | mesbrj | ✅ Done | 3d |
+|  | Pass-through relay | `internal/proxy` accept, `getpeername`→tuple lookup (fail-closed + bounded retry), log orig-dst, raw-pipe | mesbrj | ✅ Done | 3d |
+| **Phase 2 — M2 Preload keylog** | Preload interposer | `preload/keylog_preload.c`: interpose `SSL_CTX_new`/`SSL_CTX_new_ex`, register `SSL_CTX_set_keylog_callback` | mesbrj | ✅ Done | 2d |
+|  | Keylog socket server | `internal/keylog` unix-socket server: accept, read newline-delimited lines, validate/dedup/append (reuses existing NSS pipeline) | mesbrj | ✅ Done | 2d |
+|  | Preload env wiring | `cmd/app`/`deploy/podman` wiring: build the `.so`, set `LD_PRELOAD` + socket-path env vars on the app container | mesbrj | ✅ Done | 2d |
+| **Phase 3 — M3 Capture harness** | Capture | `internal/capture` in-process gopacket pcapng + DSB to `/var/log/sidecar/dump.pcapng` (tcpdump fallback) | mesbrj | ✅ Done | 3d |
+|  | Retention/cleanup | Bounded size/age caps, rotation, tmpfs keylog, teardown wipe / `--retain` | mesbrj | ✅ Done | 1d |
+|  | Offline validation | tshark decrypts the DSB pcapng; assert decrypted HTTP app-data | mesbrj | ✅ Done | 2d |
+|  | Podman harness | `deploy/podman` pod (shared netns, host cgroup ns), caps/mounts, app container `LD_PRELOAD` wiring, `curl https://example.com` smoke test | mesbrj | ✅ Done | 3d |
+| **Phase 4 — Test & harden** | Unit + integration + e2e | `testify` suites; `integration`/`e2e` build tags (see Testing Strategy) | mesbrj | ✅ Done | 4d |
+| **Phase 5 — Platform verification** | Feature 04 supported platforms (AD-013) | Run the `deploy/podman` e2e suite per tier to move rows from `Planned` to `Verified` (Ubuntu 24.04 reference first); decide the SELinux equivalent of the AppArmor `unconfined` workaround; drive Talos through its API instead of a shell | mesbrj | 🔜 Planned | TBD |
 
 **Dependencies**:
 
@@ -414,12 +462,15 @@ Milestones are vertical slices from the PRD (M1 redirect-only → M2 TLS+keylog 
 - **Key material at rest**: `sslkeylog.log` on **tmpfs**, mode `0600`, owned by the sidecar
   UID, directory `0700`; never persisted to disk beyond RAM.
 - **Key material in transit (preload socket)**: the Unix domain socket between the interposer
-  and the sidecar lives in the same `0700` tmpfs directory as the keylog, reachable only within
-  the pod's shared UID trust boundary; it is never network-reachable and carries the same
-  secret-grade lines as the file it feeds.
+  and the sidecar lives in a pod-shared `0711` directory (a named volume at `/run/keylog`) with
+  the bound socket file at `0666`, so the app container's arbitrary UID can reach the sidecar's
+  UID-1337 listener; the directory — not the socket file — is the trust boundary. It is never
+  network-reachable and carries the same secret-grade lines as the file it feeds. The keylog
+  file itself lives on a separate, sidecar-only tmpfs.
 - **Capture at rest**: `dump.pcapng` mode `0600`; the DSB embeds the keylog, so the file is
-  plaintext-equivalent and handled identically. A split (pcap + separate keylog) mode allows
-  ciphertext and secrets to be retained independently.
+  plaintext-equivalent and handled identically. A split (pcap + separate keylog) mode — which
+  would let ciphertext and secrets be retained independently — is **descoped from the MVP**
+  (AD-005: no code path) and deferred to a follow-on.
 - **Retention**: bounded (size + age caps, rotation) and ephemeral by default; pod teardown
   wipes `/var/log/sidecar`, with `--retain` to opt in. Never unbounded.
 - **In transit**: the app↔server leg is TLS 1.3 with forward secrecy; the app↔relay leg is
@@ -435,11 +486,13 @@ Milestones are vertical slices from the PRD (M1 redirect-only → M2 TLS+keylog 
 
 ### Least privilege
 
-- Capabilities scoped to `CAP_BPF` + `CAP_NET_ADMIN` (redirect only; kernel ≥ 5.8); fall back
-  to `CAP_SYS_ADMIN` only on older kernels. **No `CAP_PERFMON`** — it was required only for
-  uprobe attach, which no longer exists in this design.
-- Mounts limited to `/sys/fs/bpf`, `/sys/fs/cgroup`, and a tmpfs for the keylog + preload
-  socket. No `debugfs`.
+- Capabilities scoped to `CAP_BPF` + `CAP_NET_ADMIN` (cgroup attach; kernel ≥ 5.8),
+  `CAP_SYS_RESOURCE` (RLIMIT_MEMLOCK raise on BPF load) and `CAP_NET_RAW` (AF_PACKET capture
+  socket), all after `--cap-drop ALL`. **No `CAP_PERFMON`** — it was required only for uprobe
+  attach, which no longer exists in this design. AppArmor/seccomp confinement is disabled on the
+  sidecar container only (AD-009), which widens its effective surface beyond this cap list.
+- Mounts limited to `/sys/fs/bpf`, `/sys/fs/cgroup`, a tmpfs for the keylog, and named volumes
+  for the capture directory and the shared socket directory. No `debugfs`.
 - Rootful Podman is still required for the redirect half (cgroup program attach), but every
   sidecar process runs as UID 1337, and the app container needs no elevated privilege at all
   to have the interposer preloaded into it (an env var + a bind-mounted `.so`).
@@ -472,10 +525,10 @@ default unit run stays green on unprivileged CI.
 | Test Type | Scope | Coverage target | Approach |
 | --- | --- | --- | --- |
 | Unit | map codec, resolver miss policy, NSS format/dedup, keylog socket server, pcapng+DSB writer, retention | Pure-Go, no kernel | `testify` table/suite tests |
-| Integration (eBPF cgroup) | `connect4`/`sockops` behaviour, attach/pin lifecycle | Kernel ≥ 5.10, `CAP_BPF`+`CAP_NET_ADMIN` | `BPF_PROG_TEST_RUN` via `cilium/ebpf` `Program.Test`, real cgroup |
+| Integration (eBPF cgroup) | `connect4`/`sockops` behaviour, attach/pin lifecycle | Kernel ≥ 5.10, `CAP_BPF`+`CAP_NET_ADMIN` | Real cgroup attach/pin; behaviour attempted via `BPF_PROG_TEST_RUN` (`cilium/ebpf` `Program.Run(&ebpf.RunOptions{…})`), which is unsupported for `cgroup/connect4` on this host — those tests `t.Skip`, so the rewrite/re-key behaviour is proven by the Feature 03 e2e suite |
 | Integration (preload interposer) | secret extraction from a real `libssl` (TLS 1.2/1.3) via `LD_PRELOAD` | `clang`/`gcc` + real `libssl`, no special kernel/caps | build tag `integration` |
 | Integration (relay) | fail-closed miss, passthrough splice | Loopback / `net.Pipe` | build tag `integration` |
-| Integration (decrypt) | pcapng+DSB (and split pcap+keylog) → tshark app-data | Needs `tshark` | build tag `integration` |
+| Integration (decrypt) | pcapng+DSB → tshark app-data | Needs `tshark` | build tag `integration` |
 | E2E (Podman) | pod bring-up (shared netns, host cgroup ns), curl smoke (real cert), offline validation, teardown cleanup | Rootful, `podman` + kernel ≥ 5.10 | build tag `e2e` |
 
 ### Critical scenarios (traced to feature acceptance)
@@ -484,7 +537,7 @@ default unit run stays green on unprivileged CI.
 
 - Unit: `orig_dst`/`tuple_key` codec round-trip and struct-layout match; port byte-order
   normalisation; IPv4-only decode; loader config (`PROXY_UID=1337`, `PROXY_PORT=15001`,
-  pin dir); resolver "not found" → fail-closed (bounded retry, RST, miss metric).
+  pin dir); resolver "not found" → fail-closed (bounded retry, RST; a miss counter is planned).
 - Integration: `connect4` rewrites TCP non-loopback and records by cookie; skips UDP,
   loopback, and UID 1337; `sockops` re-keys cookie→tuple and drops the cookie; attach at the
   pod parent + pin lifecycle; LRU self-eviction; fail-closed on an un-redirected direct connect;
@@ -505,8 +558,8 @@ default unit run stays green on unprivileged CI.
 - Unit: pcapng writer validity/link-type/bytes; capture/keylog shared clock; path/config;
   retention enforcement (size + age caps, `--retain`); artifact permissions (`0600`/`0700`);
   tshark pairing helper.
-- Integration: **acceptance** — tshark decrypts the DSB pcapng (and the split pcap+keylog)
-  to HTTP app-data; timestamp-skew negative test; tcpdump vs gopacket parity.
+- Integration: **acceptance** — tshark decrypts the DSB pcapng to HTTP app-data;
+  timestamp-skew negative test; tcpdump vs gopacket parity.
 - E2E: rootful pod (shared netns, host cgroup ns, caps + mounts) healthy with maps pinned and
   the app container's interposer loaded; `curl https://example.com` succeeds without `-k`
   (real cert); smoke test end-to-end (200, orig-dst logged, files grow); offline validation;
@@ -520,6 +573,12 @@ This is a local/dev sidecar, so "monitoring" means operator-facing signals and s
 rather than a production APM stack.
 
 ### Signals to track
+
+> **Planned — not implemented.** None of the counters or gauges below exist in the code today.
+> The sidecar's only implemented signal is one structured log line per relayed connection
+> (`log.Info("connection relayed", …)` in `cmd/app/app.go`). The resolver does count definitive
+> misses in-process (`proxy.WithOnMiss` callback + `Resolver.Misses()`), but nothing exports it
+> as a metric. Treat this table as the target observability surface.
 
 | Signal | Type | Watch for | Surface |
 | --- | --- | --- | --- |
@@ -535,27 +594,24 @@ rather than a production APM stack.
 
 ### Structured logging
 
-**Log format** (JSON), per connection:
+**Log format** (JSON) — what the sidecar emits today: one record per relayed connection, from
+`internal/shared/logger`'s `{"level","timestamp","message","context"}` shape:
 
 ```json
 {
-  "level": "info",
+  "level": "INFO",
   "timestamp": "2026-09-01T10:00:00Z",
   "message": "connection relayed",
   "context": {
-    "conn_id": "c-123",
-    "src": "127.0.0.1:52344",
-    "orig_dst": "93.184.216.34:443",
-    "bytes_up": 1234,
-    "bytes_down": 5678,
-    "duration_ms": 42
+    "orig_dst": "93.184.216.34:443"
   }
 }
 ```
 
-- Log: interception events, orig-dst resolution (with miss reason — a security signal),
-  relay dial outcome, preload interposer connection status, keylog-line counters,
-  capture/artifact rotation.
+- **Planned — not implemented**: the additional per-connection fields (`conn_id`, `src`,
+  `bytes_up`, `bytes_down`, `duration_ms`) and the remaining log events — orig-dst resolution
+  (with miss reason — a security signal), relay dial outcome, preload interposer connection
+  status, keylog-line counters, capture/artifact rotation.
 - The L4 relay does not parse SNI/ALPN; only the orig-dst `IP:port` is recorded (treated as sensitive).
 - Never log: keylog secrets, client randoms, decrypted plaintext (see Security).
 
@@ -608,7 +664,7 @@ there is no production traffic ramp, but the same discipline applies.
 | Interception correctness | N/A (new) | 100% of app IPv4 TCP egress resolves the exact original dst | Feature-01 acceptance / e2e |
 | Decryption success | N/A | `curl https://example.com` egress decrypts to plaintext HTTP via the preload-interposer keylog | Feature-03 acceptance (tshark) |
 | Keylog correctness | N/A | emitted `client_random` matches the captured ClientHello | Feature-02 acceptance |
-| Original-dst lookup miss rate | N/A | ~0 under normal churn (misses fail closed) | sidecar counter |
+| Original-dst lookup miss rate | N/A | ~0 under normal churn (misses fail closed) | in-process `Resolver.Misses()` / integration tests (an exported miss counter is planned) |
 | Loop incidents (sidecar re-intercepted) | N/A | 0 | e2e loop-avoidance test / logs |
 | Flows raw-piped intact | N/A | 100% bytes unchanged both legs | relay integration test |
 | Unit test suite | N/A | green on unprivileged CI (`make test`) | CI |
@@ -687,14 +743,14 @@ project's actual target library) and fails loudly when absent.
 
 | Dependency | Type | Notes | Risk |
 | --- | --- | --- | --- |
-| Linux kernel ≥ 5.10 (BTF enabled) | Infrastructure | `bpf_get_socket_cookie` ≥ 5.7, `CAP_BPF` + ring buffer ≥ 5.8 for the **redirect** programs only; CO-RE needs `CONFIG_DEBUG_INFO_BTF`. Key extraction has no kernel-version dependency (AD-010) | Medium (older/custom kernels, redirect only) |
+| Linux kernel ≥ 5.10 (BTF enabled) | Infrastructure | `bpf_get_socket_cookie` ≥ 5.7, `CAP_BPF` ≥ 5.8 for the **redirect** programs only (LRU hash maps; no ring buffer remains since AD-010); CO-RE needs `CONFIG_DEBUG_INFO_BTF`. Key extraction has no kernel-version dependency (AD-010) | Medium (older/custom kernels, redirect only) |
 | App TLS library (OpenSSL `libssl`/`libcrypto`, dynamically linked) | Runtime (interposer target) | `SSL_CTX_set_keylog_callback` must be present (OpenSSL ≥ 1.1.1, i.e. every currently-maintained release); statically linked/non-OpenSSL targets get no keylog (documented, graceful no-op) | Low |
 | `clang`/`llvm` ≥ 14 or `gcc` | Build | Compiles both `*.bpf.c` and the preload interposer `preload/keylog_preload.c` | Low |
 | `cilium/ebpf` (+ `bpf2go`) | External (Go) | Pure-Go loader/codegen for the redirect programs, no CGO | Low |
 | `bpftool` | Build | Generates `vmlinux.h` for CO-RE | Low |
-| Go ≥ 1.22 | External | Relay, keylog socket server, pcapng+DSB writer (GoTLS module remains an interface-only follow-on) | Low |
+| Go ≥ 1.25 | External | Relay, keylog socket server, pcapng+DSB writer (GoTLS module remains an interface-only follow-on) | Low |
 | `testify` | External (Go) | Unit/integration/e2e assertions and suites | Low |
-| gopacket (`afpacket`, `pcapgo`) / `tcpdump` | External | In-process pcapng+DSB (default, pure-Go); tcpdump fallback | Low |
+| gopacket (`pcapgo`) / `tcpdump` | External | In-process pcapng+DSB via `pcapgo.EthernetHandle` (default, pure-Go); tcpdump fallback. `afpacket` is planned for the CAPTURE-04 fix (AD-012) — it is a package of the already-required `gopacket/gopacket v1.7.1`, pure Go and CGO-free, so adopting it adds no new module dependency | Low |
 | `tshark`/Wireshark | External | Offline decryption validation | Low |
 | Rootful Podman (shared netns, host cgroup ns) | Infrastructure | Pod, caps, mounts for the redirect programs' cgroup attach; the app container needs no special namespace for the interposer (an env var + bind-mounted `.so`) | Medium (rootless can't load the redirect program types) |
 
@@ -714,7 +770,7 @@ The MVP targets correctness and reproducibility on a single host, not throughput
 | Interception overhead | `connect()` rewrite is O(1) in-kernel; negligible per-connection | Manual/e2e observation |
 | Interposer overhead | One keylog callback firing per derived secret (not per packet); O(1) secret extraction | Manual/integration observation |
 | Relay path | One extra local hop (double TCP-stack traversal accepted; no `sockmap` in MVP) | e2e smoke test |
-| Capture path | In-process `afpacket` (TPACKET_V3 mmap ring) with in-kernel BPF filter to bound loss | integration/e2e |
+| Capture path | **Current**: in-process `pcapgo.EthernetHandle` (non-mmap AF_PACKET, 64KiB capture length). Known limitation: TCP segment loss under real TLS handshake bursts (CAPTURE-04); an in-kernel BPF filter was attempted and reverted — it stopped capture mid-connection. **Planned**: `afpacket` TPACKET_V3 mmap ring to bound loss (AD-012) | integration/e2e |
 | Correctness under churn | ~0 original-dst lookup misses under normal dev load (misses fail closed); LRU sized to avoid premature eviction | integration/e2e |
 | Capture fidelity | Timestamps aligned so tshark decrypts reliably; DSB embeds the keylog | IT-03.2 |
 
@@ -736,7 +792,7 @@ The only state is ephemeral (BPF map entries, transient `/var/log/sidecar` artif
 | --- | --- | --- | --- | --- |
 | 1 | Capture backend default: external `tcpdump` vs in-process gopacket? | pcapng is the default format; DSB embeds the keylog | mesbrj | ✅ Resolved: in-process gopacket (`pcapgo` pcapng + DSB) is the default; `tcpdump` is an optional fallback/parity backend |
 | 2 | cgroup attach target: app container cgroup vs pod common parent? | Loop avoidance via UID-1337 skip + whole-sidecar UID | mesbrj | ✅ Resolved: **pod common parent** cgroup |
-| 3 | Keylog/pcap retention & cleanup policy for `/var/log/sidecar`? | Plaintext-equivalent secret artifacts | mesbrj | ✅ Resolved: tmpfs keylog, `0600`/`0700`; bounded (size+age caps, rotation) + ephemeral-by-default (teardown wipe, `--retain` to keep); DSB single-file vs split modes; no secrets to APM; post-MVP governed store |
+| 3 | Keylog/pcap retention & cleanup policy for `/var/log/sidecar`? | Plaintext-equivalent secret artifacts | mesbrj | ✅ Resolved: tmpfs keylog, `0600`/`0700`; bounded (size+age caps, rotation) + ephemeral-by-default (teardown wipe, `--retain` to keep); DSB single-file is the only shipped mode (the split pcap + separate keylog mode is descoped — AD-005); no secrets to APM; post-MVP governed store |
 | 4 | Behaviour on original-dst lookup miss: close vs raw-pipe to a safe default? | Security prefers fail-closed | mesbrj | ✅ Resolved: **fail-closed** — bounded resolve-retry then RST; misses are security telemetry (never a default) |
 | 5 | Dev CA lifecycle: regenerate per run vs persist across runs? | — | mesbrj | ✅ Resolved: **N/A** — the passive `LD_PRELOAD` interposer model has no CA |
 | 6 | SNI logging: is logging SNI acceptable given it can be sensitive? | — | mesbrj | ✅ Resolved: **N/A** — the L4 relay does not parse SNI; only the orig-dst `IP:port` is logged (treated as sensitive) |
@@ -754,8 +810,9 @@ The only state is ephemeral (BPF map entries, transient `/var/log/sidecar` artif
 | **M2 — Preload keylog** | `LD_PRELOAD` interposer (`SSL_CTX_set_keylog_callback`), keylog socket server (OpenSSL), NSS writer (proves decryption in Wireshark) | ✅ Done (Verifier PASS) |
 | **M3 — Capture harness** | in-process pcapng+DSB capture + automated decrypt check; Podman scripts (shared netns, host cgroup ns); `curl https://…` smoke test | ✅ Done (Verifier PASS) |
 | **Hardening** | Full unit/integration/e2e suites; security review of LD_PRELOAD interposer/keylog handling + retention | ✅ Done — `make lint` 0 issues, `go test -race ./...` 49 passed, `go test -race -tags=integration ./...` 58 passed/10 skipped (env-gated), all green |
+| **M4 — Platform verification** | Feature 04 (AD-013): the `deploy/podman` e2e suite passing per supported-platform tier; SELinux confinement decision; Talos API-driven harness | 🔜 Planned — no tier verified yet; all work to date ran on one developer workstation |
 
-**Critical path**: M0 → M1 → M2 → M3 → Hardening.
+**Critical path**: M0 → M1 → M2 → M3 → Hardening → M4.
 
 ---
 

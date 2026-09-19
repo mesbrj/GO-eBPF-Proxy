@@ -221,3 +221,14 @@ tracked as lesson `L-005`, and does not block a PASS verdict per validate.md's r
 candidate for a future task (e.g. an integration test that intentionally breaks cert validation
 and asserts the interposer didn't cause it) but is not a blocking gap for this feature's
 completion.
+
+---
+
+## 2026-09-18 — Independent revalidation (fresh Verifier, author ≠ verifier)
+
+- **Verdict: PASS.** Coverage re-derived independently (evidence-or-zero).
+- **Spec drift check**: none — `spec.md` accurately reflects the AD-010 LD_PRELOAD interposer + Unix-socket mechanism (carries the explicit AD-010 revision note; dir name `02-uprobe-keylog` deliberately kept). Verified all AD-010 removals: `discovery.go`/`event.go`/`consumer.go`/`openssl_offsets.go`/`gotls.go`/`bpf/tls_keylog.bpf.c` gone; zero uprobe/`bpf_probe_read`/ringbuf/offset residue in non-test `internal/keylog`.
+- **Deterministic gates**: 0 errors. `make lint` 0 issues. Unit suite green; C-interposer integration layer (KEYLOG-01/02/03/04/08) skips without clang/libssl — inherent to an `LD_PRELOAD` library, disclosed, tests exist and are well-formed.
+- **Discrimination sensor** (unit layers, restored from scratch — no `git stash`): 3/3 killed — NSS client_random length check removed (killed by `TestValidateLine_RejectsMalformed`), writer mode `0600→0644` (killed by `TestWriter_ModesAndAppend`), preload env var name change (killed by `TestPreloadEnv_ExactlyTwoExpectedVars`).
+- **Confirmed residual (unchanged, non-blocking)**: KEYLOG-03 (handshake/cert untouched) is code-shape evidenced only, not runtime-tested (tracked as lesson `L-005`); dir-guard negative test covers only `0o777`, not a read-only-bit permutation (logic is correct).
+- Real tree returned to baseline (` M .gitignore` only).

@@ -3,7 +3,7 @@
   "promote_threshold": 2,
   "window_days": 45,
   "quarantine_threshold": 2,
-  "next_id": 10,
+  "next_id": 12,
   "lessons": [
     {
       "id": "L-001",
@@ -166,6 +166,42 @@
       ],
       "created": "2026-09-13T02:48:28Z",
       "last_seen": "2026-09-13T02:48:28Z"
+    },
+    {
+      "id": "L-010",
+      "key": "ac_gap::run the privileged e2e test ladder for real sudo real pod before claiming an ac verified tests that always skip on missing root tools hid four shipped capture bugs zero byte pcapng ifindex mismatch gso truncation retain never forwarded",
+      "text": "Run the privileged/e2e test ladder for real (sudo + real pod) before claiming an AC verified; tests that always skip on missing root/tools hid four shipped capture bugs (zero-byte pcapng, ifindex mismatch, GSO truncation, --retain never forwarded).",
+      "signal": "ac_gap",
+      "scope": "testing,e2e,privileged",
+      "status": "candidate",
+      "features": [
+        "03-capture-harness"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        ".specs/STATE.md AD-011/AD-012 (testing,e2e,privileged)"
+      ],
+      "created": "2026-09-19T17:34:55Z",
+      "last_seen": "2026-09-19T17:34:55Z"
+    },
+    {
+      "id": "L-011",
+      "key": "ac_gap::run the privileged e2e test ladder for real sudo real pod before claiming an ac verified tests that always skip on missing root tools leave core behaviour with zero executing assertions",
+      "text": "Run the privileged/e2e test ladder for real (sudo + real pod) before claiming an AC verified; tests that always skip on missing root/tools leave core behaviour with zero executing assertions.",
+      "signal": "ac_gap",
+      "scope": "testing,e2e,privileged",
+      "status": "candidate",
+      "features": [
+        "01-ebpf-redirect"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "bpf/connect4_it_test.go:109 (testing,e2e,privileged)"
+      ],
+      "created": "2026-09-19T17:34:55Z",
+      "last_seen": "2026-09-19T17:34:55Z"
     }
   ]
 }

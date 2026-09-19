@@ -10,7 +10,7 @@ Implement these tasks with the `tlc-spec-driven` skill: **activate it by name an
 
 **Design**: `.specs/features/03-capture-harness/design.md`
 **Milestone**: M3 — Capture harness
-**Status**: Phases 1-4 Done (Verifier PASS); Phase 5 (T12-T14) Done — author-run re-verification PASS (see `validation.md`'s "Phase 5 re-verification" section; independent sub-agent dispatch was attempted but returned no output in this environment)
+**Status**: Phases 1-4 Done (Verifier PASS); Phase 5 (T12-T14) Done — author-run re-verification PASS (see `validation.md`'s "Phase 5 re-verification" section; independent sub-agent dispatch was attempted but returned no output in this environment) · **Phase 6 (T15-T21): Withdrawn — premise falsified by AD-014** (never implemented; kept below as a historical record) · **Phase 7 (T22-T25): Done** — CAPTURE-04 closed for real on 2026-09-19 (AD-014); e2e 6 passed / 0 failed / 0 skipped on a live rootful pod, 3 consecutive runs
 
 > **Depends on M1+M2**: reuses `internal/ebpf`/`internal/proxy` (F01), `internal/keylog` (F02), and `internal/shared/logger`.
 
@@ -27,6 +27,7 @@ Implement these tasks with the `tlc-spec-driven` skill: **activate it by name an
 | tcpdump fallback + parity | integration | Backend parity (IT-03.3) | `internal/capture/*_it_test.go` | `go test -race -tags=integration ./internal/capture/...` |
 | tshark pairing + decrypt | integration | Decrypt (IT-03.1), skew negative (IT-03.2) | `internal/capture/*_it_test.go` | `go test -race -tags=integration ./internal/capture/...` |
 | Retention manager | unit | Perms, size+age caps, `--retain`, world-access refuse (UT-03.5, UT-03.6) | `internal/capture/*_test.go` | `go test -race ./internal/capture/...` |
+| ~~AF_PACKET ring source (Phase 6)~~ — **withdrawn, AD-014** | ~~unit + integration~~ | Layer never created: Phase 6's premise was falsified and no `ring*.go` exists. Row kept so the matrix still explains the Phase 6 tasks below | ~~`internal/capture/ring*_test.go`~~ | n/a |
 | Entrypoint wiring | integration | Orchestrates load+attach+relay+keylog+capture | `cmd/app/*_it_test.go` | `go test -race -tags=integration ./cmd/app/...` |
 | Podman harness | e2e | Pod bring-up, loop avoidance (IT-03.4, IT-03.8) | `deploy/podman/*_e2e_test.go` | `go test -race -tags=e2e ./deploy/podman/...` |
 | Smoke + offline validation | e2e | Real-cert curl + decrypt (IT-03.5–03.7, IT-03.9) | `deploy/podman/*_e2e_test.go` | `go test -race -tags=e2e ./deploy/podman/...` |
@@ -63,6 +64,18 @@ Phase 3: Harness & e2e
 
 ```text
 T7 → T8
+```
+
+Phase 6: AF_PACKET ring capture (CAPTURE-04) — **Withdrawn, never executed** (AD-014)
+
+```text
+T15 → T16 → T17 → T18 → T19 → T20 → T21   (withdrawn)
+```
+
+Phase 7: CAPTURE-04 root-cause fixes
+
+```text
+T22 → T23 → T24 → T25
 ```
 
 ---
@@ -190,7 +203,7 @@ T7 → T8
 
 #### T6: Entrypoint wiring
 
-**What**: Wire load+attach (cgroup + uprobes), relay, keylog, and capture in `cmd/app`; CLI flags (`--libssl`, `--retain`, backend).
+**What**: Wire load+attach (cgroup + uprobes), relay, keylog, and capture in `cmd/app`; CLI flags (`--libssl`, `--retain`, backend). *(As-written pre-AD-010: the uprobe attach and `--libssl` flag were superseded by the LD_PRELOAD interposer + keylog socket server and never shipped; the delivered flags are `--cgroup-path`, `--relay-listen`, `--pin-dir`, `--keylog-socket`, `--keylog-path`, `--capture-iface`, `--capture-path`, `--retain`, `--max-bytes`, `--max-age`, `--retention-interval`.)*
 **Where**: `cmd/app/main.go`
 **Depends on**: T5
 **Reuses**: F01 loader/relay, F02 keylog, T2–T5 capture
@@ -375,10 +388,10 @@ T7 → T8
 **Done when**:
 
 - [x] `make build LINK_MODE=static` produces a statically linked `bin/app` (`CGO_ENABLED=0`)
-- [x] `make build LINK_MODE=dynamic` (default) produces a dynamically linked `bin/app` (`CGO_ENABLED=1`), preserving prior default behavior for non-Alpine use
+- [x] `make build LINK_MODE=dynamic` produces a dynamically linked `bin/app` (`CGO_ENABLED=1`) for non-Alpine use — note: `dynamic` was the default at T13; `static` became the default in commit `1c14582`
 - [x] An invalid `LINK_MODE` value fails `make` with a clear error
 - [x] `pod_e2e_test.go`'s `buildSidecarBinary` always sets `CGO_ENABLED=0` regardless of the host's ambient default (mirrors `LINK_MODE=static`)
-- [x] `pod-up.sh`'s missing-binary message and `README.md`'s Quick start both reference `make build LINK_MODE=static`
+- [x] `pod-up.sh`'s missing-binary message and `README.md`'s Quick start both produce a static binary (`README.md` now just says `make build`, since `static` is the default since `1c14582`)
 - [x] Test count: N/A (build tooling; verified by direct invocation, not a Go test)
 
 **Tests**: none (build-tooling verification via direct `make`/`file` invocation)
@@ -416,13 +429,15 @@ T7 → T8
 ## Phase Execution Map
 
 ```text
-Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
+Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → [Phase 6 withdrawn] → Phase 7
 
 Phase 1:  T1 → T2 → T3 → T4
 Phase 2:  T5 → T6
 Phase 3:  T7 → T8
 Phase 4:  T9 → T10 → T11
 Phase 5:  T12 → T13 → T14
+Phase 6:  T15 → T16 → T17 → T18 → T19 → T20 → T21   (withdrawn, never executed — AD-014)
+Phase 7:  T22 → T23 → T24 → T25
 ```
 
 Execution is strictly sequential — one task at a time, in order.
@@ -457,6 +472,339 @@ Execution is strictly sequential — one task at a time, in order.
 
 ---
 
+### Phase 6: AF_PACKET ring capture (CAPTURE-04) — ❌ WITHDRAWN (premise falsified by AD-014)
+
+> **Status: Withdrawn — premise falsified by AD-014 (2026-09-19). Never executed; no task below
+> was implemented and no commit exists for any of them.** T15-T21 are kept verbatim as a
+> historical record of what was planned and why, per this repo's convention of superseding
+> decisions rather than erasing them. Do not pick them up as written.
+>
+> **Why withdrawn**: every task below rests on one claim — that CAPTURE-04's offline-decrypt
+> failure was TCP segment *loss* in the in-process `pcapgo.EthernetHandle` backend, curable by a
+> mmap'd AF_PACKET ring. That claim (AD-012) is a misdiagnosis. Live testing on a real rootful
+> Podman pod found three other causes, each sufficient on its own to make a complete,
+> correctly-keyed capture decrypt to nothing: an ALPN-blind `-Y http` display filter against an
+> HTTP/2 session; a Decryption Secrets Block written as the capture's **last** block, which
+> tshark's sequential reader reaches only after the packets it should have decrypted; and
+> tshark's out-of-order TCP reassembly being off by default while roughly a third of real
+> sessions record their segments out of sequence. No segments were missing.
+>
+> **The decisive evidence**: a `tcpdump` run simultaneously in the same netns — which *is* an
+> mmap'd AF_PACKET ring, exactly what `gopacket/afpacket` provides — recorded the **same**
+> reordering on 6 of 8 streams and decrypted only 5/8 by default, 8/8 with
+> `tcp.reassemble_out_of_order:TRUE`. An afpacket migration would therefore not have fixed
+> CAPTURE-04. Phase 7 records what did.
+>
+> **What survives this withdrawal**: nothing here is disproven about `afpacket` itself — the
+> pre-planning note below (pure Go, `CGO_ENABLED=0`-clean, already in `go.mod` via
+> `gopacket/gopacket v1.7.1`) still holds, and T17's drop-counter idea remains the right way to
+> *measure* kernel-side loss. If a future workload shows real drops, this phase is a reasonable
+> starting point — but it must then be justified by measured counters, not inferred from a
+> decrypt failure, which is the inference this phase was built on.
+>
+> **No longer a prerequisite for**: Feature `04-platform-support`. PLATFORM-01 needs a 0-skipped
+> e2e run; AD-014 delivered one (6 passed / 0 failed / 0 skipped, 3 consecutive runs). The
+> residual platform gap is a clean Ubuntu 24.04 VM, not a capture-backend rewrite.
+>
+> ---
+>
+> *Original rationale, preserved unchanged:*
+>
+> **Why**: AD-012 left CAPTURE-04 open — the in-process backend (`pcapgo.EthernetHandle`, a
+> non-mmap AF_PACKET socket) drops TCP segments under a real TLS burst, so
+> `TestSmoke_OfflineValidationDecryptsPlaintext` retries-then-skips instead of asserting. This
+> phase replaces it with `gopacket/afpacket`'s TPACKET_V3 mmap ring and turns that skip into a
+> hard assertion.
+>
+> **Verified before planning**: `github.com/gopacket/gopacket/afpacket` is **pure Go** (no
+> `import "C"`), builds under `CGO_ENABLED=0` (confirmed by direct build), and lives in the
+> `gopacket/gopacket v1.7.1` module already in `go.mod` — so this adds **no new module
+> dependency** and does not threaten the static/musl build required by AD-009/AD-011.
+>
+> **Prerequisite for**: Feature `04-platform-support` (PLATFORM-01 needs a 0-skipped e2e run).
+
+#### T15: AF_PACKET ring geometry
+
+**What**: Pure function computing a valid TPACKET_V3 ring geometry (frame size, block size, block count) from the capture snaplen, honouring page-size and `TPACKET_ALIGNMENT` constraints.
+**Where**: `internal/capture/ring.go`
+**Depends on**: None
+**Reuses**: `MaxCaptureLength` (65536, from AD-012), `os.Getpagesize`
+**Requirement**: CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] Returns a geometry where block size is a multiple of the page size, frame size is `TPACKET_ALIGNMENT`-aligned, and block size is a whole multiple of frame size
+- [ ] Frame size accommodates `MaxCaptureLength` plus the tpacket header, so GSO/TSO-inflated container-veth frames are not truncated (preserves AD-012's fix)
+- [ ] Rejects a non-positive or absurdly large snaplen with a typed error rather than producing an invalid ring
+- [ ] Unit tests satisfy the Coverage Expectation (all branches + boundary cases)
+- [ ] Quick gate passes: `go test -race ./internal/capture/...`
+
+**Tests**: unit
+**Gate**: quick
+**Commit**: `feat(capture): add af_packet ring geometry calculation`
+
+---
+
+#### T16: AF_PACKET ring capture source
+
+**What**: A capture source backed by `afpacket.TPacket` in TPACKET_V3 mode using T15's geometry, exposing read and close with the same shape the writer loop already consumes.
+**Where**: `internal/capture/ring_source.go`
+**Depends on**: T15
+**Reuses**: T15 geometry, `github.com/gopacket/gopacket/afpacket`
+**Requirement**: CAPTURE-01, CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] Opens a TPACKET_V3 ring on a named interface and returns packets as `(data []byte, ci gopacket.CaptureInfo, err error)`
+- [ ] `Close` is safe to call once and unblocks an in-flight read without a data race (`-race` clean)
+- [ ] IF the interface does not exist or `CAP_NET_RAW` is absent THEN the constructor returns a wrapped error naming the interface
+- [ ] Integration tests satisfy the Coverage Expectation against a real interface, skipping cleanly without `CAP_NET_RAW`
+- [ ] Full gate passes: `go test -race -tags=integration ./internal/capture/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `feat(capture): add af_packet tpacket_v3 ring capture source`
+
+---
+
+#### T17: Ring drop accounting
+
+**What**: Surface the ring's kernel-side drop counters (`SocketStatsV3.Drops`/`Packets`/`QueueFreezes`) through the capture source and log a warning when drops are non-zero at close.
+**Where**: `internal/capture/ring_source.go`
+**Depends on**: T16
+**Reuses**: T16 source, `internal/shared/logger`
+**Requirement**: CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] The source exposes cumulative packets/drops/queue-freezes read from the kernel, not an internal estimate
+- [ ] WHEN drops are non-zero at close THEN a warning is logged naming the counts (silent loss was AD-012's core failure mode)
+- [ ] Counters are never logged as secret-bearing data (operational telemetry only, per AD-006)
+- [ ] Integration tests satisfy the Coverage Expectation, asserting counters are readable and monotonic
+- [ ] Full gate passes: `go test -race -tags=integration ./internal/capture/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `feat(capture): surface af_packet ring drop counters`
+
+---
+
+#### T18: Switch the gopacket backend to the ring source
+
+**What**: Replace `startGopacket`'s `pcapgo.NewEthernetHandle` + `SetCaptureLength` with the T16 ring source, keeping the existing writer loop and pcapng semantics unchanged.
+**Where**: `internal/capture/tcpdump.go`
+**Depends on**: T17
+**Reuses**: T16 source, existing `Writer`
+**Requirement**: CAPTURE-03, CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] `startGopacket` no longer references `pcapgo.EthernetHandle`
+- [ ] `Writer.WritePacket`'s `ci.InterfaceIndex = 0` normalisation is retained — `afpacket` also populates a real ifindex, so AD-012's fix stays load-bearing (guarded by `TestWriter_NormalizesNonZeroInterfaceIndexFromRealIfindex`)
+- [ ] The tcpdump-vs-gopacket parity test still asserts identical decrypted application data
+- [ ] Full gate passes: `go test -race -tags=integration ./internal/capture/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `refactor(capture): back the gopacket backend with the af_packet ring`
+
+---
+
+#### T19: Switch the entrypoint to the shared ring source
+
+**What**: Replace `cmd/app`'s duplicated `pcapgo.NewEthernetHandle` capture setup with the same shared ring source, eliminating the copy-paste that forced AD-012 to fix one bug in two places.
+**Where**: `cmd/app/app.go`
+**Depends on**: T18
+**Reuses**: T16 source
+**Requirement**: CAPTURE-01, CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] `cmd/app` opens capture through the shared source rather than its own handle, so the live-capture path exists in exactly one place
+- [ ] `App.Close` still terminates the capture goroutine without a data race (`-race` clean)
+- [ ] The `pcapgo.EthernetHandle` field is removed from the `App` struct
+- [ ] Integration tests satisfy the Coverage Expectation, skipping cleanly without `CAP_BPF`/bpffs
+- [ ] Full gate passes: `go test -race -tags=integration ./cmd/app/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `refactor(app): use the shared af_packet ring capture source`
+
+---
+
+#### T20: Turn the CAPTURE-04 skip into a hard assertion
+
+**What**: Replace `TestSmoke_OfflineValidationDecryptsPlaintext`'s retry-then-skip with a hard assertion that decrypted plaintext is present, since the ring backend removes the capacity limitation that justified skipping.
+**Where**: `deploy/podman/smoke_e2e_test.go`
+**Depends on**: T19
+**Reuses**: existing smoke harness
+**Requirement**: CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] The test asserts decrypted application data is present and fails (never skips) when it is absent
+- [ ] The bounded-retry-then-`t.Skipf` branch and its "known capacity limitation" comment are removed
+- [ ] Build gate passes on a real rootful pod: `make build && make lint && sudo go test -race -tags='integration e2e' ./deploy/podman/...` reports 0 failed **and 0 skipped**
+- [ ] IF drops are reported by T17's counters during the run THEN the failure message names them, so a regression is diagnosable
+
+**Tests**: e2e
+**Gate**: build
+**Commit**: `test(deploy): assert offline decryption instead of skipping (CAPTURE-04)`
+
+---
+
+#### T21: Record the decision and update the docs
+
+**What**: Add an AD recording the afpacket migration and supersede AD-012's open limitation; update the TDD, feature spec and design to describe the ring as implemented rather than planned.
+**Where**: `.specs/STATE.md`, `docs/technical-design-document.md`, `.specs/features/03-capture-harness/spec.md`, `.specs/features/03-capture-harness/design.md`
+**Depends on**: T20
+**Reuses**: AD-012, the Supported platforms/Performance sections
+**Requirement**: CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [ ] A new AD records the migration, its result, and marks AD-012's segment-loss trade-off resolved
+- [ ] The TDD's Performance "Capture path" row and Dependencies row describe `afpacket` TPACKET_V3 as **current**, not planned
+- [ ] `spec.md`'s Known Limitations table drops the CAPTURE-04 row (or marks it resolved with evidence) and CAPTURE-04's traceability status becomes unqualified `Verified`
+- [ ] `design.md`'s capture component and risk table describe the ring as implemented
+- [ ] No document still describes `pcapgo.EthernetHandle` as the live capture backend
+- [ ] Build gate passes: `make build && make lint`
+
+**Tests**: none
+**Gate**: build
+**Commit**: `docs(specs): record the af_packet ring migration closing CAPTURE-04`
+
+---
+
+### Phase 7: CAPTURE-04 root-cause fixes (✅ Done, 2026-09-19)
+
+> **Why**: this is the work that actually closed CAPTURE-04, in place of the withdrawn Phase 6.
+> Live testing on a real rootful Podman pod isolated three independent causes of the
+> offline-decrypt failure, none of them packet loss and none of them in the capture backend. All
+> segments were present in every affected capture; the failures were in what the capture said
+> about itself (secrets written too late), and in how it was being read back (wrong display
+> filter, reassembly off). See AD-014.
+>
+> **Phase gate evidence** (the whole phase, verified together on this host): `make build` clean;
+> `make lint` 0 issues; unit `-race` **55 passed / 0 failed**; integration `-race` (root)
+> **74 passed / 0 failed / 2 skipped** — both skips host-side and pre-existing (connect4
+> `PROG_TEST_RUN` unsupported on this host's kernel; this host's AppArmor profile denying signal
+> delivery to `tcpdump`); e2e on a live rootful pod **6 passed / 0 failed / 0 skipped**, run
+> **3 consecutive times**. Every test added or changed in this phase was confirmed
+> **discriminating**: each fails against the pre-fix code.
+
+#### T22: ALPN-agnostic offline-validation filter
+
+**What**: The offline-validation assertion filtered tshark on `-Y http`, but the app's `curl` negotiates HTTP/2 over ALPN and tshark dissects h2 with a separate `http2` dissector that `http` never matches. A perfectly captured, perfectly decryptable h2 session therefore produced zero matching frames — indistinguishable from a total capture or decryption failure, and the direct cause of 100% of the systematic CAPTURE-04 failure. Introduce an exported `capture.AppDataFilter = "http or http2"` next to the pairing helper, documented as to why filtering on one dissector is a trap, and use it at every call site rather than letting each restate a literal.
+**Where**: `internal/capture/pairing.go`
+**Depends on**: T14 (cross-phase)
+**Reuses**: `DecryptedAppData`'s existing filter parameter
+**Requirement**: CAPTURE-04, CAPTURE-11
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [x] `capture.AppDataFilter` is exported and matches both the `http` and `http2` dissectors
+- [x] Every offline-validation call site uses it instead of a literal `"http"` (`deploy/podman/smoke_e2e_test.go`, `internal/capture/pairing_it_test.go`, `internal/capture/tcpdump_it_test.go`)
+- [x] Integration tests satisfy the Coverage Expectation (IT-03.1 decrypt still passes, now ALPN-agnostic)
+- [x] Full gate passes: `go test -race -tags=integration ./internal/capture/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `fix(capture): match http2 in the offline-validation filter (CAPTURE-04)`
+**Status**: ✅ Done — `internal/capture/pairing.go` defines `AppDataFilter = "http or http2"` with the ALPN rationale in its doc comment; all offline-validation call sites now pass `capture.AppDataFilter`.
+
+---
+
+#### T23: Emit the Decryption Secrets Block ahead of the packet blocks
+
+**What**: `EmbedKeylog` ran during `Close` and appended the DSB as the capture's **last** block (observed: block 138 of 139, after EPBs 2-137). pcapng scopes a DSB to the blocks that *follow* it and tshark reads a capture strictly sequentially, so those secrets arrived too late to decrypt anything — the "self-decrypting capture" the sidecar advertises had never actually worked. Make `EmbedKeylog` only *record* lines, and have `Close` re-emit the capture as SHB → IDB → DSB and then copy the existing packet blocks byte-for-byte into a `0600` temp file, renamed atomically over the capture. Packet blocks stream through and are never buffered in memory (a capture routinely outgrows RAM); this is sound because an Enhanced Packet Block refers to its interface only by the id `0` that the re-emitted IDB registers identically.
+**Where**: `internal/capture/pcapng.go`
+**Depends on**: T22
+**Reuses**: T2 writer, `pcapgo.NgWriter.WriteDecryptionSecretsBlock`, AD-006's `0600` secret-grade mode
+**Requirement**: CAPTURE-01, CAPTURE-04
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [x] `EmbedKeylog` no longer writes a block; it accumulates lines for `Close`
+- [x] `Close` emits SHB → IDB → DSB → packet blocks, via a `0600` temp file and an atomic rename, so a concurrent reader sees only the old or the new capture
+- [x] No packets are held in memory during the re-emission
+- [x] Unit tests satisfy the Coverage Expectation (UT-03.1, UT-03.3) and prove the DSB precedes the packet blocks
+- [x] Quick gate passes: `go test -race ./internal/capture/...`
+
+**Tests**: unit
+**Gate**: quick
+**Commit**: `fix(capture): write the decryption secrets block before the packets`
+**Status**: ✅ Done — `EmbedKeylog` records only; `Close` delegates to `embedSecrets`/`writeSecretsFirst`, which re-emit the headers plus the DSB into an `os.CreateTemp` (`0600`) sibling file, copy the packet blocks as opaque bytes, and `os.Rename` over the capture.
+
+---
+
+#### T24: Reassemble out-of-order TCP segments in the pairing invocation
+
+**What**: Roughly a third of real sessions recorded every TCP segment but out of sequence (confirmed via IP IDs: the server sent them in order). tshark ships out-of-order reassembly off by default — a live-dissection performance/memory trade-off — so TLS record reassembly abandoned those streams at the first gap and they decrypted to nothing, which reads exactly like packet loss. This is the symptom AD-012 misread as a capture-backend capacity limit. Always pass `-o tcp.reassemble_out_of_order:TRUE` from `DecryptedAppData`, and document in the source why it is not a backend defect: a simultaneous `tcpdump` (an mmap'd AF_PACKET ring — the very thing an afpacket migration would provide) records the same reordering on the same sessions and needs the same option.
+**Where**: `internal/capture/pairing.go`
+**Depends on**: T23
+**Reuses**: `TsharkArgs`
+**Requirement**: CAPTURE-04, CAPTURE-05
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [x] `DecryptedAppData` always passes `-o tcp.reassemble_out_of_order:TRUE`
+- [x] `TsharkArgs`'s documented `-o tls.keylog_file:<path>` contract (CAPTURE-05) is unchanged
+- [x] An integration test proves a deliberately out-of-order capture still decrypts
+- [x] Full gate passes: `go test -race -tags=integration ./internal/capture/...`
+
+**Tests**: integration
+**Gate**: full
+**Commit**: `fix(capture): reassemble out-of-order tcp segments when decrypting`
+**Status**: ✅ Done — `internal/capture/pairing.go`'s `reassembleOutOfOrder` constant is appended to every `DecryptedAppData` invocation, with the tcpdump counter-evidence recorded in its doc comment; `internal/capture/pairing_it_test.go` decrypts a jumbled capture.
+
+---
+
+#### T25: Assert offline decryption instead of skipping (CAPTURE-04)
+
+**What**: With the three causes above fixed, `TestSmoke_OfflineValidationDecryptsPlaintext`'s 5×-retry-then-`t.Skipf` block has nothing left to excuse — delete it and assert hard that the harness's own capture, paired with the harness's own keylog, yields the request's decrypted plaintext. Add `TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets`, which proves T23's fix end-to-end: it stops the sidecar gracefully (so `App.Close` runs and embeds the DSB — `pod rm -f` SIGKILLs and never gets there), retains the artifact, and decrypts the capture against an **empty** keylog file, so whatever decrypts can only have come from the capture's own embedded secrets.
+**Where**: `deploy/podman/smoke_e2e_test.go`
+**Depends on**: T24
+**Reuses**: T22 filter, T23 embedded DSB, T24 reassembly, the existing smoke harness
+**Requirement**: CAPTURE-04, CAPTURE-11
+
+**Tools**: MCP: NONE · Skill: NONE
+
+**Done when**:
+
+- [x] The test asserts decrypted application data is present and fails (never skips) when it is absent
+- [x] The bounded-retry-then-`t.Skipf` branch and its "known capacity limitation" comment are gone
+- [x] A new test decrypts the retained capture with an empty keylog, proving the embedded DSB is usable
+- [x] Build gate passes on a real rootful pod: `make build && make lint && sudo go test -race -tags='integration e2e' ./deploy/podman/...` reports **6 passed / 0 failed / 0 skipped**, confirmed over 3 consecutive runs
+- [x] Both tests confirmed discriminating: each fails against the pre-fix code
+
+**Tests**: e2e
+**Gate**: build
+**Commit**: `test(deploy): assert offline decryption instead of skipping (CAPTURE-04)`
+**Status**: ✅ Done — the retry/skip block is deleted; `TestSmoke_OfflineValidationDecryptsPlaintext` asserts hard, and `TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets` decrypts the retained capture with an empty keylog. Verified live: e2e 6 passed / 0 failed / 0 skipped, 3 consecutive runs.
+
+---
+
 ## Task Granularity Check
 
 | Task | Scope | Status |
@@ -475,6 +823,17 @@ Execution is strictly sequential — one task at a time, in order.
 | T12: pcapng flush fix | 1 file | ✅ Granular |
 | T13: LINK_MODE build wiring | 4 files | ✅ Granular |
 | T14: live e2e bring-up fixes | 6 files | ⚠️ Wide but cohesive — each file's fix is one line-level bug found via the same live-bring-up session; splitting further would fragment one debugging narrative across artificial task boundaries |
+| T15: ring geometry | 1 file | ❌ Withdrawn (AD-014) — never executed |
+| T16: ring capture source | 1 file | ❌ Withdrawn (AD-014) — never executed |
+| T17: ring drop accounting | 1 file | ❌ Withdrawn (AD-014) — never executed |
+| T18: gopacket backend switch | 1 file | ❌ Withdrawn (AD-014) — never executed |
+| T19: entrypoint switch | 1 file | ❌ Withdrawn (AD-014) — never executed |
+| T20: e2e hard assertion | 1 file | ❌ Withdrawn (AD-014) — superseded by T25, which does the same thing for the real reasons |
+| T21: docs + decision record | 4 files | ❌ Withdrawn (AD-014) — superseded by AD-014 itself plus this file's Phase 6/7 reconciliation |
+| T22: ALPN-agnostic filter | 1 file (+3 call sites updated to the new constant) | ✅ Granular — the constant lives in one file; the call-site updates are mechanical and meaningless to split from it |
+| T23: DSB before packets | 1 file | ✅ Granular |
+| T24: out-of-order reassembly | 1 file | ✅ Granular |
+| T25: e2e hard assertion + self-decrypt test | 1 file | ✅ Granular |
 
 ---
 
@@ -496,6 +855,11 @@ Execution is strictly sequential — one task at a time, in order.
 | T12 | T2 (cross-phase) | (phase 5 start) | ✅ Match |
 | T13 | T12 | T12 → T13 | ✅ Match |
 | T14 | T13 | T13 → T14 | ✅ Match |
+| T15–T21 | (as written in Phase 6) | T15 → … → T21 | ⏸️ Withdrawn (AD-014) — chain retained for the historical record; nothing to execute |
+| T22 | T14 (cross-phase) | (phase 7 start) | ✅ Match |
+| T23 | T22 | T22 → T23 | ✅ Match |
+| T24 | T23 | T23 → T24 | ✅ Match |
+| T25 | T24 | T24 → T25 | ✅ Match |
 
 ---
 
@@ -517,3 +881,14 @@ Execution is strictly sequential — one task at a time, in order.
 | T12 | pcapng writer flush | unit | unit | ✅ OK |
 | T13 | Build tooling (Makefile/scripts) | none | none | ✅ OK (build-tooling, verified via direct invocation) |
 | T14 | Harness scripts + e2e tests | e2e | e2e | ✅ OK |
+| T15 | AF_PACKET ring source (withdrawn) | unit + integration | unit | ⏸️ Withdrawn (AD-014) — no code layer was created |
+| T16 | AF_PACKET ring source (withdrawn) | unit + integration | integration | ⏸️ Withdrawn (AD-014) — no code layer was created |
+| T17 | AF_PACKET ring source (withdrawn) | unit + integration | integration | ⏸️ Withdrawn (AD-014) — no code layer was created |
+| T18 | tcpdump fallback + parity (withdrawn) | integration | integration | ⏸️ Withdrawn (AD-014) |
+| T19 | Entrypoint wiring (withdrawn) | integration | integration | ⏸️ Withdrawn (AD-014) |
+| T20 | Smoke + offline validation (withdrawn) | e2e | e2e | ⏸️ Withdrawn (AD-014) — superseded by T25 |
+| T21 | Docs (withdrawn) | none | none | ⏸️ Withdrawn (AD-014) |
+| T22 | tshark pairing + decrypt | integration | integration | ✅ OK |
+| T23 | pcapng writer + DSB | unit | unit | ✅ OK |
+| T24 | tshark pairing + decrypt | integration | integration | ✅ OK |
+| T25 | Smoke + offline validation | e2e | e2e | ✅ OK |

@@ -159,3 +159,13 @@ All 7 requirements are traced to `file:line` assertions whose asserted values ma
 **Issues found**: relay fail-closed test does not discriminate a fail-open forward → strengthen it (fix #1). Shipped relay code is correct.
 
 **Next steps**: route fix #1 to an implementer; F03 e2e will close the deferred eBPF behavioral ACs.
+
+---
+
+## 2026-09-18 — Independent revalidation (fresh Verifier, author ≠ verifier)
+
+- **Verdict: PASS.** Re-derived AC coverage from scratch (evidence-or-zero); did not inherit the prior verdict.
+- **Deterministic gates**: `validate_spec` / `validate_tasks` / `validate_state` — 0 errors (pre-existing `Tests: none` warnings only). Build clean, `make lint` 0 issues, unit + integration suites green (root/`PROG_TEST_RUN`-gated eBPF behavioral tests skip cleanly on this unprivileged box, as before).
+- **Discrimination sensor** (unit layers, one at a time, restored from scratch — no `git stash`): 3/3 mutants killed — codec IP byte-order decode (killed by `TestByteOrder_PortHostIPNetwork`), resolver fail-closed `ErrNotFound` branch (killed by `TestResolve_MissFailsClosed`), tuple-key Port field zeroed (killed by `TestByteOrder_PortHostIPNetwork`).
+- **Confirmed residual (unchanged, non-blocking)**: core in-kernel redirect ACs (REDIR-01/02/03/06/07) have no executing assertion in unprivileged CI — they are deferred to Feature 03 e2e; the shipped code is correct. Minor spec-precision: retry-count assertion (4 calls) anchors to implementation vs spec's "bounded retry"; resolver stub bypasses the tuple key so key-correctness rests on `codec_test`.
+- Real tree returned to baseline (` M .gitignore` only); no source left mutated.

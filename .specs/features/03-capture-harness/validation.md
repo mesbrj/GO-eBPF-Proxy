@@ -1,4 +1,4 @@
-# Capture Harness (Feature 03) Validation — ROUND 2 (re-verification)
+# Capture Harness (Feature 03) Validation — ROUND 2 (re-verification) — cumulative (round 2 → 2026-09-18 real-environment run)
 
 **Date**: 2026-09-12
 **Spec**: `.specs/features/03-capture-harness/spec.md`
@@ -415,3 +415,112 @@ Executed live on this host (not reasoned about) — all commands re-run by the v
 **Issues found**: One disclosed, non-blocking backend capacity limitation (gopacket TCP segment loss under real network bursts) and one un-mutation-tested-but-`-race`-verified concurrency fix — both listed above, neither hidden.
 
 **Next steps**: Non-blocking follow-up (not required to close this pass): migrate the in-process capture backend to a mmap'd AF_PACKET ring buffer (e.g. `gopacket/afpacket`) to close the CAPTURE-04 segment-loss gap definitively. No fix→re-verify cycle required for the fixes actually in scope of this diff; Phase 5 (T12-T14) is accepted as-is.
+
+---
+
+## 2026-09-18 — Independent revalidation (fresh Verifier, author ≠ verifier)
+
+- **Verdict: PASS.** All 11 ACs re-mapped independently (evidence-or-zero); every unit-provable AC has real, discriminating coverage; decrypt/Podman ACs correctly gated to e2e/root.
+- **AD-011 / AD-012 code verification — all present, none missing**: interval flush + post-construction flush (`pcapng.go:82,126-131`); `WritePacket` forces `InterfaceIndex=0` (`pcapng.go:113`); `SetCaptureLength(65536)` at both live sites (`tcpdump.go:73`, `cmd/app/app.go:138`); Makefile `LINK_MODE ?= static`; `pod-up.sh` waits for `dump.pcapng` and forwards `RETAIN`→`--retain`.
+- **Discrimination sensor** (unit layers, restored from scratch — no `git stash`): 3/3 killed, and the AD fixes are guarded by dedicated **regression** tests, not merely present — retention size cap disabled (killed by `retention_test.go:20`), `InterfaceIndex=0` normalization removed (killed by `TestWriter_NormalizesNonZeroInterfaceIndex`), initial flush removed (killed by `TestWriter_FileVisibleOnDiskWithoutClose`).
+- **Disclosed CAPTURE-04 limitation honestly represented**: `smoke_e2e_test.go` `t.Skipf`s on gopacket segment-loss capacity failure — it skips, never silently passes.
+- **Confirmed residual (unchanged, non-blocking, already in spec traceability)**: CAPTURE-02 clock-sharing not proven end-to-end (tested in isolation); CAPTURE-06 UID-1337 ownership not asserted (only `0600`/`0700` mode).
+- Real tree returned to baseline (` M .gitignore` only); the transient mutation from the concurrent sensor run was restored and re-confirmed green.
+
+### 2026-09-18 — Real-environment execution (privileged + e2e, this host)
+
+The earlier revalidation section noted the privileged/e2e layers skipped on an unprivileged box. They were subsequently run for real on this host (kernel 7.0.0, rootful podman 4.9.3, tshark, clang, bpftool, sudo):
+
+- **Integration (`-race`, sudo/root)**: all pass except two disclosed skips — `TestConnect4_RewritesTcpDestinationToRelay` (kernel lacks `BPF_PROG_TEST_RUN` for `CGroupSockAddr`; the rewrite is instead proven by the e2e pod test) and `TestBackendParity_TcpdumpAndGopacketDecryptIdentically` (host AppArmor denies signalling `tcpdump` — AD-012). eBPF loader pin-lifecycle/LRU, connect4/sockops load+verify, TLS1.3 decrypt round-trip (`TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP`), retention, and cmd/app lifecycle all executed and passed.
+- **e2e (real Podman pod, sudo)**: `go test -tags='integration e2e' ./deploy/podman/...` → **4 passed / 1 skipped / 0 failed** in ~26s. Passed: `TestPodUp_BringsUpHealthyPodWithExpectedConfig`, `TestPodUp_SidecarEgressNotRedirected` (self-loop avoidance), `TestSmoke_RealCertRequestSucceedsAndArtifactsGrow` (real cert request through the live pod, artifacts grow on disk — the original zero-byte-pcapng bug stays fixed), `TestPodDown_DefaultWipesRetainPreserves`. Skipped: `TestSmoke_OfflineValidationDecryptsPlaintext` — retried 5×, gopacket backend lost TCP segments every attempt (err always `<nil>`; the decrypt path itself is sound), so it skips per the disclosed CAPTURE-04 capacity limitation (AD-012), never silently passing.
+- Pod torn down; no leftover pods. Real tree unchanged (build artifacts gitignored).
+
+---
+
+## 2026-09-19 — CAPTURE-04 root-cause fix pass (AD-014)
+
+**Scope**: close CAPTURE-04 — the one acceptance criterion this feature had never proven
+end-to-end. Every prior pass recorded it honestly as a disclosed limitation
+(`TestSmoke_OfflineValidationDecryptsPlaintext` retried 5× then `t.Skipf`'d), attributed by
+AD-012 to TCP segment loss in the in-process gopacket backend and scheduled for repair by a
+`gopacket/afpacket` migration (tasks.md Phase 6, T15-T21).
+
+**Verdict: CAPTURE-04 is Verified, for real.** Phase 6 is **withdrawn**: its premise was false.
+
+### AD-012's diagnosis was a misdiagnosis
+
+No segments were being lost. Live testing on a real rootful Podman pod found **three**
+independent causes, each sufficient on its own to make a complete, correctly-keyed capture
+decrypt to nothing:
+
+1. **Wrong tshark display filter — 100% of the systematic failure.** The app's `curl` negotiates
+   HTTP/2 via ALPN, but the assertion filtered `-Y http`. tshark dissects h2 with a separate
+   `http2` dissector that `http` never matches, so a perfect capture yielded zero matching
+   frames — indistinguishable from total capture or decryption failure. Fixed by a new exported
+   `capture.AppDataFilter = "http or http2"` (`internal/capture/pairing.go:18`), applied at all
+   offline-validation call sites (`deploy/podman/smoke_e2e_test.go`,
+   `internal/capture/pairing_it_test.go`, `internal/capture/tcpdump_it_test.go`).
+2. **The embedded DSB was unusable.** `EmbedKeylog` ran during `Close` and appended the
+   Decryption Secrets Block as the file's **last** block — observed directly: DSB at block 138
+   of 139, after EPBs 2-137. pcapng scopes a DSB to the blocks that follow it and tshark reads a
+   capture strictly sequentially, so the secrets arrived too late to decrypt anything. The
+   "self-decrypting capture" this feature documents had therefore never worked. Fixed at
+   `internal/capture/pcapng.go:163`: `EmbedKeylog` now only records lines, and `Close` re-emits
+   the file as SHB → IDB → DSB and then copies the existing packet blocks byte-for-byte into a
+   `0600` temp file, atomically renamed over the capture. No packets are buffered in memory.
+3. **Out-of-order TCP segments — not loss.** Roughly a third of sessions recorded every segment
+   but out of sequence (confirmed via IP IDs: the server sent them in order). tshark's default
+   reassembly abandons such a stream at its first gap, which reads exactly like loss. Fixed by
+   always passing `-o tcp.reassemble_out_of_order:TRUE` (`internal/capture/pairing.go:39,54`).
+
+**The decisive evidence about afpacket**: a `tcpdump` run simultaneously in the same netns —
+which *is* an mmap'd AF_PACKET ring, exactly what `gopacket/afpacket` provides — recorded the
+**same** reordering on 6 of 8 streams, and decrypted only 5/8 by default, 8/8 with the
+reassembly option. The reordering is a property of the capture point, not of the non-mmap
+socket. The afpacket migration would not have fixed CAPTURE-04 and is not required for it.
+
+### Tests added or changed — all confirmed discriminating
+
+Each was run against the pre-fix code and **fails** there; none is a tautology.
+
+| Test | Proves | Change |
+| ---- | ------ | ------ |
+| `TestSmoke_OfflineValidationDecryptsPlaintext` (`deploy/podman/smoke_e2e_test.go`) | The harness's own capture, paired with the harness's own keylog, yields the request's decrypted plaintext | The 5×-retry + `t.Skipf` block is **deleted** and replaced with a hard assertion |
+| `TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets` (new) | The retained capture decrypts **unaided** — paired with an **empty** keylog file, so anything decrypted can only have come from the capture's own DSB. Stops the sidecar gracefully (`podman stop`, so `App.Close` runs and embeds the block; `pod rm -f` SIGKILLs and never gets there) with `RETAIN=1` | New |
+| `TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData` (new, `internal/capture/pairing_it_test.go`) | An h2-over-TLS-1.3 session decrypts under `AppDataFilter` — the case a bare `http` filter reports as zero frames | New |
+| `TestDecryptedAppData_OutOfOrderServerSegmentsStillDecrypt` (new, `internal/capture/pairing_it_test.go`) | A deliberately jumbled capture still decrypts under `tcp.reassemble_out_of_order:TRUE` | New |
+| `TestWriter_EmbedKeylog_SecretsBlockPrecedesEveryPacketBlock`, `..._ReEmissionPreservesEveryPacketAndLinkType`, `..._LeavesOnlyTheCaptureAtSecretGradeMode`, `TestWriter_Close_WithoutKeylogWritesNoSecretsBlock` (new, `internal/capture/pcapng_test.go`) | The DSB precedes every packet block; the re-emission preserves every packet and the link type; the re-emission leaves only the capture behind, at `0600` (no stray temp file, AD-006); and a keylog-free `Close` writes no DSB at all | New |
+
+### Gate evidence
+
+| Command | Result |
+| --- | --- |
+| `make build` | clean |
+| `make lint` | 0 issues |
+| `go test -race ./...` (unit) | **55 passed / 0 failed** |
+| `sudo go test -race -tags=integration ./...` | **74 passed / 0 failed / 2 skipped** — both host-side and pre-existing: connect4 `PROG_TEST_RUN` unsupported on this host's kernel, and this host's AppArmor profile denying signal delivery to `tcpdump` (tcpdump-parity) |
+| `sudo go test -race -tags='integration e2e' ./deploy/podman/...` | **6 passed / 0 failed / 0 skipped**, run **3 consecutive times** on a live rootful pod |
+
+This is the first e2e run of this feature with **zero skips**. The two remaining integration
+skips are host-side facts about this workstation, not gaps in the codebase, and are disclosed in
+`spec.md`'s Known Limitations.
+
+### Consequences recorded elsewhere
+
+- `.specs/STATE.md`: **AD-014** added (the three causes, their fixes, the misdiagnosis, and the
+  tcpdump/mmap-ring evidence); **AD-012**'s `Status` amended — its segment-loss trade-off is
+  resolved and its diagnosis superseded, while its `InterfaceIndex`, GSO-snaplen,
+  readiness-wait and `RETAIN`-forwarding fixes all still hold.
+- `tasks.md`: **Phase 6 (T15-T21) withdrawn**, kept verbatim as a historical record rather than
+  deleted; **Phase 7 (T22-T25)** added, Done, recording the work that actually fixed CAPTURE-04.
+- `spec.md`: CAPTURE-04's traceability is now unqualified `Verified`; its Known Limitations row
+  is retired with evidence, leaving only the two host-side limitations.
+- `README.md`: the Quick start's offline-decrypt command corrected to
+  `-Y 'http or http2' -o tcp.reassemble_out_of_order:TRUE`.
+
+### Residual (unchanged, non-blocking)
+
+CAPTURE-02's clock sharing is still tested in isolation rather than end-to-end across
+`internal/capture` and `internal/keylog`, and CAPTURE-06's UID-1337 ownership is still only
+structurally implied (`pod-up.sh --user 1337:1337`), not independently asserted. Both predate
+this pass and are already carried in `spec.md`'s traceability notes.

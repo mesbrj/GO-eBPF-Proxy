@@ -10,7 +10,7 @@ Interception requires zero app changes and no iptables/NAT, so it works under re
 
 ## Functional requirements
 
-- Attach `cgroup/connect4` + `sockops` to the **pod common parent cgroup v2** (via cilium/ebpf); the sidecar self-locates it as the parent of its own `/proc/self/cgroup` (requires a host cgroup namespace). Attaching to the app container's cgroup is a tighter-scope alternative when the sidecar UID cannot be guaranteed.
+- Attach `cgroup/connect4` + `sockops` to the **pod common parent cgroup v2** (via cilium/ebpf); the sidecar does not discover that path itself — it is passed in via the required `--cgroup-path` flag, which `deploy/podman/pod-up.sh` resolves from `podman pod inspect` (a host cgroup namespace keeps that path attachable from inside the container). Attaching to the app container's cgroup is a tighter-scope alternative when the sidecar UID cannot be guaranteed.
 - Rewrite only `IPPROTO_TCP`, IPv4, non-loopback destinations; **skip the proxy UID (1337) — load-bearing for loop avoidance**, since the parent-scoped hook also covers the sidecar's own egress.
 - `connect4` records original dst keyed by socket cookie; `sockops` (`TCP_CONNECT_CB`) re-keys it by `(src_ip, src_port)` and drops the cookie key.
 - Expose the tuple map to Go for original-destination lookup.
@@ -19,7 +19,7 @@ Interception requires zero app changes and no iptables/NAT, so it works under re
 
 ## Non-functional requirements
 
-- Kernel ≥ 5.10 with a unified cgroup v2 hierarchy; caps `CAP_BPF` + `CAP_NET_ADMIN`; host cgroup namespace so the pod parent slice is resolvable/attachable; CO-RE via target BTF.
+- Kernel ≥ 5.10 with a unified cgroup v2 hierarchy; caps `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_SYS_RESOURCE` (RLIMIT_MEMLOCK raise on load); host cgroup namespace so the pod parent slice is resolvable/attachable; CO-RE via target BTF.
 - No connection leak; entries self-evict; no loop on proxy egress — the entire sidecar runs as UID 1337 so the parent-scoped hook excludes all of its traffic.
 - Correlation must be race-free (tuple present before SYN).
 
@@ -33,7 +33,7 @@ Given the app dials a remote `IP:443`, the proxy accepting the redirected connec
 
 - Framework: `testify` (`assert`, `require`, `mock`, `suite`); executed via `make test` (`go test -race ./...`).
 - Pure-Go unit tests require no kernel and run in CI on any Linux host; they cover the map codec, key/value marshalling, and loader configuration.
-- eBPF program behaviour is verified with `BPF_PROG_TEST_RUN` through the cilium/ebpf `Program.Test` API, gated by build tag `//go:build integration` and requiring `CAP_BPF` + `CAP_NET_ADMIN` on kernel ≥ 5.10.
+- eBPF program behaviour is attempted with `BPF_PROG_TEST_RUN` through cilium/ebpf's `Program.Run` API, gated by build tag `//go:build integration` and requiring `CAP_BPF` + `CAP_NET_ADMIN` + `CAP_SYS_RESOURCE` on kernel ≥ 5.10. Note: `PROG_TEST_RUN` for `cgroup/connect4`/`sockops` is unsupported on current kernels, so those behavioural tests `t.Skip`; the rewrite/skip/re-key behaviour is proven instead by the Feature 03 Podman e2e suite.
 - Kernel/cgroup-attach and real-socket tests share that tag and `t.Skip` when the kernel version or capabilities are unavailable, so `make test` stays green on unprivileged runners.
 
 ### Unit tests (no kernel)
@@ -61,6 +61,8 @@ Given the app dials a remote `IP:443`, the proxy accepting the redirected connec
 | IT-01.8 | Fill `origdst_by_tuple` beyond `max_entries` | Oldest entries self-evict; no leak or error | Entries self-evict (LRU) |
 | IT-01.9 | Real dial from the attached cgroup to a local stand-in "remote"; proxy resolves via `getpeername` → tuple lookup | Tuple present before `accept()`; resolver returns the exact original `IP:port` | **Acceptance**; race-free |
 | IT-01.10 | Direct connect to `127.0.0.1:15001` with no tuple (un-redirected / evicted) | Bounded retry then connection closed (RST); no forward to any default; miss metric incremented; no leaked socket | Resolver miss policy (fail-closed) |
+
+> **Coverage note**: IT-01.1–01.6 depend on `BPF_PROG_TEST_RUN` for `cgroup/connect4`/`sockops`, which is unsupported on current kernels — those tests skip, and the behaviour is verified end-to-end by the Feature 03 Podman e2e suite instead. IT-01.7 (load/attach/pin/LRU) does run, as root.
 
 ### Traceability
 

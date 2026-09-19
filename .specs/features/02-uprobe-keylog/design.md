@@ -25,7 +25,7 @@ graph TD
     SOCK --> SRV["internal/keylog SocketServer<br/>accept + read lines"]
     SRV --> VALIDATE["nss.ValidateLine (existing, unchanged)"]
     VALIDATE --> DEDUP["Writer.Append: dedup (label, client_random, secret)"]
-    DEDUP --> FILE[("/var/log/sidecar/sslkeylog.log<br/>0600, tmpfs")]
+    DEDUP --> FILE[("/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log<br/>0600, tmpfs")]
 ```
 
 ---
@@ -70,8 +70,10 @@ graph TD
 - **Purpose**: Interpose `SSL_CTX_new`/`SSL_CTX_new_ex`, register a keylog callback, ship
   each formatted line to the sidecar.
 - **Location**: `preload/keylog_preload.c`
-- **Build**: `clang`/`gcc -shared -fPIC -o libkeylogpreload.so keylog_preload.c -ldl`; not
-  part of the Go build (no CGO in the main binary); wired via a `Makefile` target.
+- **Build**: the `make build-preload` target —
+  `$(CC) -shared -fPIC -o preload/libkeylogpreload.so preload/keylog_preload.c -ldl -lssl -lcrypto`
+  (`-lssl` is required: the interposer calls `SSL_CTX_set_keylog_callback`, and needs the OpenSSL
+  dev headers). Not part of the Go build — the sidecar binary stays CGO-free.
 - **Interfaces**:
   - `SSL_CTX *SSL_CTX_new(const SSL_METHOD *method)` / `SSL_CTX_new_ex(...)` — call through
     via `dlsym(RTLD_NEXT, ...)`, then `SSL_CTX_set_keylog_callback(ctx, keylog_cb)`
@@ -90,7 +92,7 @@ graph TD
 - **Location**: `internal/keylog/socket_server.go`
 - **Interfaces**:
   - `type SocketServerConfig struct { SocketPath string; KeylogPath string }`
-  - `NewSocketServer(cfg SocketServerConfig) (*SocketServer, error)` — creates the socket
+  - `NewSocketServer(cfg SocketServerConfig, opts ...SocketServerOption) (*SocketServer, error)` — creates the socket
     directory (`0711`) if missing, applies the permission guard, removes a stale socket
     file, `net.Listen("unix", path)`, `os.Chmod(path, 0666)`, opens the `Writer`
   - `(*SocketServer) Run() error` — accept loop; one goroutine per connection, `bufio.Scanner`

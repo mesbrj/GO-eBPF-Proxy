@@ -4,9 +4,9 @@
 **Milestone**: M1 — Redirect only
 **Status**: Verified (Verifier PASS)
 
-> **Greenfield note**: The workspace scaffold is empty (no `go.mod`, no source). This feature
-> establishes the toolchain (Phase 0) that Features 02–03 reuse: `go.mod`, the Makefile from
-> [AGENTS.md](../../../AGENTS.md), and `bpf2go` + `vmlinux.h` wiring.
+> **Phase 0 note (historical)**: this feature started from an empty workspace and established
+> the toolchain later reused by Features 02–03: `go.mod`, the Makefile from
+> [AGENTS.md](../../../AGENTS.md), and `bpf2go` + `vmlinux.h` wiring. All of it now exists.
 
 ---
 
@@ -19,8 +19,8 @@ raw-pipes bytes to the real server.
 
 ```mermaid
 graph TD
-    app["app connect(dst:443)"] -->|cgroup/connect4| C4["connect4.bpf.c<br/>rewrite dst→127.0.0.1:15001<br/>origdst_by_cookie[cookie]=dst"]
-    C4 -->|TCP_CONNECT_CB| SO["sockops.bpf.c<br/>re-key by (src_ip,src_port)<br/>drop cookie key"]
+    app["app connect(dst:443)"] -->|cgroup/connect4| C4["proxy.bpf.c (cgroup/connect4)<br/>rewrite dst→127.0.0.1:15001<br/>origdst_by_cookie[cookie]=dst"]
+    C4 -->|TCP_CONNECT_CB| SO["proxy.bpf.c (sockops)<br/>re-key by (src_ip,src_port)<br/>drop cookie key"]
     SO --> MAP[("origdst_by_tuple<br/>LRU_HASH, pinned")]
     app -->|redirected conn| RELAY["internal/proxy relay<br/>127.0.0.1:15001"]
     RELAY -->|getpeername → lookup| MAP
@@ -37,8 +37,7 @@ graph TD
 
 | Component | Location | How to Use |
 | --------- | -------- | ---------- |
-| Logger | `internal/shared/logger/` (empty) | Create the shared structured JSON logger here first; every feature imports it |
-| — | — | No other code exists; this milestone sets the conventions |
+| Logger | `internal/shared/logger/` | The shared structured JSON logger established here; every feature imports it |
 
 ### Integration Points
 
@@ -46,7 +45,7 @@ graph TD
 | ------ | ------------------ |
 | Kernel cgroup v2 | `cilium/ebpf` `link.AttachCgroup` at the pod parent cgroup |
 | bpffs `/sys/fs/bpf` | Pin/unpin maps + programs |
-| `internal/proxy` ↔ kernel maps | `bpf2go`-generated map handle read via the loader's map wrapper |
+| `internal/proxy` ↔ kernel maps | The loader hands out the raw `bpf2go`-generated `*ciliumebpf.Map` handle, which satisfies `proxy.Lookuper` directly (no wrapper type) |
 
 ---
 
@@ -55,7 +54,7 @@ graph TD
 ### connect4 eBPF program
 
 - **Purpose**: Rewrite qualifying IPv4 TCP `connect()` destinations to the relay and record the original by cookie.
-- **Location**: `bpf/connect4.bpf.c` (+ generated `bpf/*_bpfel.go`)
+- **Location**: `bpf/proxy.bpf.c` — `SEC("cgroup/connect4")` (+ generated `bpf/proxy_bpfel.go`/`proxy_bpfeb.go`)
 - **Interfaces**:
   - Program `cgroup_connect4(ctx *bpf_sock_addr): int` — returns 1 (allow) after rewrite
   - Writes `origdst_by_cookie[bpf_get_socket_cookie(ctx)] = {user_ip4, user_port}`
@@ -65,7 +64,7 @@ graph TD
 ### sockops eBPF program
 
 - **Purpose**: Re-key the original destination from cookie to `(src_ip, src_port)` before SYN.
-- **Location**: `bpf/sockops.bpf.c`
+- **Location**: `bpf/proxy.bpf.c` — `SEC("sockops")` (same translation unit as `connect4`)
 - **Interfaces**:
   - Program `sockops_prog(ctx *bpf_sock_ops): int` — acts only on `BPF_SOCK_OPS_TCP_CONNECT_CB`
   - Moves `origdst_by_cookie[cookie]` → `origdst_by_tuple[{src_ip, src_port}]`; deletes cookie key
@@ -77,11 +76,14 @@ graph TD
 - **Purpose**: Load, attach (cgroup), pin, and expose maps to Go; own the lifecycle.
 - **Location**: `internal/ebpf/`
 - **Interfaces**:
-  - `Load(cfg Config) (*Objects, error)` — load `bpf2go` collection
-  - `AttachCgroup(cgroupPath string) (io.Closer, error)`
-  - `OrigDstByTuple() *ebpf.Map` — map handle for the resolver
-  - `Close() error` — detach + unpin
-- **Dependencies**: `cilium/ebpf`, generated objects, cgroup self-location via `/proc/self/cgroup`
+  - `Load(cfg Config) (*Loader, error)` — load `bpf2go` collection
+  - `(l *Loader) Attach(cgroupPath string) error`
+  - `(l *Loader) OrigDstByTuple() *ciliumebpf.Map` — map handle for the resolver
+  - `(l *Loader) Close() error` — detach + remove pins
+- **Dependencies**: `cilium/ebpf`, generated objects, and the cgroup path supplied from outside —
+  the sidecar does **not** self-locate it: `cmd/app` requires a `--cgroup-path` flag, which
+  `deploy/podman/pod-up.sh` resolves from `podman pod inspect` (AD-002: one pod common parent
+  cgroup covers both containers)
 - **Reuses**: `internal/shared/logger`
 
 ### Original-destination resolver
@@ -89,17 +91,18 @@ graph TD
 - **Purpose**: `(srcIP, srcPort) → (dstIP, dstPort)` with fail-closed miss policy.
 - **Location**: `internal/proxy/resolver.go`
 - **Interfaces**:
-  - `Resolve(srcIP net.IP, srcPort uint16) (netip.AddrPort, error)` — typed `ErrNotFound`
+  - `Resolve(srcIP netip.Addr, srcPort uint16) (netip.AddrPort, error)` — typed `ErrNotFound`
   - Bounded retry wrapper: N attempts over a few ms, then definitive miss
 - **Dependencies**: tuple-map handle; the codec
-- **Reuses**: map wrapper from `internal/ebpf`
+- **Reuses**: the loader's raw `*ciliumebpf.Map` handle (`Loader.OrigDstByTuple()`), passed into
+  `NewResolver` as a `proxy.Lookuper`
 
 ### Pass-through L4 relay
 
 - **Purpose**: Accept redirected connections, resolve orig-dst, raw-pipe bytes both ways.
 - **Location**: `internal/proxy/relay.go`
 - **Interfaces**:
-  - `ListenAndServe(addr string) error` — listens `127.0.0.1:15001`
+  - `NewRelay(r *Resolver, opts ...RelayOption) *Relay`; `(rl *Relay) Serve(ln net.Listener) error` — accepts on the passed listener (`127.0.0.1:15001`)
   - Per-conn: `getpeername` → `Resolve` → dial → bidirectional `io.Copy`
   - On definitive miss: RST (close), increment miss metric
 - **Dependencies**: resolver, logger
@@ -109,7 +112,7 @@ graph TD
 
 - **Purpose**: Marshal/unmarshal `orig_dst` and `tuple_key` matching the C struct layout.
 - **Location**: `internal/ebpf/codec.go`
-- **Interfaces**: `MarshalTupleKey`, `UnmarshalOrigDst`; byte-order-normalised port
+- **Interfaces**: `TupleKey(srcIP netip.Addr, srcPort uint16) (bpf.ProxyTupleKey, error)`, `OrigDst(dstIP netip.Addr, dstPort uint16) (bpf.ProxyOrigDst, error)`, `AddrPort(od bpf.ProxyOrigDst) netip.AddrPort`; byte-order-normalised port
 - **Reuses**: `encoding/binary`
 
 ---
@@ -147,9 +150,9 @@ struct tuple_key { __u32 ip; __u16 port; };          // normalised port order
 
 | Concern | Location (file:line) | Impact | Mitigation |
 | ------- | -------------------- | ------ | ---------- |
-| Port byte-order mismatch (host vs network) | `bpf/sockops.bpf.c` (new) | Lookup always misses | Normalise in `sockops`; UT-01.3 codec test; IT-01.5 end-to-end |
+| Port byte-order mismatch (host vs network) | `bpf/proxy.bpf.c` (`sockops`) | Lookup always misses | Normalise in `sockops`; UT-01.3 codec test; IT-01.5 end-to-end |
 | Wrong cgroup attach → no intercept or self-loop | `internal/ebpf` (new) | High | Attach at pod parent; whole-sidecar UID 1337 + UID skip; IT-01.4 loop test |
-| Greenfield: no toolchain yet | repo root | Blocks all work | Phase 0 establishes `go.mod`, Makefile, `bpf2go`, `vmlinux.h` |
+| Greenfield: no toolchain yet (resolved) | repo root | Blocked all work | Phase 0 established `go.mod`, Makefile, `bpf2go`, `vmlinux.h` |
 | LRU eviction before `accept()` under churn | `origdst_by_tuple` | Connection fails closed | `sockops` writes before SYN; size the map; bounded retry |
 
 > None hidden — all flagged with mitigations above.

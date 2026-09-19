@@ -68,6 +68,18 @@ Seen once or not yet corroborated. Tracked, not trusted.
 - evidence: validation.md#Phase 4 addendum re-verification (AD-010) (deploy/podman/pod_e2e_test.go Ranked gap 2) (task-authoring)
 - last seen: 2026-09-13T02:48:28Z
 
+### L-010 - Run the privileged/e2e test ladder for real (sudo + real pod) before claiming an AC verified; tests that always skip on missing root/tools hid four shipped capture bugs (zero-byte pcapng, ifindex mismatch, GSO truncation, --retain never forwarded).
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `testing,e2e,privileged` · harmful: 0
+- features: 03-capture-harness
+- evidence: .specs/STATE.md AD-011/AD-012 (testing,e2e,privileged)
+- last seen: 2026-09-19T17:34:55Z
+
+### L-011 - Run the privileged/e2e test ladder for real (sudo + real pod) before claiming an AC verified; tests that always skip on missing root/tools leave core behaviour with zero executing assertions.
+- signal: `ac_gap` · recurrence: 1 feature(s) · scope: `testing,e2e,privileged` · harmful: 0
+- features: 01-ebpf-redirect
+- evidence: bpf/connect4_it_test.go:109 (testing,e2e,privileged)
+- last seen: 2026-09-19T17:34:55Z
+
 ## Quarantined (failed when applied - ignore)
 
 A confirmed lesson that recurred alongside failure. Kept for the maintainer to review.
