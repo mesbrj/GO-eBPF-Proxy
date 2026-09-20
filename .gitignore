@@ -1,17 +1,12 @@
 # Project harness and specs
+AGENTS.md
 .github
 .claude
 .mcp.json
-# AGENTS.md
-# .specs
-# docs/technical-design-document.md
-# docs/prd/feature-*.md
-# docs/prd/product-requirements-document.md
+.specs
+docs/technical-design-document.md
 docs/feasibility-study.md
-
-
-# Local editor lint config
-/.markdownlint.json
+docs/prd/
 
 # Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
 bpf/vmlinux.h
