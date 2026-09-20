@@ -108,7 +108,7 @@ binary.
   compiler + OpenSSL headers (for building the `LD_PRELOAD` interposer)
 - Rootful Podman (local dev setup)
 - Supported platforms: Ubuntu 24.04 LTS is the reference platform — see the
-  [technical design document](docs/technical-design-document.md) for the full supported-platform matrix
+  [technical design document](https://curious-quince-eb8.notion.site/Techinical-Design-Document-3e08ea6a94c880cc9dfccc6fd2fed274#3e18ea6a94c8802d8e5de603f8f49b0e) for the full supported-platform matrix
 - `tshark` (optional, only needed to run the offline decrypt step in [Quick start](#quick-start))
 
 ## Quick start
@@ -188,11 +188,15 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 
 `sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band DPI; the TUI; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
 
+## Project Documentation
+
+[GO-eBPF-Proxy - Public Docs](https://curious-quince-eb8.notion.site/GO-eBPF-Proxy-Public-3e08ea6a94c8801e9083e63fc0773810)
+
 ## Skills reference
 
-- [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/): Plan and implement the features.
-- [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/): Create (and maintain) the technical design document based on previous researches, decisions and plans.
-- [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior): Manage and track the human tasks/activities.
+- [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/)
+- [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/) 
+- [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior)
 
 ## License
 
