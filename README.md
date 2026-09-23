@@ -176,8 +176,9 @@ make generate
 bpf/             eBPF C programs (connect4, sockops) + generated bindings
 internal/ebpf/   loader: load/attach/pin the eBPF programs, map codec
 internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
-internal/keylog/ keylog socket server, NSS keylog validation/writer, preload env builder
-internal/capture/ pcapng writer + embedded DSB, tcpdump fallback, tshark pairing, retention
+internal/keylog/ keylog socket server, NSS keylog validation/writer
+internal/capture/ live AF_PACKET capture, pcapng writer + embedded DSB, retention
+internal/capture/capturetest/ tshark offline-decryption check (test support only)
 preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new, ships keylog lines
 internal/shared/ structured logging, shared infra
 cmd/app/         sidecar entrypoint (wires loader, relay, keylog socket server, capture)

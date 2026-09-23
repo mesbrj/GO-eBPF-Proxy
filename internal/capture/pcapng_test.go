@@ -111,7 +111,7 @@ func TestWriter_NormalizesNonZeroInterfaceIndexFromRealIfindex(t *testing.T) {
 func TestWriter_DefaultsTimestampToInjectedClock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	want := time.Date(2026, 6, 1, 8, 30, 0, 0, time.UTC)
-	w, err := NewWriter(path, Options{Clock: NewManualClock(want)})
+	w, err := NewWriter(path, Options{Clock: newManualClock(want)})
 	require.NoError(t, err)
 
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0x01}))

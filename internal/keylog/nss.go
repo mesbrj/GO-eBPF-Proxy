@@ -17,33 +17,9 @@ var labelName = map[Label]string{
 	LabelExporterSecret:               "EXPORTER_SECRET",
 }
 
-// ErrUnknownLabel is returned for a label with no known NSS line name.
-var ErrUnknownLabel = errors.New("keylog: unknown secret label")
-
-// ErrInvalidClientRandomLength is returned when client_random isn't 32 bytes.
-var ErrInvalidClientRandomLength = errors.New("keylog: client_random must be 32 bytes")
-
-// ErrInvalidSecretLength is returned when a secret's length doesn't match what
-// its label allows: exactly 48 bytes for CLIENT_RANDOM (TLS 1.2 master
-// secret), or 32/48 bytes for a TLS 1.3 secret (SHA-256/SHA-384 cipher hash).
-var ErrInvalidSecretLength = errors.New("keylog: secret length does not match the label's cipher-hash length")
-
-// FormatLine formats one NSS keylog line: "<LABEL> <client_random hex> <secret hex>".
-func FormatLine(label Label, clientRandom, secret []byte) (string, error) {
-	name, ok := labelName[label]
-	if !ok {
-		return "", fmt.Errorf("%w: %d", ErrUnknownLabel, label)
-	}
-	if len(clientRandom) != 32 {
-		return "", ErrInvalidClientRandomLength
-	}
-	if !validSecretLen(label, len(secret)) {
-		return "", fmt.Errorf("%w: %s got %d bytes", ErrInvalidSecretLength, name, len(secret))
-	}
-	return fmt.Sprintf("%s %s %s", name, hex.EncodeToString(clientRandom), hex.EncodeToString(secret)), nil
-}
-
-// validSecretLen reports whether n is an allowed secret length for label.
+// validSecretLen reports whether n is an allowed secret length for label:
+// exactly 48 bytes for CLIENT_RANDOM (TLS 1.2 master secret), or 32/48 bytes
+// for a TLS 1.3 secret (SHA-256/SHA-384 cipher hash).
 func validSecretLen(label Label, n int) bool {
 	if label == LabelClientRandom {
 		return n == 48
@@ -65,9 +41,9 @@ var labelByName = func() map[string]Label {
 var ErrMalformedLine = errors.New("keylog: malformed NSS keylog line")
 
 // ValidateLine checks that line is a well-formed NSS keylog line: a known
-// label, a 32-byte (64 hex chars) client_random, and a secret whose length is
-// valid for that label. It never accepts a line that FormatLine would not
-// have produced.
+// label, a 32-byte (64 hex chars) client_random, and a hex secret whose
+// length is valid for that label. Anything else, including a line truncated
+// mid-write, is rejected with ErrMalformedLine.
 func ValidateLine(line string) error {
 	fields := strings.Fields(line)
 	if len(fields) != 3 {

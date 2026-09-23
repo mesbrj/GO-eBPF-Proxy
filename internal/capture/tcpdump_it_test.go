@@ -5,6 +5,7 @@ package capture
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,7 +41,7 @@ func TestBackendParity_TcpdumpAndGopacketDecryptIdentically(t *testing.T) {
 	}
 	defer func() { _ = stopTd() }()
 
-	stopGp, err := startGopacket("lo", gopacketPath)
+	stopGp, err := startLiveCapture("lo", gopacketPath)
 	if err != nil {
 		t.Skipf("gopacket capture not permitted in this environment: %v", err)
 	}
@@ -82,12 +83,33 @@ func TestBackendParity_TcpdumpAndGopacketDecryptIdentically(t *testing.T) {
 	require.NoError(t, stopGp())
 	require.NoError(t, kw.Close())
 
-	tcpdumpOut, err := DecryptedAppData(tcpdumpPath, keylogPath, AppDataFilter)
+	tcpdumpOut, err := decryptAppData(t, tcpdumpPath, keylogPath)
 	require.NoError(t, err)
-	gopacketOut, err := DecryptedAppData(gopacketPath, keylogPath, AppDataFilter)
+	gopacketOut, err := decryptAppData(t, gopacketPath, keylogPath)
 	require.NoError(t, err)
 
 	assert.Contains(t, tcpdumpOut, body, "tcpdump backend must decrypt the HTTP response body")
 	assert.Contains(t, gopacketOut, body, "gopacket backend must decrypt the HTTP response body")
 	assert.Equal(t, tcpdumpOut, gopacketOut, "both backends must decrypt to identical application data")
+}
+
+// startTcpdump runs `tcpdump -i <iface> -w <path>` as a subprocess and
+// returns a stop func that signals it to exit and waits for a clean pcap
+// trailer to be flushed. tcpdump is not a sidecar backend -- the sidecar
+// always captures in-process via StartLive -- only the independent reference
+// the parity test above compares StartLive's capture against.
+func startTcpdump(iface, path string) (stop func() error, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("capture: create capture dir: %w", err)
+	}
+	cmd := exec.Command("tcpdump", "-i", iface, "-w", path, "-U") // #nosec G204 -- iface/path are test-controlled, not raw user input
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("capture: start tcpdump: %w", err)
+	}
+	return func() error {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			return fmt.Errorf("capture: stop tcpdump: %w", err)
+		}
+		return cmd.Wait()
+	}, nil
 }

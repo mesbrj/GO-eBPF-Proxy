@@ -3,7 +3,9 @@
 package capture
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -20,14 +22,50 @@ import (
 	"github.com/gopacket/gopacket/pcapgo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture/capturetest"
 )
+
+// tsharkTimeout bounds one tshark run. These captures hold a single flow and
+// dissect in about a second, so a run still going after this is wedged and
+// should fail its test, not stall the suite until go test's global timeout.
+const tsharkTimeout = time.Minute
+
+// startLiveCapture captures iface into a fresh pcapng Writer at path through
+// the sidecar's own capture path (NewWriter + StartLive), so these tests
+// exercise the code the binary runs. The returned stop ends the capture and
+// then closes the Writer, leaving a complete capture at path.
+func startLiveCapture(iface, path string) (stop func() error, err error) {
+	w, err := NewWriter(path, Options{})
+	if err != nil {
+		return nil, err
+	}
+	live, err := StartLive(iface, w)
+	if err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	return func() error {
+		stopErr := live.Stop() // w is written to until Stop returns
+		return errors.Join(stopErr, w.Close())
+	}, nil
+}
+
+// decryptAppData pairs the capture at pcapPath with keylogPath and returns
+// tshark's decrypted application data, bounded by tsharkTimeout.
+func decryptAppData(t *testing.T, pcapPath, keylogPath string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), tsharkTimeout)
+	defer cancel()
+	return capturetest.DecryptedAppData(ctx, pcapPath, keylogPath, capturetest.AppDataFilter)
+}
 
 // IT-03.1 (Acceptance): a real TLS 1.3 flow captured to pcapng and paired
 // with its NSS keylog must decrypt to plaintext HTTP application data via
 // tshark. Needs tshark and a capturable loopback interface (CAP_NET_RAW);
 // skips cleanly otherwise -- same class of environment-limited deferral
 // recorded for F01/F02 in .specs/STATE.md.
-func TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
+func TestOfflineDecryption_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
 	if _, err := exec.LookPath("tshark"); err != nil {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
@@ -36,7 +74,7 @@ func TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
 	pcapPath := filepath.Join(dir, "dump.pcapng")
 	keylogPath := filepath.Join(dir, "sslkeylog.log")
 
-	stop, err := startGopacket("lo", pcapPath)
+	stop, err := startLiveCapture("lo", pcapPath)
 	if err != nil {
 		t.Skipf("loopback capture not permitted in this environment: %v", err)
 	}
@@ -65,7 +103,7 @@ func TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
 	require.NoError(t, stop())
 	require.NoError(t, kw.Close())
 
-	out, err := DecryptedAppData(pcapPath, keylogPath, AppDataFilter)
+	out, err := decryptAppData(t, pcapPath, keylogPath)
 	require.NoError(t, err)
 	assert.Contains(t, out, body, "tshark must decrypt the HTTP response body")
 }
@@ -77,7 +115,7 @@ func TestDecryptedAppData_RealTLS13FlowDecryptsToHTTP(t *testing.T) {
 // h2 with a separate "http2" dissector that a plain "http" display filter
 // never matches, so filtering on "http" alone reports zero frames for a
 // perfectly captured, perfectly decrypting h2 session.
-func TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing.T) {
+func TestOfflineDecryption_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing.T) {
 	if _, err := exec.LookPath("tshark"); err != nil {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
@@ -86,7 +124,7 @@ func TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing
 	pcapPath := filepath.Join(dir, "dump.pcapng")
 	keylogPath := filepath.Join(dir, "sslkeylog.log")
 
-	stop, err := startGopacket("lo", pcapPath)
+	stop, err := startLiveCapture("lo", pcapPath)
 	if err != nil {
 		t.Skipf("loopback capture not permitted in this environment: %v", err)
 	}
@@ -117,7 +155,7 @@ func TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing
 	require.NoError(t, stop())
 	require.NoError(t, kw.Close())
 
-	out, err := DecryptedAppData(pcapPath, keylogPath, AppDataFilter)
+	out, err := decryptAppData(t, pcapPath, keylogPath)
 	require.NoError(t, err)
 	assert.Contains(t, out, body, "tshark must decrypt the h2 response body")
 }
@@ -132,7 +170,7 @@ func TestDecryptedAppData_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testing
 // tshark abandons TCP reassembly at the first gap unless told otherwise, and
 // an abandoned stream decrypts to nothing at all, which is indistinguishable
 // from lost packets or a mismatched key.
-func TestDecryptedAppData_OutOfOrderServerSegmentsStillDecrypt(t *testing.T) {
+func TestOfflineDecryption_OutOfOrderServerSegmentsStillDecrypt(t *testing.T) {
 	if _, err := exec.LookPath("tshark"); err != nil {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
@@ -141,7 +179,7 @@ func TestDecryptedAppData_OutOfOrderServerSegmentsStillDecrypt(t *testing.T) {
 	pcapPath := filepath.Join(dir, "dump.pcapng")
 	keylogPath := filepath.Join(dir, "sslkeylog.log")
 
-	stop, err := startGopacket("lo", pcapPath)
+	stop, err := startLiveCapture("lo", pcapPath)
 	if err != nil {
 		t.Skipf("loopback capture not permitted in this environment: %v", err)
 	}
@@ -175,7 +213,7 @@ func TestDecryptedAppData_OutOfOrderServerSegmentsStillDecrypt(t *testing.T) {
 	reordered := rewriteWithServerSegmentsReversed(t, pcapPath, jumbled, serverPort)
 	require.GreaterOrEqual(t, reordered, 2, "the capture must hold several server segments for reordering them to mean anything")
 
-	out, err := DecryptedAppData(jumbled, keylogPath, AppDataFilter)
+	out, err := decryptAppData(t, jumbled, keylogPath)
 	require.NoError(t, err)
 	assert.Contains(t, out, body, "a capture whose server segments arrived out of sequence must still decrypt")
 }
@@ -239,7 +277,7 @@ func rewriteWithServerSegmentsReversed(t *testing.T, src, dst string, serverPort
 // generated outside the capture window, i.e. "skewed") must fail to
 // decrypt -- guarding the timestamp/session-alignment invariant against
 // regression.
-func TestDecryptedAppData_MismatchedKeylogFailsToDecrypt(t *testing.T) {
+func TestOfflineDecryption_MismatchedKeylogFailsToDecrypt(t *testing.T) {
 	if _, err := exec.LookPath("tshark"); err != nil {
 		t.Skip("tshark not installed; cannot assert decryption failure")
 	}
@@ -248,7 +286,7 @@ func TestDecryptedAppData_MismatchedKeylogFailsToDecrypt(t *testing.T) {
 	pcapPath := filepath.Join(dir, "dump.pcapng")
 	wrongKeylogPath := filepath.Join(dir, "wrong-sslkeylog.log")
 
-	stop, err := startGopacket("lo", pcapPath)
+	stop, err := startLiveCapture("lo", pcapPath)
 	if err != nil {
 		t.Skipf("loopback capture not permitted in this environment: %v", err)
 	}
@@ -276,7 +314,7 @@ func TestDecryptedAppData_MismatchedKeylogFailsToDecrypt(t *testing.T) {
 	bogusLine := "SERVER_HANDSHAKE_TRAFFIC_SECRET " + strings.Repeat("00", 32) + " " + strings.Repeat("00", 32) + "\n"
 	require.NoError(t, os.WriteFile(wrongKeylogPath, []byte(bogusLine), 0o600))
 
-	out, err := DecryptedAppData(pcapPath, wrongKeylogPath, AppDataFilter)
+	out, err := decryptAppData(t, pcapPath, wrongKeylogPath)
 	// tshark does not error on a non-matching keylog; decryption silently
 	// fails, so the HTTP application-data never materialises.
 	require.NoError(t, err)

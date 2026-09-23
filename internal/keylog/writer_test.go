@@ -12,13 +12,7 @@ import (
 )
 
 func sampleLine(secretByte byte) string {
-	cr := fixedBytes(32, 0xAA)
-	ms := fixedBytes(48, secretByte)
-	line, err := FormatLine(LabelClientRandom, cr, ms)
-	if err != nil {
-		panic(err)
-	}
-	return line
+	return formatLine(LabelClientRandom, fixedBytes(32, 0xAA), fixedBytes(48, secretByte))
 }
 
 // UT-02.4: file 0600 in dir 0700, O_APPEND, newline-terminated.

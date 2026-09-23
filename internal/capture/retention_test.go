@@ -24,7 +24,7 @@ func TestEnforce_EvictsOldestFirstWhenSizeCapExceeded(t *testing.T) {
 	writeFileAt(t, filepath.Join(dir, "middle.pcapng"), 100, base.Add(time.Hour))
 	writeFileAt(t, filepath.Join(dir, "newest.pcapng"), 100, base.Add(2*time.Hour))
 
-	r := Retention{Dir: dir, MaxBytes: 150, Clock: NewManualClock(base.Add(3 * time.Hour))}
+	r := Retention{Dir: dir, MaxBytes: 150, Clock: newManualClock(base.Add(3 * time.Hour))}
 	require.NoError(t, r.Enforce())
 
 	_, err := os.Stat(filepath.Join(dir, "oldest.pcapng"))
@@ -50,7 +50,7 @@ func TestEnforce_EvictsFilesOlderThanMaxAge(t *testing.T) {
 	writeFileAt(t, filepath.Join(dir, "stale.pcapng"), 10, base)
 	writeFileAt(t, filepath.Join(dir, "fresh.pcapng"), 10, base.Add(23*time.Hour))
 
-	r := Retention{Dir: dir, MaxAge: 24 * time.Hour, Clock: NewManualClock(base.Add(25 * time.Hour))}
+	r := Retention{Dir: dir, MaxAge: 24 * time.Hour, Clock: newManualClock(base.Add(25 * time.Hour))}
 	require.NoError(t, r.Enforce())
 
 	_, err := os.Stat(filepath.Join(dir, "stale.pcapng"))
@@ -65,7 +65,7 @@ func TestEnforce_NoopWhenWithinBounds(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	writeFileAt(t, filepath.Join(dir, "a.pcapng"), 10, base)
 
-	r := Retention{Dir: dir, MaxBytes: 1000, MaxAge: time.Hour, Clock: NewManualClock(base.Add(time.Minute))}
+	r := Retention{Dir: dir, MaxBytes: 1000, MaxAge: time.Hour, Clock: newManualClock(base.Add(time.Minute))}
 	require.NoError(t, r.Enforce())
 
 	_, err := os.Stat(filepath.Join(dir, "a.pcapng"))

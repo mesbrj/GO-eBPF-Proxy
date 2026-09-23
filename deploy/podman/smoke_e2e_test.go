@@ -3,6 +3,7 @@
 package podman
 
 import (
+	"context"
 	"net"
 	"os"
 	"os/exec"
@@ -15,7 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture/capturetest"
 )
 
 // requireInternetEgress skips when example.com isn't reachable -- the smoke
@@ -80,6 +81,21 @@ func fileSizeOrZero(path string) int64 {
 	return info.Size()
 }
 
+// tsharkTimeout bounds one tshark run. A smoke capture holds a few flows and
+// dissects in seconds, so a run still going after this is wedged and should
+// fail its test, not stall the suite until go test's global timeout.
+const tsharkTimeout = time.Minute
+
+// decryptAppData pairs the capture at pcapPath with keylogPath ("" pairs no
+// external keylog, leaving only the capture's embedded secrets) and returns
+// tshark's decrypted application data, bounded by tsharkTimeout.
+func decryptAppData(t *testing.T, pcapPath, keylogPath string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), tsharkTimeout)
+	defer cancel()
+	return capturetest.DecryptedAppData(ctx, pcapPath, keylogPath, capturetest.AppDataFilter)
+}
+
 // IT-03.5 / IT-03.6 (Acceptance, smoke test): curl https://example.com (no
 // -k) from the app container succeeds end-to-end through the relay,
 // validating the real server certificate, and grows the capture + keylog
@@ -142,7 +158,7 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 	var out string
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		out, err = capture.DecryptedAppData(capturePath, hostKeylogPath, capture.AppDataFilter)
+		out, err = decryptAppData(t, capturePath, hostKeylogPath)
 		if (err == nil && strings.Contains(strings.ToLower(out), "example")) || time.Now().After(deadline) {
 			break
 		}
@@ -183,12 +199,9 @@ func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 	stopOut, err := exec.Command("podman", "stop", "-t", "30", podName+"-sidecar").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
 	require.NoError(t, err, "podman stop sidecar (graceful, so App.Close runs): %s", stopOut)
 
-	// An empty keylog stands in for "no keylog": whatever decrypts can then
-	// only have come from the capture's own embedded secrets.
-	emptyKeylog := filepath.Join(t.TempDir(), "empty-sslkeylog.log")
-	require.NoError(t, os.WriteFile(emptyKeylog, nil, 0o600))
-
-	out, err := capture.DecryptedAppData(capturePath, emptyKeylog, capture.AppDataFilter)
+	// No external keylog: whatever decrypts can then only have come from the
+	// capture's own embedded secrets.
+	out, err := decryptAppData(t, capturePath, "")
 	require.NoError(t, err)
 	assert.Contains(t, strings.ToLower(out), "example",
 		"the capture's embedded Decryption Secrets Block must decrypt the session unaided; a DSB written after the packet blocks never can, since tshark reads a capture sequentially")

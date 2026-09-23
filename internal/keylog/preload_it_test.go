@@ -143,6 +143,16 @@ func startOpenSSLServer(t *testing.T, certPath, keyPath, tlsFlag string) (addr s
 	}
 }
 
+// preloadEnv returns the env vars that load the LD_PRELOAD keylog interposer
+// from soPath and point it at socketPath: the same pair deploy/podman/pod-up.sh
+// sets on the app container.
+func preloadEnv(soPath, socketPath string) []string {
+	return []string{
+		"LD_PRELOAD=" + soPath,
+		"GOEBPF_PRELOAD_SOCKET=" + socketPath,
+	}
+}
+
 // runOpenSSLClient runs `openssl s_client` against addr with env appended to
 // the current process environment (used to set LD_PRELOAD/
 // GOEBPF_PRELOAD_SOCKET), feeding empty stdin so the handshake completes and
@@ -174,7 +184,7 @@ func TestPreload_TLS13Handshake_EmitsFiveLinesWithMatchingClientRandom(t *testin
 
 	_, sockPath, keylogPath := newTestSocketServer(t)
 
-	runOpenSSLClient(t, addr, "-tls1_3", PreloadEnv(so, sockPath))
+	runOpenSSLClient(t, addr, "-tls1_3", preloadEnv(so, sockPath))
 
 	got := waitForKeylogLineCount(t, keylogPath, 5, 5*time.Second)
 	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
@@ -216,7 +226,7 @@ func TestPreload_TLS12Handshake_EmitsOneClientRandomLine(t *testing.T) {
 
 	_, sockPath, keylogPath := newTestSocketServer(t)
 
-	runOpenSSLClient(t, addr, "-tls1_2", PreloadEnv(so, sockPath))
+	runOpenSSLClient(t, addr, "-tls1_2", preloadEnv(so, sockPath))
 
 	got := waitForKeylogLineCount(t, keylogPath, 1, 5*time.Second)
 	fields := strings.Fields(strings.TrimRight(got, "\n"))
@@ -261,7 +271,7 @@ func TestPreload_PlainTCPTraffic_EmitsNoLines(t *testing.T) {
 
 	_, sockPath, keylogPath := newTestSocketServer(t)
 
-	env := PreloadEnv(so, sockPath)
+	env := preloadEnv(so, sockPath)
 	cmd := exec.Command("curl", "-s", "-o", os.DevNull, srv.URL) // #nosec G204 -- fixed subcommand, test-controlled args
 	cmd.Env = append(os.Environ(), env...)
 	require.NoError(t, cmd.Run())
@@ -288,7 +298,7 @@ func TestPreload_NonOpenSSLBinary_NoCrashNoLines(t *testing.T) {
 	_, sockPath, keylogPath := newTestSocketServer(t)
 
 	cmd := exec.Command(truePath) // #nosec G204 -- fixed, no arguments
-	cmd.Env = append(os.Environ(), PreloadEnv(so, sockPath)...)
+	cmd.Env = append(os.Environ(), preloadEnv(so, sockPath)...)
 	err = cmd.Run()
 	assert.NoError(t, err, "a non-OpenSSL binary must run to completion without crashing")
 
@@ -317,7 +327,7 @@ func TestPreload_SocketUnreachable_ClientCompletesWithoutBlocking(t *testing.T) 
 
 	done := make(chan struct{})
 	go func() {
-		runOpenSSLClient(t, addr, "-tls1_3", PreloadEnv(so, unreachableSock))
+		runOpenSSLClient(t, addr, "-tls1_3", preloadEnv(so, unreachableSock))
 		close(done)
 	}()
 
