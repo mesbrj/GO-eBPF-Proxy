@@ -92,10 +92,7 @@ func Start(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("app: listen %q: %w", cfg.RelayListen, err)
 	}
 	a.ln = ln
-	log := logger.New(os.Stderr)
-	relay := proxy.NewRelay(proxy.NewResolver(loader.OrigDstByTuple()), proxy.WithOnResolved(func(dst netip.AddrPort) {
-		log.Info("connection relayed", map[string]any{"orig_dst": dst.String()})
-	}))
+	relay := newRelay(loader.OrigDstByTuple(), logger.New(os.Stderr))
 	go func() { _ = relay.Serve(ln) }()
 
 	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
@@ -190,6 +187,26 @@ func (a *App) Close() error {
 		errs = append(errs, a.retention.Cleanup())
 	}
 	return errors.Join(errs...)
+}
+
+// newRelay builds the relay over the origdst_by_tuple map m, logging every
+// relayed connection's original destination, every fail-closed resolver miss
+// with its source tuple (a bug signal -- LRU undersizing -- or an abuse
+// signal -- a direct, un-redirected connect to the relay port), and every
+// upstream dial failure. Without the last two, a connection the relay resets
+// or cannot forward leaves no trace.
+func newRelay(m proxy.Lookuper, log *logger.Logger) *proxy.Relay {
+	resolver := proxy.NewResolver(m, proxy.WithOnMiss(func(src netip.AddrPort) {
+		log.Warn("connection reset: no original destination (fail-closed)", map[string]any{"src": src.String()})
+	}))
+	return proxy.NewRelay(resolver,
+		proxy.WithOnResolved(func(dst netip.AddrPort) {
+			log.Info("connection relayed", map[string]any{"orig_dst": dst.String()})
+		}),
+		proxy.WithOnDialErr(func(err error) {
+			log.Warn("upstream dial failed", map[string]any{"error": err.Error()})
+		}),
+	)
 }
 
 // readKeylogLines reads the keylog file's non-empty lines for embedding as a
