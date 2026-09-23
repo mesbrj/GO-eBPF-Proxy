@@ -36,8 +36,10 @@ socket layer, and TLS keys read passively from the process that already holds th
    socket to the sidecar.
 5. The sidecar's socket server reads those lines, validates and deduplicates them, and
    writes them as an NSS keylog (on tmpfs, `0600`/`0700`).
-6. The sidecar also captures the relay's outbound leg to a pcapng file, embedding the
-   keylog as a Decryption Secrets Block on close — the capture is self-decrypting.
+6. The sidecar also captures the relay's outbound leg to a pcapng file, in-process
+   (gopacket reading an `AF_PACKET` socket — no libpcap or external capture tool),
+   embedding the keylog as a Decryption Secrets Block on close — the capture is
+   self-decrypting.
    Retention is bounded (size + age caps) and ephemeral by default: pod teardown wipes
    the capture directory unless `--retain` is set.
 7. Offline, `tshark`/Wireshark pairs the pcapng (or its embedded DSB) with the keylog to

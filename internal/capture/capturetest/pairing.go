@@ -45,10 +45,9 @@ func TsharkArgs(pcapPath, keylogPath string) []string {
 // segments jumbled (confirmed via IP IDs: the server sent them in order).
 // Without this, TLS record reassembly abandons such a session and it decrypts
 // to nothing, which looks exactly like packet loss or a bad key. It is not a
-// capture-backend defect: a simultaneous tcpdump -- an mmap'd AF_PACKET ring
-// buffer, the very thing a gopacket/afpacket migration would provide --
-// records the same reordering on the same sessions, and needs the same option
-// to decrypt them.
+// defect of the in-process capture: an independent, simultaneous capture of
+// the same sessions through an mmap'd AF_PACKET ring buffer recorded the same
+// reordering, and needed the same option to decrypt them.
 const reassembleOutOfOrder = "tcp.reassemble_out_of_order:TRUE"
 
 // DecryptedAppData runs tshark over pcapPath paired with keylogPath (see

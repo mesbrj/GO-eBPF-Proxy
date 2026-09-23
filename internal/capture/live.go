@@ -7,8 +7,9 @@ import (
 )
 
 // Live copies packets from a network interface into a Writer until Stop. It
-// is the sidecar's capture backend: an in-process AF_PACKET reader, so the
-// binary stays CGO-free and needs no tcpdump in its image.
+// is the sidecar's only capture backend: an in-process AF_PACKET reader, so
+// the binary stays CGO-free and needs no libpcap or external capture tool in
+// its image. The offline-decryption tests capture through it too.
 type Live struct {
 	iface string
 	h     *pcapgo.EthernetHandle

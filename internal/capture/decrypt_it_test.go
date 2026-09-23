@@ -165,8 +165,8 @@ func TestOfflineDecryption_RealTLS13HTTP2FlowDecryptsToApplicationData(t *testin
 // body. This is not a hypothetical: on a real rootful Podman pod roughly a
 // third of otherwise-perfect TLS 1.3 sessions land in the capture with the
 // server's segments jumbled (their IP IDs prove the server sent them in
-// order), and a simultaneous tcpdump -- an mmap'd AF_PACKET ring buffer --
-// records exactly the same reordering, so no capture backend escapes it.
+// order), and an independent, simultaneous mmap'd AF_PACKET ring capture
+// recorded exactly the same reordering, so no capture design escapes it.
 // tshark abandons TCP reassembly at the first gap unless told otherwise, and
 // an abandoned stream decrypts to nothing at all, which is indistinguishable
 // from lost packets or a mismatched key.
