@@ -7,42 +7,6 @@ import (
 	"strings"
 )
 
-// TLS wire version values, as negotiated (not the ClientHello legacy_version).
-const (
-	TLSVersion12 uint16 = 0x0303
-	TLSVersion13 uint16 = 0x0304
-)
-
-// ErrUnknownTLSVersion is returned for an unrecognised or downgraded TLS
-// version; no NSS line is ever emitted for it.
-var ErrUnknownTLSVersion = errors.New("keylog: unknown or downgraded TLS version")
-
-// LabelSet is the ordered set of NSS labels a TLS version emits per handshake.
-type LabelSet []Label
-
-// tls13LabelSet is fixed: five secrets in derivation order.
-var tls13LabelSet = LabelSet{
-	LabelClientHandshakeTrafficSecret,
-	LabelServerHandshakeTrafficSecret,
-	LabelClientTrafficSecret0,
-	LabelServerTrafficSecret0,
-	LabelExporterSecret,
-}
-
-// Classify selects the NSS label set for a negotiated TLS version: one
-// CLIENT_RANDOM line for 1.2, the five traffic/handshake/exporter secrets for
-// 1.3. Any other (unknown or downgraded) version is a typed error.
-func Classify(version uint16) (LabelSet, error) {
-	switch version {
-	case TLSVersion12:
-		return LabelSet{LabelClientRandom}, nil
-	case TLSVersion13:
-		return tls13LabelSet, nil
-	default:
-		return nil, ErrUnknownTLSVersion
-	}
-}
-
 // labelName is the NSS keylog line name for each Label.
 var labelName = map[Label]string{
 	LabelClientRandom:                 "CLIENT_RANDOM",
@@ -85,15 +49,6 @@ func validSecretLen(label Label, n int) bool {
 		return n == 48
 	}
 	return n == 32 || n == 48
-}
-
-// ClientRandomKey returns the canonical lowercase-hex client_random, the
-// stable join key used to pair a keylog line to its captured ClientHello.
-func ClientRandomKey(clientRandom []byte) (string, error) {
-	if len(clientRandom) != 32 {
-		return "", ErrInvalidClientRandomLength
-	}
-	return hex.EncodeToString(clientRandom), nil
 }
 
 // labelByName is the reverse of labelName, used by ValidateLine.

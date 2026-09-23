@@ -10,31 +10,6 @@ import (
 	"github.com/gopacket/gopacket/pcapgo"
 )
 
-// lookPath resolves the tcpdump binary; overridable in tests so backend
-// selection doesn't depend on whether tcpdump happens to be installed.
-var lookPath = exec.LookPath
-
-// backendFor reports which backend Start would choose for the given tcpdump
-// lookup function: "tcpdump" when found, "gopacket" otherwise. Exposed
-// separately so the fallback-selection edge case is unit-testable without a
-// real capture (spec edge case: tcpdump unavailable -> gopacket fallback).
-func backendFor(lp func(string) (string, error)) string {
-	if _, err := lp("tcpdump"); err == nil {
-		return "tcpdump"
-	}
-	return "gopacket"
-}
-
-// Start captures iface to path, preferring tcpdump when it is on PATH and
-// falling back to the in-process gopacket backend otherwise. It returns a
-// stop func that cleanly terminates the capture.
-func Start(iface, path string) (stop func() error, err error) {
-	if backendFor(lookPath) == "tcpdump" {
-		return startTcpdump(iface, path)
-	}
-	return startGopacket(iface, path)
-}
-
 // startTcpdump runs `tcpdump -i <iface> -w <path>` as a subprocess and
 // returns a stop func that signals it to exit and waits for a clean pcap
 // trailer to be flushed.

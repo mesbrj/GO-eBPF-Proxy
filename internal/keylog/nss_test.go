@@ -91,37 +91,3 @@ func TestFormatLine_InvalidSecretLength(t *testing.T) {
 	_, err := FormatLine(LabelExporterSecret, cr, fixedBytes(20, 0x55))
 	assert.ErrorIs(t, err, ErrInvalidSecretLength)
 }
-
-// UT-02.6: version classifier selects the label set; unknown/downgraded -> typed error.
-func TestClassify_VersionSelectsLabelSet(t *testing.T) {
-	t.Run("1.2 -> CLIENT_RANDOM", func(t *testing.T) {
-		labels, err := Classify(TLSVersion12)
-		require.NoError(t, err)
-		assert.Equal(t, LabelSet{LabelClientRandom}, labels)
-	})
-	t.Run("1.3 -> five labels", func(t *testing.T) {
-		labels, err := Classify(TLSVersion13)
-		require.NoError(t, err)
-		assert.Len(t, labels, 5)
-	})
-	t.Run("unknown/downgraded -> typed error, no line", func(t *testing.T) {
-		_, err := Classify(0x0301) // TLS 1.0
-		assert.ErrorIs(t, err, ErrUnknownTLSVersion)
-	})
-}
-
-// UT-02.10: canonical client_random is a stable lowercase-hex join key.
-func TestClientRandomKey_CanonicalAndStable(t *testing.T) {
-	cr := fixedBytes(32, 0xFA)
-	key1, err := ClientRandomKey(cr)
-	require.NoError(t, err)
-	key2, err := ClientRandomKey(cr)
-	require.NoError(t, err)
-
-	assert.Equal(t, key1, key2, "same client_random must produce the same key")
-	assert.Equal(t, strings.ToLower(key1), key1, "key must be canonical lowercase hex")
-	assert.Len(t, key1, 64)
-
-	_, err = ClientRandomKey(fixedBytes(16, 0xFA))
-	assert.ErrorIs(t, err, ErrInvalidClientRandomLength)
-}
