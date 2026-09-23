@@ -187,7 +187,7 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 
 ## Out of scope (MVP)
 
-`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band DPI; the TUI; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
+`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band: DPI, IPFIX export; the TUI; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
 
 ## Project Documentation
 
@@ -196,7 +196,7 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 ## Skills reference
 
 - [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/)
-- [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/) 
+- [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/)
 - [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior)
 
 ## License
