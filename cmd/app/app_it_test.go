@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
 
 // Orchestration smoke test: every wired subsystem (eBPF load+attach, relay,
@@ -50,7 +52,7 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
 	cfg.RetentionTick = 0 // deterministic test: no background ticker
 
-	a, err := Start(cfg)
+	a, err := Start(cfg, logger.New(os.Stderr))
 	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
 		t.Skipf("privileged capture/attach not permitted: %v", err)
 	}
@@ -90,7 +92,7 @@ func TestApp_CloseWithRetainPreservesArtifacts(t *testing.T) {
 	cfg.RetentionTick = 0
 	cfg.Retain = true
 
-	a, err := Start(cfg)
+	a, err := Start(cfg, logger.New(os.Stderr))
 	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
 		t.Skipf("privileged capture/attach not permitted: %v", err)
 	}

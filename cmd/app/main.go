@@ -6,10 +6,11 @@ package main
 
 import (
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
 
 func main() {
@@ -26,15 +27,17 @@ func main() {
 	flag.Int64Var(&cfg.MaxBytes, "max-bytes", cfg.MaxBytes, "capture directory size cap in bytes (0 disables)")
 	flag.DurationVar(&cfg.MaxAge, "max-age", cfg.MaxAge, "capture artifact age cap (0 disables)")
 	flag.DurationVar(&cfg.RetentionTick, "retention-interval", cfg.RetentionTick, "how often to enforce retention while running (0 disables)")
+	flag.DurationVar(&cfg.StatsInterval, "stats-interval", cfg.StatsInterval, "how often to log the cumulative counters as a \"stats\" line, plus once at shutdown (0 disables)")
 	flag.Parse()
 
+	log := logger.New(os.Stderr)
 	if cfg.CgroupPath == "" {
-		log.Fatal("app: --cgroup-path is required")
+		fatal(log, "app: --cgroup-path is required", nil)
 	}
 
-	a, err := Start(cfg)
+	a, err := Start(cfg, log)
 	if err != nil {
-		log.Fatalf("app: start: %v", err)
+		fatal(log, "app: start failed", err)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -42,6 +45,18 @@ func main() {
 	<-sig
 
 	if err := a.Close(); err != nil {
-		log.Fatalf("app: shutdown: %v", err)
+		fatal(log, "app: shutdown failed", err)
 	}
+}
+
+// fatal logs msg (and err, if any) at ERROR and exits 1. It goes through the
+// sidecar's JSON logger rather than the standard library's plain-text log so
+// that a log pipeline parsing the sidecar's output also sees why it exited.
+func fatal(log *logger.Logger, msg string, err error) {
+	var ctx map[string]any
+	if err != nil {
+		ctx = map[string]any{"error": err.Error()}
+	}
+	log.Error(msg, ctx)
+	os.Exit(1)
 }

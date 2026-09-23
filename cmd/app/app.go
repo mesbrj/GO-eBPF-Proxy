@@ -32,6 +32,7 @@ type Config struct {
 	MaxBytes         int64
 	MaxAge           time.Duration
 	RetentionTick    time.Duration
+	StatsInterval    time.Duration
 }
 
 // DefaultConfig returns a Config populated with the sidecar's compiled-in
@@ -47,6 +48,7 @@ func DefaultConfig() Config {
 		MaxBytes:         100 * 1024 * 1024,
 		MaxAge:           24 * time.Hour,
 		RetentionTick:    5 * time.Minute,
+		StatsInterval:    time.Minute,
 	}
 }
 
@@ -55,8 +57,10 @@ func DefaultConfig() Config {
 // capture into its DSB-embedded pcapng writer.
 type App struct {
 	cfg       Config
+	log       *logger.Logger
 	loader    *ebpf.Loader
 	ln        net.Listener
+	resolver  *proxy.Resolver
 	keylogSrv *keylog.SocketServer
 	capW      *capture.Writer
 	live      *capture.Live
@@ -65,11 +69,11 @@ type App struct {
 }
 
 // Start loads and attaches the eBPF programs, starts the relay, starts the
-// keylog socket server, and starts capture. On any failure it tears down
-// whatever was already started before returning the error (never leaks a
-// partial run).
-func Start(cfg Config) (*App, error) {
-	a := &App{cfg: cfg}
+// keylog socket server, and starts capture, with every subsystem logging
+// through log. On any failure it tears down whatever was already started
+// before returning the error (never leaks a partial run).
+func Start(cfg Config, log *logger.Logger) (*App, error) {
+	a := &App{cfg: cfg, log: log}
 
 	loader, err := ebpf.Load(ebpf.Config{
 		CgroupPath: cfg.CgroupPath,
@@ -92,13 +96,14 @@ func Start(cfg Config) (*App, error) {
 		return nil, fmt.Errorf("app: listen %q: %w", cfg.RelayListen, err)
 	}
 	a.ln = ln
-	relay := newRelay(loader.OrigDstByTuple(), logger.New(os.Stderr))
+	a.resolver = newResolver(loader.OrigDstByTuple(), log)
+	relay := newRelay(a.resolver, log)
 	go func() { _ = relay.Serve(ln) }()
 
 	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
 		SocketPath: cfg.KeylogSocketPath,
 		KeylogPath: cfg.KeylogPath,
-	})
+	}, keylog.WithLogger(log))
 	if err != nil {
 		_ = a.Close()
 		return nil, fmt.Errorf("app: start keylog socket server: %w", err)
@@ -130,7 +135,10 @@ func Start(cfg Config) (*App, error) {
 
 	a.stopTick = make(chan struct{})
 	if cfg.RetentionTick > 0 {
-		go a.enforceRetentionPeriodically()
+		go a.enforceRetentionPeriodically(a.stopTick)
+	}
+	if cfg.StatsInterval > 0 {
+		go a.logStatsPeriodically(a.stopTick)
 	}
 
 	return a, nil
@@ -138,18 +146,45 @@ func Start(cfg Config) (*App, error) {
 
 // enforceRetentionPeriodically bounds the capture directory's footprint
 // while the sidecar runs, not just at teardown (spec: retention is never
-// unbounded).
-func (a *App) enforceRetentionPeriodically() {
+// unbounded). It returns once stop is closed; stop is passed in rather than
+// read from a.stopTick, which Close sets to nil concurrently.
+func (a *App) enforceRetentionPeriodically(stop <-chan struct{}) {
 	t := time.NewTicker(a.cfg.RetentionTick)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
 			_ = a.retention.Enforce()
-		case <-a.stopTick:
+		case <-stop:
 			return
 		}
 	}
+}
+
+// logStatsPeriodically emits the stats line every StatsInterval until stop is
+// closed.
+func (a *App) logStatsPeriodically(stop <-chan struct{}) {
+	t := time.NewTicker(a.cfg.StatsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			a.logStats()
+		case <-stop:
+			return
+		}
+	}
+}
+
+// logStats reports the sidecar's counters as one "stats" log line:
+// origdst_lookup_miss (fail-closed resolver misses) and keylog_lines_rejected
+// (malformed lines the keylog socket refused). Both are cumulative since
+// start, so a log consumer derives rates from consecutive lines.
+func (a *App) logStats() {
+	a.log.Info("stats", map[string]any{
+		"origdst_lookup_miss":   a.resolver.Misses(),
+		"keylog_lines_rejected": a.keylogSrv.RejectedCount(),
+	})
 }
 
 // Close embeds the final keylog into the capture as a DSB, stops every
@@ -160,6 +195,12 @@ func (a *App) Close() error {
 	if a.stopTick != nil {
 		close(a.stopTick)
 		a.stopTick = nil
+		// stopTick exists only once Start fully succeeded, so every counter's
+		// source is up. Report the final values: a run shorter than
+		// StatsInterval would otherwise never log them.
+		if a.cfg.StatsInterval > 0 {
+			a.logStats()
+		}
 	}
 	if a.live != nil {
 		// Stop waits for the packet-reading goroutine to exit, so it must
@@ -189,16 +230,20 @@ func (a *App) Close() error {
 	return errors.Join(errs...)
 }
 
-// newRelay builds the relay over the origdst_by_tuple map m, logging every
-// relayed connection's original destination, every fail-closed resolver miss
-// with its source tuple (a bug signal -- LRU undersizing -- or an abuse
-// signal -- a direct, un-redirected connect to the relay port), and every
-// upstream dial failure. Without the last two, a connection the relay resets
-// or cannot forward leaves no trace.
-func newRelay(m proxy.Lookuper, log *logger.Logger) *proxy.Relay {
-	resolver := proxy.NewResolver(m, proxy.WithOnMiss(func(src netip.AddrPort) {
+// newResolver builds the fail-closed resolver over the origdst_by_tuple map m,
+// logging every definitive miss with its source tuple: a bug signal (LRU
+// undersizing) or an abuse signal (a direct, un-redirected connect to the
+// relay port). Without it, the connection the relay resets leaves no trace.
+func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
+	return proxy.NewResolver(m, proxy.WithOnMiss(func(src netip.AddrPort) {
 		log.Warn("connection reset: no original destination (fail-closed)", map[string]any{"src": src.String()})
 	}))
+}
+
+// newRelay builds the relay over resolver, logging every relayed connection's
+// original destination and every upstream dial failure -- the relay closes
+// the client either way, so the log is the only trace of the failure.
+func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
 	return proxy.NewRelay(resolver,
 		proxy.WithOnResolved(func(dst netip.AddrPort) {
 			log.Info("connection relayed", map[string]any{"orig_dst": dst.String()})
