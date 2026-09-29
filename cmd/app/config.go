@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -51,6 +52,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.Duration("max-age", d.MaxAge, "capture artifact age cap (0 disables)")
 	fs.Duration("retention-interval", d.RetentionTick, "how often to enforce retention while running (0 disables)")
 	fs.Duration("stats-interval", d.StatsInterval, "how often to log the cumulative counters as a \"stats\" line, plus once at shutdown (0 disables)")
+	fs.TextVar(new(slog.Level), "log-level", d.LogLevel, "minimum level logged: debug, info, warn or error, optionally offset like warn+2")
 	path := fs.String(configFlag, "", "optional config file (.yaml, .yml, .toml or .json); "+envPrefix+"* env vars and flags override it")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -100,13 +102,16 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	// hook koanf would otherwise install is restated here. Weak typing stays
 	// off so a value of the wrong type (a boolean for max-bytes, a number for
 	// retain) is an error instead of being coerced; env and flag values, which
-	// always arrive as strings, are parsed strictly by the string hooks.
+	// always arrive as strings, are parsed strictly by the string hooks, and
+	// log-level by slog.Level's own UnmarshalText.
 	err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{DecoderConfig: &mapstructure.DecoderConfig{
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(
 			mapstructure.StringToTimeDurationHookFunc(),
 			mapstructure.StringToInt64HookFunc(),
 			mapstructure.StringToBoolHookFunc(),
+			mapstructure.TextUnmarshallerHookFunc(),
 			strictNumbers,
+			levelByName,
 		),
 		ErrorUnused: true,
 		Result:      &cfg,
@@ -147,6 +152,24 @@ func strictNumbers(from, to reflect.Type, data any) (any, error) {
 // isInt64 reports whether f is a whole number that int64 can hold.
 func isInt64(f float64) bool {
 	return f == math.Trunc(f) && f >= -(1<<63) && f < 1<<63
+}
+
+var (
+	levelType    = reflect.TypeFor[slog.Level]()
+	levelPtrType = reflect.TypeFor[*slog.Level]()
+)
+
+// levelByName rejects a log level that is not a name. A name has already
+// been decoded by now: TextUnmarshallerHookFunc runs slog.Level's
+// UnmarshalText, which errors on an unknown one, and hands on a *slog.Level.
+// Any other value is a number or boolean from a config file, which
+// mapstructure would otherwise decode silently: YAML "log-level: 1.9" would
+// become level 1.
+func levelByName(from, to reflect.Type, data any) (any, error) {
+	if to == levelType && from != levelType && from != levelPtrType {
+		return nil, fmt.Errorf("log level %v is not a name (write it like \"warn\")", data)
+	}
+	return data, nil
 }
 
 // parserFor picks the config file's parser from its extension.

@@ -188,6 +188,7 @@ you:
 | `--max-age` | `24h` | Capture artifact age cap; `0` disables it |
 | `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
 | `--stats-interval` | `1m` | How often the `stats` line is logged, plus once at shutdown; `0` disables it |
+| `--log-level` | `info` | Lowest level logged: `debug`, `info`, `warn` or `error`, optionally offset like `warn+2`; `warn` drops the per-connection `connection relayed` lines |
 
 ```yaml
 # sidecar.yaml, used with --config=sidecar.yaml

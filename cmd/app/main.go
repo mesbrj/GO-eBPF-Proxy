@@ -15,12 +15,16 @@ import (
 )
 
 func main() {
-	log := logger.New(os.Stderr)
+	// The level is known only once the configuration loads; until then the
+	// zero LevelVar keeps INFO, so a config error is still logged.
+	var level slog.LevelVar
+	log := logger.New(os.Stderr, logger.WithLevel(&level))
 
 	cfg, err := loadConfig(flag.CommandLine, os.Args[1:], os.Environ())
 	if err != nil {
 		fatal(log, "app: config load failed", err)
 	}
+	level.Set(cfg.LogLevel)
 	if cfg.CgroupPath == "" {
 		fatal(log, "app: --cgroup-path is required", nil)
 	}

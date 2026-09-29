@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -31,7 +32,7 @@ func writeConfig(t *testing.T, name, body string) string {
 	return path
 }
 
-// everySetting has a non-default value for all 12 settings, so a source
+// everySetting has a non-default value for all 13 settings, so a source
 // that drops or mistypes any one of them fails the comparison.
 var everySetting = Config{
 	CgroupPath:       "/sys/fs/cgroup/machine.slice/pod",
@@ -46,6 +47,7 @@ var everySetting = Config{
 	MaxAge:           12 * time.Hour,
 	RetentionTick:    30 * time.Second,
 	StatsInterval:    10 * time.Second,
+	LogLevel:         slog.LevelWarn,
 }
 
 func TestLoadConfig_NoSourcesYieldsDefaults(t *testing.T) {
@@ -73,6 +75,7 @@ max-bytes: 2048
 max-age: 12h
 retention-interval: 30s
 stats-interval: 10s
+log-level: warn
 `
 	for _, tc := range []struct {
 		name string
@@ -94,6 +97,7 @@ max-bytes = 2048
 max-age = "12h"
 retention-interval = "30s"
 stats-interval = "10s"
+log-level = "warn"
 `},
 		{name: "config.json", body: `{
   "cgroup-path": "/sys/fs/cgroup/machine.slice/pod",
@@ -107,7 +111,8 @@ stats-interval = "10s"
   "max-bytes": 2048,
   "max-age": "12h",
   "retention-interval": "30s",
-  "stats-interval": "10s"
+  "stats-interval": "10s",
+  "log-level": "warn"
 }`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,6 +220,7 @@ func TestLoadConfig_AcceptsExistingFlagNamesInBothForms(t *testing.T) {
 				dash + "max-age=12h",
 				dash + "retention-interval=30s",
 				dash + "stats-interval=10s",
+				dash + "log-level=warn",
 			}
 
 			cfg, err := load(t, args, nil)
@@ -410,4 +416,72 @@ func TestLoadConfig_RejectsMalformedFile(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), path)
+}
+
+// A level is a slog level name in every source, in any case and optionally
+// offset; the flag rejects an unknown name at parse time.
+func TestLoadConfig_LogLevelByName(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		environ []string
+		want    slog.Level
+	}{
+		{name: "file", args: []string{"--config", "FILE"}, want: slog.LevelDebug},
+		{name: "env", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL=WARN+2"}, want: slog.LevelWarn + 2},
+		{name: "flag", args: []string{"--log-level=error"}, want: slog.LevelError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if len(tc.args) == 2 && tc.args[1] == "FILE" {
+				tc.args = []string{"--config", writeConfig(t, "config.yaml", "log-level: debug\n")}
+			}
+
+			cfg, err := load(t, tc.args, tc.environ)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.LogLevel)
+		})
+	}
+
+	t.Run("unknown flag value", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := load(t, []string{"--log-level=loud"}, nil)
+
+		assert.ErrorContains(t, err, "log-level")
+	})
+}
+
+// A level must be a slog level name: an unknown or empty name, or a number
+// or boolean in a file, is an error rather than a silently decoded level.
+func TestLoadConfig_RejectsLogLevelThatIsNotAName(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		file    string // YAML body; empty means no config file
+		environ []string
+	}{
+		{name: "unknown name env var", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL=loud"}},
+		{name: "empty env var", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL="}},
+		{name: "unknown name in file", file: "log-level: loud"},
+		{name: "number in file", file: "log-level: 4"},
+		{name: "fractional number in file", file: "log-level: 1.9"},
+		{name: "boolean in file", file: "log-level: true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var args []string
+			if tc.file != "" {
+				args = []string{"--config", writeConfig(t, "config.yaml", tc.file+"\n")}
+			}
+
+			_, err := load(t, args, tc.environ)
+
+			assert.ErrorContains(t, err, "log-level")
+		})
+	}
 }

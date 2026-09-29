@@ -35,6 +35,7 @@ type Config struct {
 	MaxAge           time.Duration `koanf:"max-age"`
 	RetentionTick    time.Duration `koanf:"retention-interval"`
 	StatsInterval    time.Duration `koanf:"stats-interval"`
+	LogLevel         slog.Level    `koanf:"log-level"`
 }
 
 // DefaultConfig returns a Config populated with the sidecar's compiled-in
@@ -51,6 +52,7 @@ func DefaultConfig() Config {
 		MaxAge:           24 * time.Hour,
 		RetentionTick:    5 * time.Minute,
 		StatsInterval:    time.Minute,
+		LogLevel:         slog.LevelInfo,
 	}
 }
 
