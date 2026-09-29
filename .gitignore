@@ -1,9 +1,11 @@
 # Project harness and specs
 AGENTS.md
+.agents
 .github
 .claude
 .mcp.json
 .specs
+skills-lock.json
 docs/technical-design-document.md
 docs/feasibility-study.md
 docs/prd/
