@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
@@ -32,6 +33,15 @@ type SocketServerConfig struct {
 // capture.CheckTarget) so a different app UID can still traverse the dir.
 var ErrWorldAccessibleSocketDir = errors.New("keylog: refusing to listen under a world-writable/readable socket directory")
 
+// At most warnLogBurst of each socket-server WARN (a rejected line, a
+// connection read error) are logged per warnLogInterval: anything able to
+// reach the socket can trigger them at will. The stats line's
+// keylog_lines_rejected still counts every rejected line.
+const (
+	warnLogBurst    = 10
+	warnLogInterval = time.Minute
+)
+
 // SocketServerOption configures optional SocketServer behavior.
 type SocketServerOption func(*SocketServer)
 
@@ -47,6 +57,8 @@ type SocketServer struct {
 	writer     *Writer
 	socketPath string
 	log        *logger.Logger
+	rejectLog  *logger.Logger // log, limited for rejected lines
+	readErrLog *logger.Logger // log, limited for connection read errors
 	rejected   int64
 }
 
@@ -86,6 +98,8 @@ func NewSocketServer(cfg SocketServerConfig, opts ...SocketServerOption) (*Socke
 	for _, o := range opts {
 		o(s)
 	}
+	s.rejectLog = s.log.Limited(warnLogInterval, warnLogBurst)
+	s.readErrLog = s.log.Limited(warnLogInterval, warnLogBurst)
 	return s, nil
 }
 
@@ -138,12 +152,12 @@ func (s *SocketServer) handleConn(conn net.Conn) {
 			// value must happen-after this log write (via the atomic
 			// add/load pair below), never used as a proxy signal that
 			// races ahead of it.
-			s.log.Warn("keylog: socket server rejected a malformed line")
+			s.rejectLog.Warn("keylog: socket server rejected a malformed line")
 			atomic.AddInt64(&s.rejected, 1)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		s.log.Warn("keylog: socket server connection read error", slog.String("error", err.Error()))
+		s.readErrLog.Warn("keylog: socket server connection read error", slog.String("error", err.Error()))
 	}
 }
 

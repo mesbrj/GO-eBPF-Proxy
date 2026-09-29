@@ -131,6 +131,21 @@ func TestNewRelay_LogsUpstreamDialFailure(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "the dial failure to %s must be logged", dst)
 }
 
+// Anything in the pod can connect to the relay port and trigger a miss, so
+// only missLogBurst misses are logged per interval; the counter the stats
+// line reports still sees every one.
+func TestNewResolver_LimitsMissLogButCountsEveryMiss(t *testing.T) {
+	logs := &syncBuffer{}
+	r := newResolver(missEverything, logger.New(logs))
+	for range missLogBurst + 5 {
+		_, err := r.Resolve(netip.MustParseAddr("10.0.0.1"), 40000)
+		require.ErrorIs(t, err, proxy.ErrNotFound)
+	}
+
+	assert.Equal(t, missLogBurst, strings.Count(logs.String(), "no original destination"))
+	assert.Equal(t, uint64(missLogBurst+5), r.Misses())
+}
+
 // The stats line must carry each counter's cumulative value under its own
 // name. Two resolver misses and one rejected keylog line make the two values
 // distinct, so a swapped or dropped field shows.

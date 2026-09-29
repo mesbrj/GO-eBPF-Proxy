@@ -231,13 +231,23 @@ func (a *App) Close() error {
 	return errors.Join(errs...)
 }
 
+// At most missLogBurst resolver misses are logged per missLogInterval:
+// anything in the pod can connect to the relay port and trigger a miss at
+// will. The stats line's origdst_lookup_miss still counts every one.
+const (
+	missLogBurst    = 10
+	missLogInterval = time.Minute
+)
+
 // newResolver builds the fail-closed resolver over the origdst_by_tuple map m,
-// logging every definitive miss with its source tuple: a bug signal (LRU
-// undersizing) or an abuse signal (a direct, un-redirected connect to the
-// relay port). Without it, the connection the relay resets leaves no trace.
+// logging each definitive miss with its source tuple, up to missLogBurst per
+// missLogInterval: a bug signal (LRU undersizing) or an abuse signal (a
+// direct, un-redirected connect to the relay port). Without it, the
+// connection the relay resets leaves no trace.
 func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
+	missLog := log.Limited(missLogInterval, missLogBurst)
 	return proxy.NewResolver(m, proxy.WithOnMiss(func(src netip.AddrPort) {
-		log.Warn("connection reset: no original destination (fail-closed)", slog.String("src", src.String()))
+		missLog.Warn("connection reset: no original destination (fail-closed)", slog.String("src", src.String()))
 	}))
 }
 

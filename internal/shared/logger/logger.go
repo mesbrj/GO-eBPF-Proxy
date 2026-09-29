@@ -47,6 +47,7 @@ const unloggableValue = "***UNLOGGABLE***"
 // slog.LogValuer, which slog resolves into attrs the key match does see.
 type Logger struct {
 	inner *slog.Logger
+	limit *limiter // nil unless built by Limited
 }
 
 // Option configures a Logger built by New.
@@ -182,7 +183,23 @@ func (l *Logger) Error(msg string, attrs ...slog.Attr) {
 }
 
 // log emits one record with attrs under "context", in the order given. slog
-// omits an empty group, so a call without attrs has no "context" field.
+// omits an empty group, so a call without attrs has no "context" field. A
+// record below the level never reaches the limiter, so it is not counted as
+// suppressed.
 func (l *Logger) log(level slog.Level, msg string, attrs []slog.Attr) {
-	l.inner.LogAttrs(context.Background(), level, msg, slog.GroupAttrs("context", attrs...))
+	ctx := context.Background()
+	if !l.inner.Enabled(ctx, level) {
+		return
+	}
+	if l.limit != nil {
+		keep, dropped := l.limit.admit()
+		if !keep {
+			return
+		}
+		if dropped > 0 {
+			// Clip so the append never writes into the caller's array.
+			attrs = append(slices.Clip(attrs), slog.Int64("suppressed", dropped))
+		}
+	}
+	l.inner.LogAttrs(ctx, level, msg, slog.GroupAttrs("context", attrs...))
 }

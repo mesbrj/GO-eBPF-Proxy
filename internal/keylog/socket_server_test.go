@@ -113,6 +113,25 @@ func TestSocketServer_MalformedLine_RejectedWithoutAppendOrContentLog(t *testing
 	assert.NotContains(t, logBuf.String(), sentinel, "the rejected line's content must never appear in logs")
 }
 
+// Anything able to reach the socket can send malformed lines, so only
+// warnLogBurst rejections are logged per interval; RejectedCount, which the
+// stats line reports, still counts every one.
+func TestSocketServer_MalformedLines_LogLimitedButAllCounted(t *testing.T) {
+	var logBuf bytes.Buffer
+	s, sockPath, _ := newTestSocketServer(t, WithLogger(logger.New(&logBuf)))
+
+	conn, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	const sent = warnLogBurst + 5
+	_, err = conn.Write([]byte(strings.Repeat("not an NSS keylog line\n", sent)))
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.Eventually(t, func() bool { return s.RejectedCount() == sent },
+		2*time.Second, 5*time.Millisecond, "every malformed line must be counted")
+	assert.Equal(t, warnLogBurst, strings.Count(logBuf.String(), "rejected a malformed line"))
+}
+
 // UT-02.5 edge case: a connection that closes mid-line (no trailing newline)
 // must not corrupt the keylog -- the partial data is rejected as malformed,
 // never appended, and does not affect a prior well-formed line.
