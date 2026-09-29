@@ -20,20 +20,21 @@ import (
 
 // Config configures one run of the sidecar: eBPF redirect + relay, the
 // LD_PRELOAD-interposer keylog socket server, and capture with bounded,
-// ephemeral-by-default retention.
+// ephemeral-by-default retention. Each koanf tag is the setting's key in
+// every configuration source (see loadConfig).
 type Config struct {
-	CgroupPath       string
-	RelayListen      string
-	PinDir           string
-	KeylogSocketPath string
-	KeylogPath       string
-	CaptureIface     string
-	CapturePath      string
-	Retain           bool
-	MaxBytes         int64
-	MaxAge           time.Duration
-	RetentionTick    time.Duration
-	StatsInterval    time.Duration
+	CgroupPath       string        `koanf:"cgroup-path"`
+	RelayListen      string        `koanf:"relay-listen"`
+	PinDir           string        `koanf:"pin-dir"`
+	KeylogSocketPath string        `koanf:"keylog-socket"`
+	KeylogPath       string        `koanf:"keylog-path"`
+	CaptureIface     string        `koanf:"capture-iface"`
+	CapturePath      string        `koanf:"capture-path"`
+	Retain           bool          `koanf:"retain"`
+	MaxBytes         int64         `koanf:"max-bytes"`
+	MaxAge           time.Duration `koanf:"max-age"`
+	RetentionTick    time.Duration `koanf:"retention-interval"`
+	StatsInterval    time.Duration `koanf:"stats-interval"`
 }
 
 // DefaultConfig returns a Config populated with the sidecar's compiled-in
@@ -269,7 +270,7 @@ func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
 // readKeylogLines reads the keylog file's non-empty lines for embedding as a
 // pcapng Decryption Secrets Block.
 func readKeylogLines(path string) ([]string, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- operator-supplied config path, not raw user input
+	data, err := os.ReadFile(path) // #nosec G304 G703 -- operator-supplied config path (flag, env var or config file), not raw user input
 	if err != nil {
 		return nil, err
 	}
