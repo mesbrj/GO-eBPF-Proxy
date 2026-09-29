@@ -251,16 +251,17 @@ func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
 	}))
 }
 
-// newRelay builds the relay over resolver, logging every relayed connection's
-// original destination and every upstream dial failure -- the relay closes
-// the client either way, so the log is the only trace of the failure.
+// newRelay builds the relay over resolver, logging each resolved connection
+// once with its original destination: at INFO once the upstream dial
+// succeeds, or at WARN with the error when it fails -- the relay closes the
+// client then, so the log is the only trace of the failure.
 func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
 	return proxy.NewRelay(resolver,
-		proxy.WithOnResolved(func(dst netip.AddrPort) {
+		proxy.WithOnRelayed(func(dst netip.AddrPort) {
 			log.Info("connection relayed", slog.String("orig_dst", dst.String()))
 		}),
-		proxy.WithOnDialErr(func(err error) {
-			log.Warn("upstream dial failed", slog.String("error", err.Error()))
+		proxy.WithOnDialErr(func(dst netip.AddrPort, err error) {
+			log.Warn("upstream dial failed", slog.String("orig_dst", dst.String()), slog.String("error", err.Error()))
 		}),
 	)
 }

@@ -14,8 +14,8 @@ import (
 type Relay struct {
 	resolver    *Resolver
 	dialTimeout time.Duration
-	onDialErr   func(error)
-	onResolved  func(dst netip.AddrPort)
+	onDialErr   func(dst netip.AddrPort, err error)
+	onRelayed   func(dst netip.AddrPort)
 }
 
 // RelayOption configures a Relay.
@@ -26,16 +26,18 @@ func WithDialTimeout(d time.Duration) RelayOption {
 	return func(r *Relay) { r.dialTimeout = d }
 }
 
-// WithOnDialErr registers a callback for upstream dial failures.
-func WithOnDialErr(fn func(error)) RelayOption {
+// WithOnDialErr registers a callback for upstream dial failures, invoked
+// with the resolved original destination the relay could not reach.
+func WithOnDialErr(fn func(dst netip.AddrPort, err error)) RelayOption {
 	return func(r *Relay) { r.onDialErr = fn }
 }
 
-// WithOnResolved registers a callback invoked with the original destination
-// on every successful resolve, before dialing -- the hook operators use to
-// log the correct original destination per connection.
-func WithOnResolved(fn func(dst netip.AddrPort)) RelayOption {
-	return func(r *Relay) { r.onResolved = fn }
+// WithOnRelayed registers a callback invoked with the original destination
+// once the upstream dial succeeds, as the relay starts piping -- the hook
+// operators use to log the correct original destination per connection. A
+// resolved connection triggers exactly one of onRelayed and onDialErr.
+func WithOnRelayed(fn func(dst netip.AddrPort)) RelayOption {
+	return func(r *Relay) { r.onRelayed = fn }
 }
 
 // NewRelay builds a Relay backed by the given resolver.
@@ -79,17 +81,16 @@ func (rl *Relay) handle(client net.Conn) {
 		rl.reset(client) // fail-closed: never forward to a default
 		return
 	}
-	if rl.onResolved != nil {
-		rl.onResolved(dst)
-	}
-
 	upstream, err := net.DialTimeout("tcp", dst.String(), rl.dialTimeout)
 	if err != nil {
 		if rl.onDialErr != nil {
-			rl.onDialErr(err)
+			rl.onDialErr(dst, err)
 		}
 		_ = client.Close()
 		return
+	}
+	if rl.onRelayed != nil {
+		rl.onRelayed(dst)
 	}
 	splice(client, upstream)
 }

@@ -125,10 +125,12 @@ func TestNewRelay_LogsUpstreamDialFailure(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	_, _ = io.ReadAll(conn)
 
+	want := `"orig_dst":"` + dst.String() + `"`
 	assert.Eventually(t, func() bool {
 		out := logs.String()
-		return strings.Contains(out, "upstream dial failed") && strings.Contains(out, dst.String())
-	}, 2*time.Second, 10*time.Millisecond, "the dial failure to %s must be logged", dst)
+		return strings.Contains(out, "upstream dial failed") && strings.Contains(out, want)
+	}, 2*time.Second, 10*time.Millisecond, "the dial failure must be logged with %s", want)
+	assert.NotContains(t, logs.String(), "connection relayed", "a connection whose dial failed was never relayed")
 }
 
 // Anything in the pod can connect to the relay port and trigger a miss, so

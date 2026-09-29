@@ -46,8 +46,9 @@ func serveRelay(t *testing.T, r *Resolver) *net.TCPAddr {
 	return ln.Addr().(*net.TCPAddr)
 }
 
-// CAPTURE-11 (feature-03 AC): a successful resolve invokes onResolved with the
-// original destination, before dialing -- the hook operators use to log it.
+// CAPTURE-11 (feature-03 AC): a relayed connection invokes onRelayed with the
+// original destination once the upstream dial succeeds -- the hook operators
+// use to log it.
 func TestRelay_LogsResolvedOriginalDestination(t *testing.T) {
 	up := startEcho(t)
 	od, err := ebpfpkg.OrigDst(netip.MustParseAddr("127.0.0.1"), uint16(up.Port)) // #nosec G115 -- TCPAddr.Port is always 0-65535
@@ -61,7 +62,7 @@ func TestRelay_LogsResolvedOriginalDestination(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
-	relay := NewRelay(r, WithDialTimeout(2*time.Second), WithOnResolved(func(dst netip.AddrPort) {
+	relay := NewRelay(r, WithDialTimeout(2*time.Second), WithOnRelayed(func(dst netip.AddrPort) {
 		mu.Lock()
 		got = dst
 		mu.Unlock()
@@ -76,7 +77,7 @@ func TestRelay_LogsResolvedOriginalDestination(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		return got == want
-	}, 2*time.Second, 10*time.Millisecond, "onResolved must be called with the exact resolved original destination")
+	}, 2*time.Second, 10*time.Millisecond, "onRelayed must be called with the exact resolved original destination")
 }
 
 // IT-01.9: the relay resolves the original destination and raw-pipes bytes intact.
