@@ -4,6 +4,7 @@ package podman
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -51,6 +52,19 @@ func runSmoke(t *testing.T, podName string) string {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "smoke.sh: %s", out)
 	return string(out)
+}
+
+// volumeExists reports whether the named podman volume exists: podman volume
+// exists exits 0 if it does and 1 if it does not.
+func volumeExists(t *testing.T, name string) bool {
+	t.Helper()
+	err := exec.Command("podman", "volume", "exists", name).Run() // #nosec G204 -- name is a test-generated volume name, not external input
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false
+	}
+	require.NoError(t, err, "podman volume exists %s", name)
+	return true
 }
 
 // volumeCapturePath resolves the host-visible path to the named log volume's
@@ -208,7 +222,8 @@ func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 }
 
 // IT-03.9: default teardown wipes /var/log/sidecar (the keylog tmpfs and the
-// named log volume); --retain preserves the volume's artifacts.
+// named log volume); --retain preserves the volume's artifacts. Either way the
+// keylog socket volume, which holds no artifact, is removed.
 func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
@@ -221,6 +236,7 @@ func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	require.NoError(t, downDefault.Run())
 	_, err := os.Stat(capturePathDefault)
 	assert.True(t, os.IsNotExist(err), "default teardown must wipe /var/log/sidecar")
+	assert.False(t, volumeExists(t, podNameDefault+"-keylog-sock"), "default teardown must remove the keylog socket volume")
 
 	podNameRetain := "go-ebpf-proxy-it9b"
 	podUpNoCleanup(t, podNameRetain, bin, "RETAIN=1")
@@ -230,6 +246,7 @@ func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	require.NoError(t, downRetain.Run())
 	_, err = os.Stat(capturePathRetain)
 	assert.NoError(t, err, "--retain must preserve /var/log/sidecar")
+	assert.False(t, volumeExists(t, podNameRetain+"-keylog-sock"), "--retain must still remove the keylog socket volume")
 
 	t.Cleanup(func() {
 		_ = exec.Command("podman", "volume", "rm", "-f", podNameRetain+"-sidecar-logs").Run()
