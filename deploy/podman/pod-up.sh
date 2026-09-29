@@ -60,8 +60,13 @@ if [[ ! -x "$SIDECAR_BIN" ]]; then
 fi
 
 # Build the LD_PRELOAD interposer fresh so the pod always tests the current
-# tree, not a stale .so (mirrors the sidecar binary precondition above).
-make -C "$REPO_ROOT" build-preload
+# tree, not a stale .so (mirrors the sidecar binary precondition above). The
+# build runs as the owner of preload/, not as root: building as root would
+# leave a root-owned .so in the owner's working tree, and the compiler needs
+# no privileges. Numeric IDs, so an owner with no passwd entry here works too.
+read -r PRELOAD_UID PRELOAD_GID < <(stat -c '%u %g' "$REPO_ROOT/preload")
+setpriv --reuid="$PRELOAD_UID" --regid="$PRELOAD_GID" --clear-groups \
+  make -C "$REPO_ROOT" build-preload
 
 if [[ ! -f "$PRELOAD_SO" ]]; then
   echo "pod-up: interposer not found at $PRELOAD_SO (build-preload failed?)" >&2
