@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -181,10 +182,10 @@ func (a *App) logStatsPeriodically(stop <-chan struct{}) {
 // (malformed lines the keylog socket refused). Both are cumulative since
 // start, so a log consumer derives rates from consecutive lines.
 func (a *App) logStats() {
-	a.log.Info("stats", map[string]any{
-		"origdst_lookup_miss":   a.resolver.Misses(),
-		"keylog_lines_rejected": a.keylogSrv.RejectedCount(),
-	})
+	a.log.Info("stats",
+		slog.Uint64("origdst_lookup_miss", a.resolver.Misses()),
+		slog.Int64("keylog_lines_rejected", a.keylogSrv.RejectedCount()),
+	)
 }
 
 // Close embeds the final keylog into the capture as a DSB, stops every
@@ -236,7 +237,7 @@ func (a *App) Close() error {
 // relay port). Without it, the connection the relay resets leaves no trace.
 func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
 	return proxy.NewResolver(m, proxy.WithOnMiss(func(src netip.AddrPort) {
-		log.Warn("connection reset: no original destination (fail-closed)", map[string]any{"src": src.String()})
+		log.Warn("connection reset: no original destination (fail-closed)", slog.String("src", src.String()))
 	}))
 }
 
@@ -246,10 +247,10 @@ func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
 func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
 	return proxy.NewRelay(resolver,
 		proxy.WithOnResolved(func(dst netip.AddrPort) {
-			log.Info("connection relayed", map[string]any{"orig_dst": dst.String()})
+			log.Info("connection relayed", slog.String("orig_dst", dst.String()))
 		}),
 		proxy.WithOnDialErr(func(err error) {
-			log.Warn("upstream dial failed", map[string]any{"error": err.Error()})
+			log.Warn("upstream dial failed", slog.String("error", err.Error()))
 		}),
 	)
 }

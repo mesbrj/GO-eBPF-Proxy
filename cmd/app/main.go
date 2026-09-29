@@ -6,6 +6,7 @@ package main
 
 import (
 	"flag"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,10 +54,10 @@ func main() {
 // sidecar's JSON logger rather than the standard library's plain-text log so
 // that a log pipeline parsing the sidecar's output also sees why it exited.
 func fatal(log *logger.Logger, msg string, err error) {
-	var ctx map[string]any
+	var attrs []slog.Attr
 	if err != nil {
-		ctx = map[string]any{"error": err.Error()}
+		attrs = append(attrs, slog.String("error", err.Error()))
 	}
-	log.Error(msg, ctx)
+	log.Error(msg, attrs...)
 	os.Exit(1)
 }

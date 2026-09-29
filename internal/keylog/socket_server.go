@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -137,12 +138,12 @@ func (s *SocketServer) handleConn(conn net.Conn) {
 			// value must happen-after this log write (via the atomic
 			// add/load pair below), never used as a proxy signal that
 			// races ahead of it.
-			s.log.Warn("keylog: socket server rejected a malformed line", nil)
+			s.log.Warn("keylog: socket server rejected a malformed line")
 			atomic.AddInt64(&s.rejected, 1)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		s.log.Warn("keylog: socket server connection read error", map[string]any{"error": err.Error()})
+		s.log.Warn("keylog: socket server connection read error", slog.String("error", err.Error()))
 	}
 }
 
