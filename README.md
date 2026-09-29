@@ -153,6 +153,51 @@ sudo deploy/podman/pod-down.sh
 `POD_NAME`, `APP_IMAGE`, `CAPTURE_IFACE` and friends are all overridable env vars on
 `pod-up.sh` (see the script header); the smoke test targets `URL=${URL:-https://example.com}`.
 
+## Configuration
+
+`go-ebpf-proxy` has no user interface: no TUI, no web UI and no interactive mode. Its
+configuration, read once at startup, sets everything it does. At runtime it reports only
+through its structured JSON log (including a periodic `stats` line) and through the capture
+and keylog files. To change a setting, restart the sidecar with the new configuration.
+
+Each setting can come from four places. Later ones override earlier ones:
+
+1. its built-in default;
+2. a config file named by `--config` (`.yaml`/`.yml`, `.toml` or `.json`);
+3. an environment variable: `GOEBPF_SIDECAR_` plus the flag name in upper case with `-` turned
+   into `_`, for example `GOEBPF_SIDECAR_MAX_AGE=12h`;
+4. its command-line flag.
+
+The config-file key is the flag name without its leading dashes (`max-age: 12h`). An unknown setting in
+the file or in a `GOEBPF_SIDECAR_*` variable stops the sidecar at startup with an error naming
+it, and so does a key with no value or a value of the wrong type, such as an empty `max-bytes`
+or a duration without a unit (`max-age: 3600`). A typo never falls back silently to a default. `pod-up.sh` passes the flags it needs for
+you:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--cgroup-path` | none (required) | Pod common-parent cgroup v2 path the eBPF programs attach to |
+| `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on |
+| `--pin-dir` | `/sys/fs/bpf/go-ebpf-proxy` | bpffs directory for the pinned maps |
+| `--keylog-socket` | `/var/run/sidecar/keylog.sock` | Unix socket the `LD_PRELOAD` interposer connects to |
+| `--keylog-path` | `/var/log/sidecar/sslkeylog.log` | NSS keylog file (keep it on tmpfs) |
+| `--capture-iface` | `eth0` | Interface to capture the outbound leg from |
+| `--capture-path` | `/var/log/sidecar/dump.pcapng` | DSB-embedded pcapng capture file |
+| `--retain` | `false` | Keep the capture and keylog on teardown instead of wiping them |
+| `--max-bytes` | `104857600` (100 MiB) | Capture directory size cap; `0` disables it |
+| `--max-age` | `24h` | Capture artifact age cap; `0` disables it |
+| `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
+| `--stats-interval` | `1m` | How often the `stats` line is logged, plus once at shutdown; `0` disables it |
+
+```yaml
+# sidecar.yaml, used with --config=sidecar.yaml
+cgroup-path: /sys/fs/cgroup/machine.slice/machine-libpod_pod_abc.slice
+max-age: 12h
+retain: false
+```
+
+Configuration is loaded with [koanf](https://github.com/knadh/koanf).
+
 ## Build & test
 
 ```bash
@@ -183,13 +228,16 @@ internal/capture/ live AF_PACKET capture, pcapng writer + embedded DSB, retentio
 internal/capture/capturetest/ tshark offline-decryption check (test support only)
 preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new, ships keylog lines
 internal/shared/ structured logging, shared infra
-cmd/app/         sidecar entrypoint (wires loader, relay, keylog socket server, capture)
+cmd/app/         sidecar entrypoint (loads configuration; wires loader, relay, keylog socket server, capture)
 deploy/podman/   rootful Podman dev environment (pod scripts)
 ```
 
 ## Out of scope (MVP)
 
-`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band: DPI, IPFIX export; the TUI; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
+`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band: DPI, IPFIX export; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
+
+A user interface is not deferred: the project has none and will not add one (see
+[Configuration](#configuration)).
 
 ## Project Documentation
 
