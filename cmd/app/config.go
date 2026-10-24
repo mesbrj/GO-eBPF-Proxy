@@ -44,7 +44,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.String("relay-listen", d.RelayListen, "address the pass-through relay listens on")
 	fs.String("pin-dir", d.PinDir, "bpffs directory for the connect4/sockops pinned maps")
 	fs.String("keylog-socket", d.KeylogSocketPath, "unix domain socket the LD_PRELOAD keylog interposer connects to")
-	fs.String("keylog-path", d.KeylogPath, "path to the NSS keylog file (should be on tmpfs)")
+	fs.String("keylog-path", d.KeylogPath, "path to the NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start")
 	fs.String("capture-iface", d.CaptureIface, "interface to capture the outbound leg from")
 	fs.String("capture-path", d.CapturePath, "path to the DSB-embedded pcapng capture file")
 	fs.Bool("retain", d.Retain, "keep capture/keylog artifacts on teardown instead of wiping them")

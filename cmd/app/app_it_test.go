@@ -47,7 +47,8 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	cfg.PinDir = pinDir
 	cfg.KeylogSocketPath = filepath.Join(dir, "sock", "keylog.sock")
 	cfg.RelayListen = "127.0.0.1:0"
-	cfg.KeylogPath = filepath.Join(dir, "sslkeylog.log")
+	// The keylog must be on tmpfs (AD-023), which t.TempDir() need not be.
+	cfg.KeylogPath = filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
 	cfg.CaptureIface = "lo"
 	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
 	cfg.RetentionTick = 0 // deterministic test: no background ticker
@@ -90,7 +91,8 @@ func TestApp_CloseWithRetainPreservesArtifacts(t *testing.T) {
 	cfg.PinDir = pinDir
 	cfg.KeylogSocketPath = filepath.Join(dir, "sock", "keylog.sock")
 	cfg.RelayListen = "127.0.0.1:0"
-	cfg.KeylogPath = filepath.Join(dir, "sslkeylog.log")
+	// The keylog must be on tmpfs (AD-023), which t.TempDir() need not be.
+	cfg.KeylogPath = filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
 	cfg.CaptureIface = "lo"
 	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
 	cfg.RetentionTick = 0

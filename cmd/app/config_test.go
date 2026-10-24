@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ var everySetting = Config{
 	RelayListen:      "127.0.0.1:16001",
 	PinDir:           "/sys/fs/bpf/other",
 	KeylogSocketPath: "/run/keylog/keylog.sock",
-	KeylogPath:       "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log",
+	KeylogPath:       "/run/sidecar-keylog/sslkeylog.log",
 	CaptureIface:     "veth0",
 	CapturePath:      "/var/log/sidecar/other.pcapng",
 	Retain:           true,
@@ -48,6 +49,29 @@ var everySetting = Config{
 	RetentionTick:    30 * time.Second,
 	StatsInterval:    10 * time.Second,
 	LogLevel:         slog.LevelWarn,
+}
+
+// C54: everySetting is only a useful fixture while each of its fields
+// differs from the default: a source that dropped a setting equal to its
+// default would still compare equal and pass. (The keylog-path default moved
+// to the harness tmpfs path, which everySetting used to hold.)
+func TestEverySetting_DiffersFromTheDefaultInEveryField(t *testing.T) {
+	t.Parallel()
+
+	got, def := reflect.ValueOf(everySetting), reflect.ValueOf(DefaultConfig())
+	for i := range got.NumField() {
+		name := got.Type().Field(i).Name
+		assert.NotEqual(t, def.Field(i).Interface(), got.Field(i).Interface(),
+			"everySetting.%s equals its default, so a source that drops it goes unnoticed", name)
+	}
+}
+
+// C53 (AC 36, door 5): the default keylog path is the harness's tmpfs mount,
+// never the disk-backed capture directory.
+func TestDefaultConfig_KeylogPathIsTheHarnessTmpfs(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log", DefaultConfig().KeylogPath)
 }
 
 func TestLoadConfig_NoSourcesYieldsDefaults(t *testing.T) {
@@ -67,7 +91,7 @@ cgroup-path: /sys/fs/cgroup/machine.slice/pod
 relay-listen: 127.0.0.1:16001
 pin-dir: /sys/fs/bpf/other
 keylog-socket: /run/keylog/keylog.sock
-keylog-path: /var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log
+keylog-path: /run/sidecar-keylog/sslkeylog.log
 capture-iface: veth0
 capture-path: /var/log/sidecar/other.pcapng
 retain: true
@@ -89,7 +113,7 @@ cgroup-path = "/sys/fs/cgroup/machine.slice/pod"
 relay-listen = "127.0.0.1:16001"
 pin-dir = "/sys/fs/bpf/other"
 keylog-socket = "/run/keylog/keylog.sock"
-keylog-path = "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log"
+keylog-path = "/run/sidecar-keylog/sslkeylog.log"
 capture-iface = "veth0"
 capture-path = "/var/log/sidecar/other.pcapng"
 retain = true
@@ -104,7 +128,7 @@ log-level = "warn"
   "relay-listen": "127.0.0.1:16001",
   "pin-dir": "/sys/fs/bpf/other",
   "keylog-socket": "/run/keylog/keylog.sock",
-  "keylog-path": "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log",
+  "keylog-path": "/run/sidecar-keylog/sslkeylog.log",
   "capture-iface": "veth0",
   "capture-path": "/var/log/sidecar/other.pcapng",
   "retain": true,

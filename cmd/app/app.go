@@ -43,7 +43,7 @@ func DefaultConfig() Config {
 		RelayListen:      "127.0.0.1:15001",
 		PinDir:           ebpf.DefaultConfig().PinDir,
 		KeylogSocketPath: "/var/run/sidecar/keylog.sock",
-		KeylogPath:       "/var/log/sidecar/sslkeylog.log",
+		KeylogPath:       "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log",
 		CaptureIface:     "eth0",
 		CapturePath:      "/var/log/sidecar/dump.pcapng",
 		MaxBytes:         100 * 1024 * 1024,
@@ -70,11 +70,17 @@ type App struct {
 	stopTick  chan struct{}
 }
 
-// Start loads and attaches the eBPF programs, starts the relay, starts the
-// keylog socket server, and starts capture, with every subsystem logging
-// through log. On any failure it tears down whatever was already started
-// before returning the error (never leaks a partial run).
+// Start refuses a keylog directory that is not on tmpfs, then loads and
+// attaches the eBPF programs, starts the relay, starts the keylog socket
+// server, and starts capture, with every subsystem logging through log. On
+// any failure it tears down whatever was already started before returning
+// the error (never leaks a partial run).
 func Start(cfg Config, log *logger.Logger) (*App, error) {
+	// First, before anything is loaded or created: a refused keylog leaves
+	// nothing to tear down (AD-023).
+	if err := checkKeylogTmpfs(cfg.KeylogPath); err != nil {
+		return nil, err
+	}
 	a := &App{cfg: cfg, log: log}
 
 	loader, err := ebpf.Load(ebpf.Config{
