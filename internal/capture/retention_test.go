@@ -197,6 +197,71 @@ func TestRetention_OwnedBytesCountsOnlyFinishedOwnedCaptures(t *testing.T) {
 	assert.Equal(t, int64(700), room, "the room is --max-bytes less the owned bytes")
 }
 
+// C68 (door 2, AC 17, AC 19): an owned capture lies directly in the capture
+// directory. Files with owned names in a subdirectory are neither aged out
+// nor counted, however old.
+func TestRetention_IgnoresOwnedNamesInsideSubdirectories(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	sub := filepath.Join(dir, "sub")
+	require.NoError(t, os.Mkdir(sub, 0o700))
+	nested := map[string]int{
+		filepath.Join(sub, "dump-1.pcapng"):   500,
+		filepath.Join(sub, "dump-2-1.pcapng"): 700,
+	}
+	for path, size := range nested {
+		writeFileAt(t, path, size, old)
+	}
+	expired := filepath.Join(dir, "dump-1600000000.pcapng")
+	writeFileAt(t, expired, 200, old)
+	writeFileAt(t, filepath.Join(dir, "dump-1700000000.pcapng"), 100, now)
+
+	r := Retention{Template: filepath.Join(dir, "dump.pcapng"), MaxAge: 24 * time.Hour, Clock: newManualClock(now)}
+	owned, err := r.OwnedBytes()
+	require.NoError(t, err)
+	assert.Equal(t, int64(300), owned, "only the owned captures directly in the directory count, not the 1,200 B under sub")
+
+	require.NoError(t, r.Enforce())
+	assert.NoFileExists(t, expired, "a 48h-old owned capture directly in the directory is past --max-age")
+	for path := range nested {
+		assert.FileExists(t, path, "an owned name inside a subdirectory is not an owned capture")
+	}
+}
+
+// C69 (door 2): the template's stem and extension match literally, never as
+// a regular expression. A name that differs from an owned one only where the
+// template has a '.' is not an owned capture: it is neither counted nor aged
+// out. The owned name beside it is both.
+func TestRetention_TemplateMetacharactersMatchLiterally(t *testing.T) {
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+
+	for _, tc := range []struct {
+		name     string
+		template string
+		decoy    string // differs from an owned name only at a metacharacter
+		control  string // an owned name, the positive control
+	}{
+		{name: "extension", template: "dump.pcapng", decoy: "dump-1Xpcapng", control: "dump-1.pcapng"},
+		{name: "stem", template: "a.b.pcapng", decoy: "aXb-1.pcapng", control: "a.b-1.pcapng"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFileAt(t, filepath.Join(dir, tc.decoy), 1000, old)
+			writeFileAt(t, filepath.Join(dir, tc.control), 100, old)
+			r := Retention{Template: filepath.Join(dir, tc.template), MaxAge: 24 * time.Hour, Clock: newManualClock(now)}
+
+			owned, err := r.OwnedBytes()
+			require.NoError(t, err)
+			assert.Equal(t, int64(100), owned, "%s is not an owned capture of %s", tc.decoy, tc.template)
+
+			require.NoError(t, r.Enforce())
+			assert.Equal(t, []string{tc.decoy}, dirNames(t, dir), "the age pass deletes %s and keeps %s", tc.control, tc.decoy)
+		})
+	}
+}
+
 // C29 (AC 20, AC 45): teardown deletes this run's capture and nothing else,
 // and with Retain it deletes nothing, leaving the capture byte for byte.
 func TestRetention_CleanupDeletesOnlyThisRunsCapture(t *testing.T) {
