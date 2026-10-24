@@ -71,10 +71,12 @@ type App struct {
 }
 
 // Start refuses a keylog directory that is not on tmpfs, then loads and
-// attaches the eBPF programs, starts the relay, starts the keylog socket
-// server, and starts capture, with every subsystem logging through log. On
-// any failure it tears down whatever was already started before returning
-// the error (never leaks a partial run).
+// attaches the eBPF programs, starts the relay, creates this run's capture
+// file when --max-bytes leaves room for one, starts the keylog socket server,
+// and starts capture, with every subsystem logging through log. A run with no
+// room for a capture starts everything else (AC 12). On any failure it tears
+// down whatever was already started before returning the error (never leaks
+// a partial run).
 func Start(cfg Config, log *logger.Logger) (*App, error) {
 	// First, before anything is loaded or created: a refused keylog leaves
 	// nothing to tear down (AD-023).
@@ -108,29 +110,21 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	relay := newRelay(a.resolver, log)
 	go func() { _ = relay.Serve(ln) }()
 
-	captureDir := filepath.Dir(cfg.CapturePath)
-	if err := capture.CheckTarget(captureDir); err != nil {
+	// The capture writer exists before the keylog socket server, so the
+	// server can stream every line it accepts into the capture (AD-018).
+	if err := a.openCapture(); err != nil {
 		_ = a.Close()
 		return nil, err
 	}
-	a.retention = capture.Retention{Template: cfg.CapturePath, MaxBytes: cfg.MaxBytes, MaxAge: cfg.MaxAge, Retain: cfg.Retain}
-
-	// The capture writer exists before the keylog socket server, so the
-	// server can stream every line it accepts into the capture (AD-018).
-	capW, err := capture.CreateRunCapture(cfg.CapturePath, capture.Options{})
-	if err != nil {
-		_ = a.Close()
-		return nil, fmt.Errorf("app: open capture writer: %w", err)
+	var sink func(line string)
+	if a.capW != nil {
+		sink = a.capW.AddSecret
 	}
-	a.capW = capW
-	// Set as soon as the file exists, so a failure later in Start still
-	// deletes it, unless Retain is set.
-	a.retention.Run = capW.Path()
 
 	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
 		SocketPath: cfg.KeylogSocketPath,
 		KeylogPath: cfg.KeylogPath,
-		Sink:       capW.AddSecret,
+		Sink:       sink,
 	}, keylog.WithLogger(log))
 	if err != nil {
 		_ = a.Close()
@@ -139,12 +133,14 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	a.keylogSrv = keylogSrv
 	go func() { _ = keylogSrv.Run() }()
 
-	live, err := capture.StartLive(cfg.CaptureIface, capW)
-	if err != nil {
-		_ = a.Close()
-		return nil, fmt.Errorf("app: start capture: %w", err)
+	if a.capW != nil {
+		live, err := capture.StartLive(cfg.CaptureIface, a.capW)
+		if err != nil {
+			_ = a.Close()
+			return nil, fmt.Errorf("app: start capture: %w", err)
+		}
+		a.live = live
 	}
-	a.live = live
 
 	a.stopTick = make(chan struct{})
 	if cfg.RetentionTick > 0 {
@@ -157,6 +153,66 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	return a, nil
 }
 
+// openCapture applies --max-age and --max-bytes to the capture directory
+// and, when there is room, creates this run's capture file (AD-020, AD-021).
+// One age pass runs first, so captures past --max-age free their room before
+// the size check (AC 13). When the finished captures leave no room for even a
+// new file's header, it creates no file and logs why at ERROR: capture is
+// then not started, and Start goes on without it (AC 11, AC 12).
+func (a *App) openCapture() error {
+	captureDir := filepath.Dir(a.cfg.CapturePath)
+	if err := capture.CheckTarget(captureDir); err != nil {
+		return err
+	}
+	a.retention = capture.Retention{Template: a.cfg.CapturePath, MaxBytes: a.cfg.MaxBytes, MaxAge: a.cfg.MaxAge, Retain: a.cfg.Retain}
+	_ = a.retention.Enforce() // as on every retention tick, a capture that cannot be deleted keeps its share of the room
+	room, err := a.retention.Room()
+	if err != nil {
+		return fmt.Errorf("app: size the capture's room: %w", err)
+	}
+	opts := capture.Options{Room: room, OnStop: a.logCaptureStop}
+	if a.cfg.MaxBytes > 0 && room < capture.HeaderSize(opts) {
+		a.log.Error("capture not started: --max-bytes already reached",
+			slog.String("dir", captureDir),
+			slog.Int64("owned_bytes", a.cfg.MaxBytes-room),
+			slog.Int64("max_bytes", a.cfg.MaxBytes),
+		)
+		return nil
+	}
+
+	capW, err := capture.CreateRunCapture(a.cfg.CapturePath, opts)
+	if err != nil {
+		return fmt.Errorf("app: open capture writer: %w", err)
+	}
+	a.capW = capW
+	// Set as soon as the file exists, so a failure later in Start still
+	// deletes it, unless Retain is set.
+	a.retention.Run = capW.Path()
+	a.log.Info("capture started", slog.String("path", capW.Path()))
+	return nil
+}
+
+// logCaptureStop logs the one WARN line of a capture stopped at --max-bytes
+// (AC 4). owned_bytes is what the finished captures took of --max-bytes, plus
+// this run's capture.
+func (a *App) logCaptureStop(s capture.Stop) {
+	a.log.Warn("capture stopped: --max-bytes reached",
+		slog.String("path", s.Path),
+		slog.Int64("capture_bytes", s.Bytes),
+		slog.Int64("owned_bytes", a.cfg.MaxBytes-s.Room+s.Bytes),
+		slog.Int64("max_bytes", a.cfg.MaxBytes),
+	)
+}
+
+// captureState reports where this run's capture stands (door 4): not started
+// when Start found --max-bytes already reached, otherwise its Writer's state.
+func (a *App) captureState() capture.State {
+	if a.capW == nil {
+		return capture.StateNotStartedMaxBytes
+	}
+	return a.capW.State()
+}
+
 // enforceRetentionPeriodically bounds the capture directory's footprint
 // while the sidecar runs, not just at teardown (spec: retention is never
 // unbounded). It returns once stop is closed; stop is passed in rather than
@@ -167,10 +223,23 @@ func (a *App) enforceRetentionPeriodically(stop <-chan struct{}) {
 	for {
 		select {
 		case <-t.C:
-			_ = a.retention.Enforce()
+			a.enforceRetention()
 		case <-stop:
 			return
 		}
+	}
+}
+
+// enforceRetention runs one age pass, then hands an active capture the room
+// that pass freed (AC 8). A stopped capture ignores it and stays stopped
+// (AC 9).
+func (a *App) enforceRetention() {
+	_ = a.retention.Enforce()
+	if a.capW == nil {
+		return
+	}
+	if room, err := a.retention.Room(); err == nil {
+		a.capW.SetRoom(room)
 	}
 }
 
@@ -191,12 +260,14 @@ func (a *App) logStatsPeriodically(stop <-chan struct{}) {
 
 // logStats reports the sidecar's counters as one "stats" log line:
 // origdst_lookup_miss (fail-closed resolver misses) and keylog_lines_rejected
-// (malformed lines the keylog socket refused). Both are cumulative since
-// start, so a log consumer derives rates from consecutive lines.
+// (malformed lines the keylog socket refused), both cumulative since start,
+// so a log consumer derives rates from consecutive lines, plus capture_state,
+// where capture stands (door 4).
 func (a *App) logStats() {
 	a.log.Info("stats",
 		slog.Uint64("origdst_lookup_miss", a.resolver.Misses()),
 		slog.Int64("keylog_lines_rejected", a.keylogSrv.RejectedCount()),
+		slog.String("capture_state", a.captureState().String()),
 	)
 }
 

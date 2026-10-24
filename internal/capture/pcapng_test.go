@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -656,6 +658,210 @@ func TestWriter_Close_WithoutKeylogWritesNoSecretsBlock(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeEPB}, pcapngBlockTypes(t, path))
+}
+
+// The fixed sizes the room tests count in: an Ethernet capture's header (its
+// SHB and IDB), and the Enhanced Packet Block of a 100 B packet.
+const (
+	headerBytes = 124
+	epb100Bytes = 132
+)
+
+// packet100 returns a 100 B packet filled with b, so each one is told apart.
+func packet100(b byte) []byte { return bytes.Repeat([]byte{b}, 100) }
+
+// lineDSBBytes is the size of a Decryption Secrets Block holding line alone:
+// 20 B of block framing plus the newline-terminated line padded to 4 B.
+func lineDSBBytes(line string) int64 { return 20 + (int64(len(line))+1+3)&^3 }
+
+// C1 (AC 1, AC 2): the room is a hard bound on the file. With room for the
+// header and exactly three packets, the fourth stops capture and nothing after
+// it is written; one byte less and only two fit.
+func TestWriter_StopsBeforeFilePassesItsRoom(t *testing.T) {
+	require.Equal(t, int64(headerBytes), HeaderSize(Options{}), "precondition: an Ethernet capture's header is 124 B")
+
+	t.Run("520 B room", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		w, err := NewWriter(path, Options{Room: headerBytes + 3*epb100Bytes})
+		require.NoError(t, err)
+		for i := range 3 {
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(byte(i))), "packet %d fits the room", i)
+		}
+		assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(3)), ErrStopped, "the fourth packet must stop capture")
+		assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(4)), ErrStopped, "a packet after the stop must not be written")
+		require.NoError(t, w.Close())
+
+		raw := readFile(t, path)
+		assert.Len(t, raw, 520, "the closed file must fill its room exactly")
+		assert.Equal(t, [][]byte{packet100(0), packet100(1), packet100(2)}, packetPayloads(raw))
+	})
+	t.Run("519 B room", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		w, err := NewWriter(path, Options{Room: headerBytes + 3*epb100Bytes - 1})
+		require.NoError(t, err)
+		for i := range 2 {
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(byte(i))), "packet %d fits the room", i)
+		}
+		assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(2)), ErrStopped, "one byte short, the third packet must stop capture")
+		require.NoError(t, w.Close())
+
+		raw := readFile(t, path)
+		assert.Len(t, raw, headerBytes+2*epb100Bytes)
+		assert.Equal(t, [][]byte{packet100(0), packet100(1)}, packetPayloads(raw))
+	})
+}
+
+// C2 (AC 1): what is admitted counts at once, whether or not it is on disk
+// yet. Packets in the hold window count, and so does a pending secret.
+func TestWriter_HeldPacketsAndPendingSecretsCountTowardRoom(t *testing.T) {
+	t.Run("held packets", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		clock := newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))
+		w, err := NewWriter(path, Options{Room: headerBytes + 3*epb100Bytes, Clock: clock})
+		require.NoError(t, err)
+		for i := range 3 {
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, packet100(byte(i))))
+		}
+		assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{}, packet100(3)), ErrStopped,
+			"three held packets fill a 520 B room, so the fourth must be refused")
+		assert.Equal(t, int64(headerBytes), fileSize(t, path), "the clock never moved, so the three packets are still held: only the header is on disk")
+		require.NoError(t, w.Close())
+		assert.Len(t, readPackets(t, path), 3)
+	})
+	t.Run("pending secret", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		w, err := NewWriter(path, Options{Room: headerBytes + lineDSBBytes(nssKeylogLine) + 2*epb100Bytes,
+			Clock: newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))})
+		require.NoError(t, err)
+		w.AddSecret(nssKeylogLine)
+		for i := range 2 {
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, packet100(byte(i))))
+		}
+		assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{}, packet100(2)), ErrStopped,
+			"the secret's block and two packets fill the room, so the third packet must be refused")
+		require.NoError(t, w.Close())
+
+		raw := readFile(t, path)
+		assert.Equal(t, []string{nssKeylogLine + "\n"}, secretsPayloads(raw))
+		assert.Equal(t, [][]byte{packet100(0), packet100(1)}, packetPayloads(raw))
+	})
+}
+
+// C3 (AC 2): a keylog line stops capture just as a packet does, when its
+// Decryption Secrets Block does not fit the room left. Neither the line nor a
+// packet after it reaches the file.
+func TestWriter_SecretThatDoesNotFitStopsCapture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Room: headerBytes + epb100Bytes + lineDSBBytes(nssKeylogLine) - 1})
+	require.NoError(t, err)
+
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(0)))
+	w.AddSecret(nssKeylogLine)
+	assert.Equal(t, StateStoppedMaxBytes, w.State(), "a line whose block does not fit must stop capture")
+	assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(1)), ErrStopped)
+	require.NoError(t, w.Close())
+
+	raw := readFile(t, path)
+	assert.Empty(t, secretsPayloads(raw), "the line that stopped capture must be in no DSB")
+	assert.Equal(t, [][]byte{packet100(0)}, packetPayloads(raw), "only the packet admitted before the stop may be in the file")
+}
+
+// C4 (AC 3): a stop drops what comes after it, never what was admitted before
+// it. Packets still held at the stop reach the file live, once their hold
+// window passes, and the file is kept.
+func TestWriter_StopStillWritesWhatItAdmitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Room: headerBytes + 3*epb100Bytes})
+	require.NoError(t, err)
+
+	for i := range 3 {
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(byte(i))))
+	}
+	require.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(3)), ErrStopped)
+	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 3 }, liveBound, 20*time.Millisecond,
+		"the three packets held at the stop must reach the file within %s, without Close", liveBound)
+
+	require.NoError(t, w.Close())
+	assert.FileExists(t, path, "a stopped capture must be kept")
+	assert.Equal(t, [][]byte{packet100(0), packet100(1), packet100(2)}, packetPayloads(readFile(t, path)))
+}
+
+// C5 (AC 8): while capture is active, a grown room admits what the old one
+// could not.
+func TestWriter_GrownRoomAdmitsMore(t *testing.T) {
+	const room = headerBytes + epb100Bytes - 1 // one byte short of a 100 B packet's block
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Room: room})
+	require.NoError(t, err)
+
+	w.SetRoom(room + 1000)
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(0)), "the grown room must admit the packet")
+	assert.Equal(t, StateActive, w.State())
+	require.NoError(t, w.Close())
+	assert.Equal(t, [][]byte{packet100(0)}, packetPayloads(readFile(t, path)))
+}
+
+// C6 (AC 9): a stop is for good. A room grown afterwards admits neither a
+// packet nor a line, and no second capture file appears.
+func TestWriter_StoppedStaysStoppedWhenRoomGrows(t *testing.T) {
+	const room = headerBytes + epb100Bytes - 1
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dump.pcapng")
+	w, err := NewWriter(path, Options{Room: room})
+	require.NoError(t, err)
+	require.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(0)), ErrStopped)
+
+	w.SetRoom(room + 1<<20)
+	assert.ErrorIs(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(1)), ErrStopped, "a stopped capture must not admit a packet")
+	w.AddSecret(nssKeylogLine)
+	assert.Equal(t, StateStoppedMaxBytes, w.State(), "a stopped capture must stay stopped")
+	require.NoError(t, w.Close())
+
+	raw := readFile(t, path)
+	assert.Empty(t, packetPayloads(raw), "no packet may be written after the stop")
+	assert.Empty(t, secretsPayloads(raw), "no line may be written after the stop")
+	assert.Equal(t, []string{"dump.pcapng"}, dirNames(t, dir), "no second capture file may appear")
+}
+
+// C7 (AC 1, AC 4): packets, secrets and room updates race in the sidecar. Under
+// -race there must be no data race, the stop must be notified exactly once,
+// and the closed file must stay within the last room handed over.
+func TestWriter_ConcurrentLimitStopIsRaceFreeAndHappensOnce(t *testing.T) {
+	const initialRoom = 4 << 10
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	var stops atomic.Int32
+	w, err := NewWriter(path, Options{Room: initialRoom, OnStop: func(Stop) { stops.Add(1) }})
+	require.NoError(t, err)
+
+	var finalRoom atomic.Int64
+	finalRoom.Store(initialRoom)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			for i := range 200 {
+				_ = w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, packet100(byte(i)))
+			}
+		})
+		wg.Go(func() {
+			for l := range 50 {
+				w.AddSecret(keylogLine(g*50 + l))
+			}
+		})
+	}
+	wg.Go(func() {
+		for i := 1; i <= 10; i++ {
+			room := int64(initialRoom + i*1024)
+			w.SetRoom(room)
+			finalRoom.Store(room)
+			time.Sleep(time.Millisecond)
+		}
+	})
+	wg.Wait()
+	require.NoError(t, w.Close())
+
+	require.Equal(t, StateStoppedMaxBytes, w.State(), "precondition: 800 packets of 132 B overrun every room handed over")
+	assert.Equal(t, int32(1), stops.Load(), "the stop must be notified exactly once")
+	assert.LessOrEqual(t, fileSize(t, path), finalRoom.Load(), "the closed file must not exceed the final room")
 }
 
 // runStart is the Unix second the run-capture tests start at.

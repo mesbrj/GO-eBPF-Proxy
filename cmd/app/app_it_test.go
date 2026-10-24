@@ -4,14 +4,17 @@ package main
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
 )
 
@@ -81,6 +84,59 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	got, err := os.ReadFile(earlier) // #nosec G304 -- test-controlled temp path
 	require.NoError(t, err, "teardown must keep a capture an earlier run left")
 	assert.Equal(t, earlierBytes, got, "an earlier run's capture must be kept byte for byte")
+}
+
+// C18 (AC 12): a capture directory already at --max-bytes stops only capture.
+// Start succeeds, the relay and the keylog socket accept connections, and no
+// capture file is created.
+func TestApp_StartWithFullCaptureDirStartsEverythingButCapture(t *testing.T) {
+	pinDir, err := os.MkdirTemp("/sys/fs/bpf", "gotestpin-")
+	if err != nil {
+		t.Skipf("need privilege + mounted bpffs: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(pinDir) })
+
+	cg, err := os.MkdirTemp("/sys/fs/cgroup", "gotestcg-")
+	if err != nil {
+		t.Skipf("need privilege + cgroup v2: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(cg) })
+
+	dir := t.TempDir()
+	captureDir := filepath.Join(dir, "sidecar")
+	require.NoError(t, os.Mkdir(captureDir, 0o700))
+	cfg := DefaultConfig()
+	plantCapture(t, captureDir, "dump-1000000000.pcapng", cfg.MaxBytes, time.Now())
+	cfg.CgroupPath = cg
+	cfg.PinDir = pinDir
+	cfg.KeylogSocketPath = filepath.Join(dir, "sock", "keylog.sock")
+	cfg.RelayListen = "127.0.0.1:0"
+	cfg.KeylogPath = filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
+	cfg.CaptureIface = "lo"
+	cfg.CapturePath = filepath.Join(captureDir, "dump.pcapng")
+	cfg.RetentionTick = 0
+
+	a, err := Start(cfg, logger.New(os.Stderr))
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("privileged capture/attach not permitted: %v", err)
+	}
+	require.NoError(t, err, "Start must succeed without room for a capture")
+	t.Cleanup(func() { _ = a.Close() })
+
+	relay, err := net.DialTimeout("tcp", a.ln.Addr().String(), 2*time.Second)
+	require.NoError(t, err, "the relay listener must accept a connection")
+	_ = relay.Close()
+	// The relay serves it: nothing redirected this connection, so its lookup
+	// is a fail-closed miss. Waiting for that lookup also keeps Close, at
+	// cleanup, from closing the eBPF map while it runs.
+	require.Eventually(t, func() bool { return a.resolver.Misses() == 1 }, 2*time.Second, 10*time.Millisecond,
+		"the relay must handle the accepted connection")
+	keylogConn, err := net.DialTimeout("unix", cfg.KeylogSocketPath, 2*time.Second)
+	require.NoError(t, err, "the keylog socket must accept a connection")
+	_ = keylogConn.Close()
+
+	assert.Equal(t, capture.StateNotStartedMaxBytes, a.captureState())
+	assert.Equal(t, []string{"dump-1000000000.pcapng"}, dirNames(t, captureDir), "no capture file may be created")
 }
 
 // Teardown honours --retain: artifacts survive Close when Config.Retain is set.

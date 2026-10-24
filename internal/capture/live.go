@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/gopacket/gopacket/pcapgo"
@@ -37,7 +38,10 @@ func StartLive(iface string, w *Writer) (*Live, error) {
 }
 
 // run copies packets into w until a read fails, which is how Stop's close of
-// the handle surfaces. A packet w fails to write is dropped, not fatal.
+// the handle surfaces, or until w stops capture at its room: w writes nothing
+// after that, so reading on would only copy packets to drop them. The handle
+// stays open until Stop. Any other packet w fails to write is dropped, not
+// fatal.
 func (l *Live) run(w *Writer) {
 	defer close(l.done)
 	for {
@@ -45,7 +49,9 @@ func (l *Live) run(w *Writer) {
 		if err != nil {
 			return
 		}
-		_ = w.WritePacket(ci, data)
+		if err := w.WritePacket(ci, data); errors.Is(err, ErrStopped) {
+			return
+		}
 	}
 }
 

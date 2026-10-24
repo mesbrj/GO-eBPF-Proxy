@@ -48,7 +48,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.String("capture-iface", d.CaptureIface, "interface to capture the outbound leg from")
 	fs.String("capture-path", d.CapturePath, "template for each run's DSB-embedded pcapng capture: a run writes <stem>-<unix start second><ext> in its directory, never overwriting a file")
 	fs.Bool("retain", d.Retain, "keep capture/keylog artifacts on teardown instead of wiping them")
-	fs.Int64("max-bytes", d.MaxBytes, "capture directory size cap in bytes (0 disables)")
+	fs.Int64("max-bytes", d.MaxBytes, "size limit in bytes on the captures in the capture directory, this run's included: reaching it stops capture and keeps the file (0 disables)")
 	fs.Duration("max-age", d.MaxAge, "age past which finished captures are deleted, never the live one (0 disables)")
 	fs.Duration("retention-interval", d.RetentionTick, "how often to enforce retention while running (0 disables)")
 	fs.Duration("stats-interval", d.StatsInterval, "how often to log the cumulative counters as a \"stats\" line, plus once at shutdown (0 disables)")
