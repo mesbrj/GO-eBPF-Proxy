@@ -275,6 +275,49 @@ func TestWriter_LiveSecretsWrittenOnceEach(t *testing.T) {
 		"each live DSB must hold exactly the new lines, each once")
 }
 
+// Landing door 1 (AD-018): when one write releases pending secrets and packets
+// together, the secrets go first -- any of those packets may be the very
+// ServerHello the secrets decrypt. Two writes can do that: the periodic drain,
+// when a secret arrives just before its packet's hold window ends, and the
+// write the 32 MiB cap forces early. In each case the secret and the packet's
+// release are handed over back to back, so the next write sees both; a drain
+// slipping in between would write the secret alone first, which still meets
+// the order asserted here.
+func TestWriter_PendingSecretsPrecedePacketsReleasedWithThem(t *testing.T) {
+	t.Run("periodic drain", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		clock := newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+		w, err := NewWriter(path, Options{Clock: clock})
+		require.NoError(t, err)
+		defer func() { _ = w.Close() }()
+
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xaa}))
+		w.AddSecret(nssKeylogLine)
+		clock.Advance(holdWindow)
+
+		assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 1 }, liveBound, 20*time.Millisecond)
+		assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB}, blockTypes(readFile(t, path)),
+			"a drain releasing a secret and a packet together must write the secret first")
+	})
+	t.Run("cap-forced write", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dump.pcapng")
+		w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))})
+		require.NoError(t, err)
+		defer func() { _ = w.Close() }()
+
+		const size = 64 << 10
+		for range maxHeldBytes / size {
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, make([]byte, size)))
+		}
+		w.AddSecret(nssKeylogLine)
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xff}))
+
+		assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 1 }, liveBound, 20*time.Millisecond)
+		assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB}, blockTypes(readFile(t, path)),
+			"a write forced by the cap must write the pending secret before the packet it releases")
+	})
+}
+
 // AC 7: the hold queue is bounded. Holding exactly maxHeldBytes writes
 // nothing early; one byte more writes the oldest packets until the held
 // total is back within the cap -- here exactly one, the oldest.
