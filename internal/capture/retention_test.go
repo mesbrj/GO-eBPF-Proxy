@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -260,6 +261,64 @@ func TestRetention_TemplateMetacharactersMatchLiterally(t *testing.T) {
 			assert.Equal(t, []string{tc.decoy}, dirNames(t, dir), "the age pass deletes %s and keeps %s", tc.control, tc.decoy)
 		})
 	}
+}
+
+// assertOnlyControlIsOwned plants, under template dump.pcapng, the owned
+// control at 100 B and each decoy at 1,000 B, all aged 48h: first every decoy
+// together, then each decoy alone beside the control, so a matcher that takes
+// one decoy for an owned capture fails on that decoy's row. In every row the
+// owned-bytes sum is exactly the control's 100 B, and an age pass with
+// --max-age 24h deletes the control and keeps every decoy.
+func assertOnlyControlIsOwned(t *testing.T, control string, decoys ...string) {
+	t.Helper()
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+
+	check := func(t *testing.T, decoys []string) {
+		t.Helper()
+		dir := t.TempDir()
+		for _, decoy := range decoys {
+			writeFileAt(t, filepath.Join(dir, decoy), 1000, old)
+		}
+		writeFileAt(t, filepath.Join(dir, control), 100, old)
+		r := Retention{Template: filepath.Join(dir, "dump.pcapng"), MaxAge: 24 * time.Hour, Clock: newManualClock(now)}
+
+		owned, err := r.OwnedBytes()
+		require.NoError(t, err)
+		assert.Equal(t, int64(100), owned, "of %v beside %s, only %s is an owned capture of dump.pcapng", decoys, control, control)
+
+		require.NoError(t, r.Enforce())
+		assert.Equal(t, slices.Sorted(slices.Values(decoys)), dirNames(t, dir), "the age pass deletes %s and keeps %v", control, decoys)
+	}
+
+	t.Run("all decoys", func(t *testing.T) { check(t, decoys) })
+	for _, decoy := range decoys {
+		t.Run(decoy, func(t *testing.T) { check(t, []string{decoy}) })
+	}
+}
+
+// C70 (door 2): an owned name matches the whole file name. A name that holds
+// an owned name after a prefix, or before a further extension, is not an owned
+// capture: an operator's copy is neither counted toward --max-bytes nor aged
+// out. The owned name beside it is both.
+func TestRetention_OwnedNameMustMatchTheWholeName(t *testing.T) {
+	assertOnlyControlIsOwned(t, "dump-1700000000.pcapng",
+		"old-dump-1.pcapng",          // an owned name after a prefix
+		"dump-1700000000.pcapng.bak", // an owned name before a further extension
+	)
+}
+
+// C71 (door 2): an owned name's epoch is digits only and not empty, and it
+// carries at most one suffix, digits only. Any other name of the template's
+// shape is not an owned capture: it is neither counted nor aged out. The owned
+// name with an epoch and one suffix beside it is both.
+func TestRetention_OwnedNameNeedsDigitEpochAndAtMostOneSuffix(t *testing.T) {
+	assertOnlyControlIsOwned(t, "dump-1-2.pcapng",
+		"dump-old.pcapng",   // an epoch that is not digits
+		"dump-.pcapng",      // an empty epoch
+		"dump-1-x.pcapng",   // a suffix that is not digits
+		"dump-1-2-3.pcapng", // two suffixes
+	)
 }
 
 // C29 (AC 20, AC 45): teardown deletes this run's capture and nothing else,
