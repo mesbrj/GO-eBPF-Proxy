@@ -104,17 +104,6 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	relay := newRelay(a.resolver, log)
 	go func() { _ = relay.Serve(ln) }()
 
-	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
-		SocketPath: cfg.KeylogSocketPath,
-		KeylogPath: cfg.KeylogPath,
-	}, keylog.WithLogger(log))
-	if err != nil {
-		_ = a.Close()
-		return nil, fmt.Errorf("app: start keylog socket server: %w", err)
-	}
-	a.keylogSrv = keylogSrv
-	go func() { _ = keylogSrv.Run() }()
-
 	captureDir := filepath.Dir(cfg.CapturePath)
 	if err := capture.CheckTarget(captureDir); err != nil {
 		_ = a.Close()
@@ -124,12 +113,27 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	// whatever was partially written, unless Retain is set.
 	a.retention = capture.Retention{Dir: captureDir, MaxBytes: cfg.MaxBytes, MaxAge: cfg.MaxAge, Retain: cfg.Retain}
 
+	// The capture writer exists before the keylog socket server, so the
+	// server can stream every line it accepts into the capture (AD-018).
 	capW, err := capture.NewWriter(cfg.CapturePath, capture.Options{})
 	if err != nil {
 		_ = a.Close()
 		return nil, fmt.Errorf("app: open capture writer: %w", err)
 	}
 	a.capW = capW
+
+	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
+		SocketPath: cfg.KeylogSocketPath,
+		KeylogPath: cfg.KeylogPath,
+		Sink:       capW.AddSecret,
+	}, keylog.WithLogger(log))
+	if err != nil {
+		_ = a.Close()
+		return nil, fmt.Errorf("app: start keylog socket server: %w", err)
+	}
+	a.keylogSrv = keylogSrv
+	go func() { _ = keylogSrv.Run() }()
+
 	live, err := capture.StartLive(cfg.CaptureIface, capW)
 	if err != nil {
 		_ = a.Close()

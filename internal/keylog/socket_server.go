@@ -24,6 +24,9 @@ type SocketServerConfig struct {
 	SocketPath string
 	// KeylogPath is the NSS keylog file appended to via Writer.
 	KeylogPath string
+	// Sink, if set, receives every line the keylog Writer appends (see
+	// WithSink).
+	Sink func(line string)
 }
 
 // ErrWorldAccessibleSocketDir is returned when the socket's parent directory
@@ -88,7 +91,7 @@ func NewSocketServer(cfg SocketServerConfig, opts ...SocketServerOption) (*Socke
 		return nil, fmt.Errorf("keylog: chmod socket %q: %w", cfg.SocketPath, err)
 	}
 
-	w, err := NewWriter(cfg.KeylogPath)
+	w, err := NewWriter(cfg.KeylogPath, WithSink(cfg.Sink))
 	if err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("keylog: open keylog writer: %w", err)

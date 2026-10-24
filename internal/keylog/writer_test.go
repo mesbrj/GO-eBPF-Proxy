@@ -73,6 +73,28 @@ func TestWriter_DedupSameTriple(t *testing.T) {
 	assert.Len(t, lines, 1, "duplicate triples must collapse to one line")
 }
 
+// AD-018: the sink sees exactly the lines the keylog file gains -- each newly
+// appended line once, in order -- and never a malformed line or a duplicate,
+// so the capture's DSBs mirror the keylog line for line.
+func TestWriter_SinkReceivesOnlyAppendedLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sslkeylog.log")
+	var got []string
+	w, err := NewWriter(path, WithSink(func(line string) { got = append(got, line) }))
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	first, second := sampleLine(0x05), sampleLine(0x06)
+	require.NoError(t, w.Append(first))
+	assert.ErrorIs(t, w.Append("NOT_A_VALID_LINE too short"), ErrMalformedLine)
+	require.NoError(t, w.Append(first))
+	require.NoError(t, w.Append(second))
+
+	assert.Equal(t, []string{first, second}, got, "the sink must receive each appended line once, and nothing else")
+	content, err := os.ReadFile(path) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	assert.Equal(t, first+"\n"+second+"\n", string(content), "the sink must mirror the keylog file")
+}
+
 // UT-02.5: distinct handshakes (different secrets) are each appended.
 func TestWriter_DistinctHandshakesAppended(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sslkeylog.log")

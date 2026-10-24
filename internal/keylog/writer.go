@@ -15,11 +15,22 @@ type Writer struct {
 	mu   sync.Mutex
 	f    *os.File
 	seen map[string]struct{}
+	sink func(line string)
+}
+
+// WriterOption configures optional Writer behavior.
+type WriterOption func(*Writer)
+
+// WithSink hands sink every line Append writes to the keylog file -- valid
+// and not a duplicate -- right after writing it, in append order. The
+// sidecar streams those lines into its capture this way (AD-018).
+func WithSink(sink func(line string)) WriterOption {
+	return func(w *Writer) { w.sink = sink }
 }
 
 // NewWriter opens (creating if needed) the keylog file at path, creating its
 // parent directory 0700 and the file 0600.
-func NewWriter(path string) (*Writer, error) {
+func NewWriter(path string, opts ...WriterOption) (*Writer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -27,7 +38,11 @@ func NewWriter(path string) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{f: f, seen: make(map[string]struct{})}, nil
+	w := &Writer{f: f, seen: make(map[string]struct{})}
+	for _, o := range opts {
+		o(w)
+	}
+	return w, nil
 }
 
 // Append validates line as a well-formed NSS keylog line, rejecting it
@@ -51,6 +66,9 @@ func (w *Writer) Append(line string) error {
 		return err
 	}
 	w.seen[key] = struct{}{}
+	if w.sink != nil {
+		w.sink(line)
+	}
 	return nil
 }
 
