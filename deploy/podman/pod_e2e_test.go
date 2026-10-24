@@ -10,8 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,7 +77,9 @@ func inspectContainer(t *testing.T, name string) podmanInspect {
 	return arr[0]
 }
 
-func podUp(t *testing.T, podName, sidecarBin string) {
+// podUp brings up the pod, tears it down at cleanup, and returns what
+// pod-up.sh printed.
+func podUp(t *testing.T, podName, sidecarBin string) string {
 	t.Helper()
 	// A RETAIN exported by the caller's shell must not leak into a test that
 	// asserts what pod-up.sh does without one (AD-019).
@@ -88,6 +93,7 @@ func podUp(t *testing.T, podName, sidecarBin string) {
 		down.Env = env
 		_ = down.Run()
 	})
+	return string(out)
 }
 
 // podLabel returns the value of label key on the pod podName.
@@ -148,11 +154,27 @@ func tupleMapEntryCount(t *testing.T, pinDir string) int {
 // IT-03.4: the pod comes up healthy with the required namespaces, caps, and
 // mounts; connect4/sockops are attached at the pod parent cgroup, their maps
 // are pinned, and the app container carries the LD_PRELOAD keylog interposer.
+// C57 (AC 39, AC 14, AC 38): on a fresh volume, pod-up.sh finds this run's
+// capture, the only one there, named after a second no earlier than its
+// start, and the sidecar logs that file as started.
 func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
 	podName := "go-ebpf-proxy-it4"
-	podUp(t, podName, bin)
+	start := time.Now().Unix()
+	out := podUp(t, podName, bin)
+	assert.NotContains(t, out, "pod-up: capture not started")
+
+	captures := volumeCaptures(t, volumeMountpoint(t, podName))
+	require.Len(t, captures, 1, "the volume must hold exactly this run's capture: %v", captures)
+	m := regexp.MustCompile(`^dump-([0-9]+)\.pcapng$`).FindStringSubmatch(captures[0])
+	require.NotNil(t, m, "this run's capture must be named dump-<epoch>.pcapng, got %s", captures[0])
+	epoch, err := strconv.ParseInt(m[1], 10, 64)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, epoch, start, "the capture's epoch must be no earlier than the test's start")
+	started := logLines(sidecarLogs(t, podName), "capture started")
+	require.Len(t, started, 1)
+	assert.Contains(t, started[0], `"path":"/var/log/sidecar/`+captures[0]+`"`)
 
 	sidecar := inspectContainer(t, podName+"-sidecar")
 	assert.Equal(t, "running", sidecar.State.Status, "sidecar container must be running")
@@ -257,4 +279,43 @@ func TestPodUp_MissingSidecarBinaryExitsOneWithoutPod(t *testing.T) {
 	require.ErrorAs(t, err, &exitErr, "pod-up.sh must fail without a sidecar binary: %s", out)
 	assert.Equal(t, 1, exitErr.ExitCode(), "pod-up.sh must exit 1: %s", out)
 	assert.False(t, podExists(t, podName), "a failed pod-up.sh must leave no pod behind")
+}
+
+// C19, C58 (AC 11, AC 12, AC 37, AC 39, AC 40, at the boundary): on a volume
+// whose kept capture already fills the default --max-bytes, pod-up.sh says
+// capture did not start and still starts the app, which the relay serves.
+// The sidecar logs one ERROR line, creates no capture, and reports the state
+// in its final stats line.
+func TestPodUp_FullVolumeStartsWithoutCaptureAndStillRelays(t *testing.T) {
+	requireRootfulPodman(t)
+	requireInternetEgress(t)
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-itfull"
+	keptCaptureVolume(t, podName, 104_857_600)
+
+	stderr := podUpNoCleanup(t, podName, bin)
+	var notStarted []string
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "pod-up: capture not started") {
+			notStarted = append(notStarted, line)
+		}
+	}
+	assert.Len(t, notStarted, 1, "pod-up.sh must print one 'capture not started' line on stderr: %s", stderr)
+	assert.Equal(t, "running", inspectContainer(t, podName+"-app").State.Status, "pod-up.sh must still start the app container")
+
+	out := runSmoke(t, podName)
+	assert.Contains(t, out, "HTTP 200", "the relay must serve the app without capture")
+	assert.Equal(t, []string{"dump-1000000000.pcapng"}, volumeCaptures(t, volumeMountpoint(t, podName)),
+		"the volume must hold no capture but the kept one")
+
+	sidecar := podName + "-sidecar"
+	stopOut, err := exec.Command("podman", "stop", "-t", "30", sidecar).CombinedOutput() // #nosec G204 -- sidecar is a test-generated container name, not external input
+	require.NoError(t, err, "podman stop (SIGTERM): %s", stopOut)
+	logs := sidecarLogs(t, podName)
+	errorLines := logLines(logs, "capture not started: --max-bytes already reached")
+	require.Len(t, errorLines, 1, "exactly one ERROR line: %s", logs)
+	assert.Contains(t, errorLines[0], `"level":"ERROR"`)
+	stats := logLines(logs, "stats")
+	require.NotEmpty(t, stats, "Close must log the final stats line")
+	assert.Contains(t, stats[len(stats)-1], `"capture_state":"not_started_max_bytes"`)
 }

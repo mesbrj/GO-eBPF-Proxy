@@ -43,11 +43,11 @@ KEYLOG_DIR="/run/keylog"
 KEYLOG_SOCKET="$KEYLOG_DIR/keylog.sock"
 # RETAIN must be decided at sidecar startup, not at pod-down.sh time: the
 # app's own --retain flag (cmd/app/main.go) controls whether its graceful
-# shutdown (App.Close -> capture.Retention.Cleanup) wipes /var/log/sidecar's
-# CONTENTS. pod-down.sh's own --retain only decides whether to remove the
-# now-already-emptied-or-not podman VOLUME itself -- without also passing
-# --retain here, the app always wipes its own directory on shutdown
-# regardless of what pod-down.sh does with the volume. The choice is also
+# shutdown (App.Close -> capture.Retention.Cleanup) deletes this run's capture
+# from /var/log/sidecar. pod-down.sh's own --retain only decides whether to
+# remove the podman VOLUME itself -- without also passing --retain here, the
+# app always deletes its capture on shutdown regardless of what pod-down.sh
+# does with the volume. The choice is also
 # recorded on the pod as the label go-ebpf-proxy.retain (AD-019), which
 # pod-down.sh follows by default, so RETAIN=1 here is the only switch needed.
 RETAIN="${RETAIN:-0}"
@@ -124,7 +124,11 @@ POD_CGROUP="/sys/fs/cgroup/$(podman pod inspect "$POD_NAME" --format '{{.CgroupP
 # keylog socket before the app container starts" -- the interposer only
 # retries briefly then silently drops a line if the socket isn't reachable
 # yet, so starting the app first would race an early handshake against the
-# sidecar's own listener).
+# sidecar's own listener). SIDECAR_START is the second it is started: the
+# sidecar names this run's capture after its own start second, never earlier,
+# so the readiness check below can tell it from a capture an earlier run kept
+# in the same volume.
+SIDECAR_START="$(date +%s)"
 podman run -d \
   --pod "$POD_NAME" \
   --name "${POD_NAME}-sidecar" \
@@ -166,19 +170,24 @@ if [[ ! -S "$KEYLOG_VOLUME_MOUNT/keylog.sock" ]]; then
   exit 1
 fi
 
-# Also wait for the capture writer's file to exist. The sidecar's Start()
-# now creates it before the keylog socket server (the server streams every
-# key line into it, AD-018), so the wait above already implies it; this
-# check stays as the explicit readiness guarantee -- without the file, a
-# teardown that happens immediately after pod-up returns (no intervening
-# smoke traffic) could find no dump.pcapng at all, even under --retain.
-for _ in $(seq 1 100); do
-  [[ -f "$LOG_VOLUME_MOUNT/dump.pcapng" ]] && break
-  sleep 0.1
+# Then check for this run's capture. Each run writes its own
+# dump-<epoch>[-<n>].pcapng (AD-021), and the sidecar's Start() creates it
+# before the keylog socket server (the server streams every key line into
+# it, AD-018), so once the socket is bound the file exists -- unless the
+# captures kept in the volume already reached --max-bytes, in which case the
+# sidecar runs on without capture (AD-020). Only a file whose epoch is at or
+# after SIDECAR_START is this run's; the epoch is compared as a number, never
+# as a string.
+CAPTURE_PATH=""
+for f in "$LOG_VOLUME_MOUNT"/dump-*.pcapng; do
+  if [[ -f "$f" && ! -L "$f" && "${f##*/}" =~ ^dump-([0-9]+)(-[0-9]+)?\.pcapng$ ]] \
+    && (( 10#${BASH_REMATCH[1]} >= SIDECAR_START )); then
+    CAPTURE_PATH="$f"
+    break
+  fi
 done
-if [[ ! -f "$LOG_VOLUME_MOUNT/dump.pcapng" ]]; then
-  echo "pod-up: capture file did not appear at $LOG_VOLUME_MOUNT/dump.pcapng within 10s" >&2
-  exit 1
+if [[ -z "$CAPTURE_PATH" ]]; then
+  echo "pod-up: capture not started: the sidecar created no capture, because the captures kept in $LOG_VOLUME (dump-*.pcapng) already reach --max-bytes; see the sidecar log (podman logs ${POD_NAME}-sidecar). Starting the app anyway: the relay works without capture" >&2
 fi
 
 podman run -d \

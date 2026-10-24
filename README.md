@@ -41,10 +41,12 @@ socket layer, and TLS keys read passively from the process that already holds th
    Each key line is written into it as a Decryption Secrets Block as soon as it arrives,
    while every packet waits one second before it is written, so the keys land ahead of
    the handshake they decrypt. The capture is therefore self-decrypting while it is
-   being written, even if the sidecar is killed. A clean stop re-emits it with all keys
-   in one leading block.
-   Retention is bounded (size + age caps) and ephemeral by default: pod teardown wipes
-   the capture directory unless the pod was brought up with `RETAIN=1`.
+   being written, even if the sidecar is killed. A clean stop only drains and closes it.
+   Each run writes its own `dump-<epoch>.pcapng`, never overwriting a capture an earlier
+   run kept. Capture is bounded: it stops, keeping its file, once the captures in the
+   directory reach `--max-bytes`, and finished captures are deleted past `--max-age`.
+   It is ephemeral by default: pod teardown wipes the capture directory unless the pod
+   was brought up with `RETAIN=1`.
 7. Offline, `tshark`/Wireshark decrypts the pcapng from its embedded DSBs alone (or
    paired with the keylog) to show the app's real traffic in plaintext — proving the
    whole pipeline end-to-end.
@@ -58,7 +60,7 @@ flowchart LR
     app -. "libssl handshake" .-> interposer["LD_PRELOAD interposer<br/>(SSL_CTX_new + keylog callback)"]
     interposer -- "NSS lines over unix socket" --> keylog["keylog socket server<br/>-> NSS keylog"]
     keylog -. "streamed in as DSBs" .-> capture
-    capture -- "dump.pcapng" --> tshark["tshark / Wireshark<br/>offline decrypt"]
+    capture -- "dump-epoch.pcapng" --> tshark["tshark / Wireshark<br/>offline decrypt"]
 ```
 
 ## Pod view
@@ -95,7 +97,7 @@ flowchart TB
     relay == "raw pipe (real cert validated by the app)" ==> upstream["Upstream server"]
     relay -. "outbound leg" .-> capture
     keylog -. "NSS keylog (tmpfs)" .-> capture
-    capture -- "dump.pcapng" --> disk[("/var/log/sidecar<br/>(host-visible volume)")]
+    capture -- "dump-epoch.pcapng" --> disk[("/var/log/sidecar<br/>(host-visible volume)")]
     disk -. "tshark -o tls.keylog_file:..." .-> decrypted(["decrypted plaintext"])
 ```
 
@@ -140,8 +142,10 @@ sudo deploy/podman/smoke.sh
 
 # 4. Decrypt the capture offline. It carries the session keys itself, written as
 #    Decryption Secrets Blocks while it is captured, so it decrypts with no keylog
-#    file: mid-run, after a clean stop, or after the sidecar was killed
-tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')/dump.pcapng" \
+#    file: mid-run, after a clean stop, or after the sidecar was killed. Each run
+#    writes its own dump-<epoch>.pcapng; ls -t picks the newest, this run's
+CAPTURE="$(ls -t "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')"/dump-*.pcapng | head -n 1)"
+tshark -r "$CAPTURE" \
   -o "tls.keylog_file:" -o tcp.reassemble_out_of_order:TRUE \
   -Y 'http or http2' -V
 # -o "tls.keylog_file:" clears any keylog file set in your Wireshark preferences, so
@@ -163,8 +167,11 @@ sudo deploy/podman/pod-down.sh
 
 Keeping the artifacts is decided once, when the pod comes up.
 `RETAIN=1` on `pod-up.sh` alone keeps the capture through teardown: the sidecar then
-keeps its capture directory when it stops, and the pod records the choice as the label
-`go-ebpf-proxy.retain=1`, which a plain `pod-down.sh` follows. The kept `dump.pcapng` decrypts with no keylog file,
+keeps its capture when it stops, and the pod records the choice as the label
+`go-ebpf-proxy.retain=1`, which a plain `pod-down.sh` follows. A pod brought up again on
+the kept volume writes its own capture beside the kept ones. If they already reach
+`--max-bytes`, `pod-up.sh` warns `pod-up: capture not started` and the pod runs without
+capture. The kept capture decrypts with no keylog file,
 and the tmpfs keylog file is never kept: it disappears with the sidecar container, and
 the capture already carries every key it held. `RETAIN=0 pod-down.sh` still wipes a
 retained pod. `pod-down.sh --retain` on a pod brought up without `RETAIN=1` exits `1` and
@@ -200,12 +207,12 @@ you:
 | `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on |
 | `--pin-dir` | `/sys/fs/bpf/go-ebpf-proxy` | bpffs directory for the pinned maps |
 | `--keylog-socket` | `/var/run/sidecar/keylog.sock` | Unix socket the `LD_PRELOAD` interposer connects to |
-| `--keylog-path` | `/var/log/sidecar/sslkeylog.log` | NSS keylog file (keep it on tmpfs) |
+| `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start |
 | `--capture-iface` | `eth0` | Interface to capture the outbound leg from |
-| `--capture-path` | `/var/log/sidecar/dump.pcapng` | DSB-embedded pcapng capture file |
+| `--capture-path` | `/var/log/sidecar/dump.pcapng` | Template for each run's DSB-embedded pcapng capture: a run writes `dump-<epoch>.pcapng` (its start time in Unix seconds, then `-1`, `-2`, … if taken) in that directory, never overwriting a file |
 | `--retain` | `false` | Keep the capture and keylog on teardown instead of wiping them |
-| `--max-bytes` | `104857600` (100 MiB) | Capture directory size cap; `0` disables it |
-| `--max-age` | `24h` | Capture artifact age cap; `0` disables it |
+| `--max-bytes` | `104857600` (100 MiB) | Size limit on the captures in the capture directory, this run's included: reaching it stops capture and keeps the file, while the relay keeps serving the app; a run that finds it already reached starts without capture. Nothing is deleted for size; `0` disables it |
+| `--max-age` | `24h` | Each retention pass deletes finished captures older than this, never the running capture or any other file; `0` disables it |
 | `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
 | `--stats-interval` | `1m` | How often the `stats` line is logged, plus once at shutdown; `0` disables it |
 | `--log-level` | `info` | Lowest level logged: `debug`, `info`, `warn` or `error`, optionally offset like `warn+2`; `warn` drops the per-connection `connection relayed` lines |

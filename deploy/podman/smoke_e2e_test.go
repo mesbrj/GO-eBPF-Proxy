@@ -5,12 +5,15 @@ package podman
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,15 +40,20 @@ func requireInternetEgress(t *testing.T) {
 // podUpNoCleanup brings up the pod without registering automatic teardown,
 // so a test can assert on artifacts across an explicit pod-down.sh call.
 // extraEnv lets a caller pass additional env vars to pod-up.sh (e.g.
-// RETAIN=1, which pod-up.sh forwards to the sidecar's own --retain flag).
-func podUpNoCleanup(t *testing.T, podName, sidecarBin string, extraEnv ...string) {
+// RETAIN=1, which pod-up.sh forwards to the sidecar's own --retain flag). It
+// returns what pod-up.sh printed on stderr.
+func podUpNoCleanup(t *testing.T, podName, sidecarBin string, extraEnv ...string) string {
 	t.Helper()
 	env := append(envWithout("RETAIN"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
 	env = append(env, extraEnv...)
 	up := exec.Command("./pod-up.sh")
 	up.Env = env
-	out, err := up.CombinedOutput()
-	require.NoError(t, err, "pod-up.sh: %s", out)
+	var stdout, stderr bytes.Buffer
+	up.Stdout = &stdout
+	up.Stderr = &stderr
+	err := up.Run()
+	require.NoError(t, err, "pod-up.sh: %s%s", stdout.String(), stderr.String())
+	return stderr.String()
 }
 
 func runSmoke(t *testing.T, podName string) string {
@@ -70,13 +78,147 @@ func volumeExists(t *testing.T, name string) bool {
 	return true
 }
 
-// volumeCapturePath resolves the host-visible path to the named log volume's
-// dump.pcapng (the volume, unlike the keylog tmpfs, is host-visible).
-func volumeCapturePath(t *testing.T, podName string) string {
+// volumeMountpoint resolves the host-visible directory of the named pod's log
+// volume (the volume, unlike the keylog tmpfs, is host-visible).
+func volumeMountpoint(t *testing.T, podName string) string {
 	t.Helper()
 	out, err := exec.Command("podman", "volume", "inspect", podName+"-sidecar-logs", "--format", "{{.Mountpoint}}").Output() // #nosec G204 -- podName is a test-generated pod name, not external input
 	require.NoError(t, err)
-	return filepath.Join(strings.TrimSpace(string(out)), "dump.pcapng")
+	return strings.TrimSpace(string(out))
+}
+
+// volumeCapturePath resolves the host-visible path of the newest capture in
+// the named pod's log volume. Each run writes its own
+// dump-<epoch>[-<n>].pcapng (AD-021), so the newest is the running sidecar's,
+// whatever an earlier run kept beside it.
+func volumeCapturePath(t *testing.T, podName string) string {
+	t.Helper()
+	dir := volumeMountpoint(t, podName)
+	name := newestCapture(volumeCaptures(t, dir))
+	require.NotEmpty(t, name, "no dump-<epoch>[-<n>].pcapng in %s", dir)
+	return filepath.Join(dir, name)
+}
+
+// captureName matches a run's capture name, capturing its epoch and suffix.
+var captureName = regexp.MustCompile(`^dump-([0-9]+)(?:-([0-9]+))?\.pcapng$`)
+
+// volumeCaptures lists the run captures in dir: regular files named
+// dump-<epoch>[-<n>].pcapng.
+func volumeCaptures(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && captureName.MatchString(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	return names
+}
+
+// newestCapture returns the newest of the run capture names given, "" for
+// none: the highest epoch, then the highest suffix, both compared as numbers
+// (decision 9). A lexical sort would put dump-<epoch>-10 before -2.
+func newestCapture(names []string) string {
+	var newest string
+	var newestEpoch, newestSuffix uint64
+	for _, name := range names {
+		m := captureName.FindStringSubmatch(name)
+		if m == nil {
+			continue
+		}
+		epoch, err := strconv.ParseUint(m[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		var suffix uint64
+		if m[2] != "" {
+			if suffix, err = strconv.ParseUint(m[2], 10, 64); err != nil {
+				continue
+			}
+		}
+		if newest == "" || epoch > newestEpoch || epoch == newestEpoch && suffix > newestSuffix {
+			newest, newestEpoch, newestSuffix = name, epoch, suffix
+		}
+	}
+	return newest
+}
+
+// C59 (decision 9): the newest capture is picked by epoch, then suffix, as
+// numbers, never by a lexical sort.
+func TestNewestCapture_ComparesEpochAndSuffixNumerically(t *testing.T) {
+	for _, tc := range []struct{ newer, older string }{
+		{"dump-1700000000-10.pcapng", "dump-1700000000-2.pcapng"},
+		{"dump-1000000000.pcapng", "dump-999999999.pcapng"},
+		{"dump-1700000000-1.pcapng", "dump-1700000000.pcapng"},
+	} {
+		t.Run(tc.newer+" over "+tc.older, func(t *testing.T) {
+			assert.Equal(t, tc.newer, newestCapture([]string{tc.newer, tc.older}))
+			assert.Equal(t, tc.newer, newestCapture([]string{tc.older, tc.newer}), "the order given must not matter")
+		})
+	}
+}
+
+// keptCaptureVolume creates podName's log volume before pod-up.sh does,
+// holding a capture an earlier run kept: a sparse dump-1000000000.pcapng of
+// size bytes, an epoch from 2001. It registers a RETAIN=0 pod-down.sh at
+// cleanup, which removes the pod and the volume (AD-019). It returns the kept
+// capture's path.
+func keptCaptureVolume(t *testing.T, podName string, size int64) string {
+	t.Helper()
+	out, err := exec.Command("podman", "volume", "create", podName+"-sidecar-logs").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
+	require.NoError(t, err, "podman volume create: %s", out)
+	t.Cleanup(func() {
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName, "RETAIN=0")
+		_ = down.Run()
+	})
+	kept := filepath.Join(volumeMountpoint(t, podName), "dump-1000000000.pcapng")
+	f, err := os.OpenFile(kept, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- path inside a test-generated podman volume
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.NoError(t, os.Truncate(kept, size))
+	return kept
+}
+
+// sidecarLogs returns the named sidecar container's log: its JSON lines on
+// stderr.
+func sidecarLogs(t *testing.T, podName string) string {
+	t.Helper()
+	out, err := exec.Command("podman", "logs", podName+"-sidecar").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
+	require.NoError(t, err, "podman logs: %s", out)
+	return string(out)
+}
+
+// logLines returns the lines of logs whose message is msg, in order.
+func logLines(logs, msg string) []string {
+	var lines []string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `"message":"`+msg+`"`) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// fileSHA256 returns the hex sha256 of the file at path.
+func fileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path) // #nosec G304 -- path inside a test-generated podman volume
+	require.NoError(t, err)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// ownedCaptureBytes sums the sizes of the run captures in dir.
+func ownedCaptureBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	var total int64
+	for _, name := range volumeCaptures(t, dir) {
+		total += fileSizeOrZero(filepath.Join(dir, name))
+	}
+	return total
 }
 
 // execFileSize returns the size of path inside container, or 0 if it does
@@ -134,7 +276,7 @@ func TestSmoke_RealCertRequestSucceedsAndArtifactsGrow(t *testing.T) {
 
 	assert.Eventually(t, func() bool {
 		return fileSizeOrZero(capturePath) > sizeBefore
-	}, 5*time.Second, 100*time.Millisecond, "dump.pcapng must grow after the smoke request")
+	}, 5*time.Second, 100*time.Millisecond, "the capture must grow after the smoke request")
 	assert.Eventually(t, func() bool {
 		return execFileSize(sidecar, keylogPath) > 0
 	}, 5*time.Second, 100*time.Millisecond, "sslkeylog.log must gain the session's lines")
@@ -431,4 +573,96 @@ func TestPodDown_RetainDecisionTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// C13-C16 (AC 1, AC 4, AC 5, AC 6, AC 7, AC 37, at the boundary): a RETAIN=1
+// pod whose volume already holds a kept capture leaving 64 KiB of the default
+// --max-bytes. Capture stops at the limit with one WARN line, the app keeps
+// being served, the capture stops growing, the sidecar still stops cleanly,
+// and the stopped capture survives a plain pod-down.sh unchanged.
+func TestSmoke_CaptureStopsAtMaxBytesAndPodKeepsServing(t *testing.T) {
+	requireRootfulPodman(t)
+	requireInternetEgress(t)
+	const maxBytes = 104_857_600 // the sidecar's default --max-bytes
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-itlimit"
+	keptCaptureVolume(t, podName, maxBytes-64<<10)
+	podUpNoCleanup(t, podName, bin, "RETAIN=1")
+	dir := volumeMountpoint(t, podName)
+	capturePath := volumeCapturePath(t, podName)
+	require.NotEqual(t, "dump-1000000000.pcapng", filepath.Base(capturePath), "precondition: this run started its own capture")
+
+	stopped := func() bool { return len(logLines(sidecarLogs(t, podName), "capture stopped: --max-bytes reached")) > 0 }
+	for i := 0; i < 50 && !stopped(); i++ {
+		runSmoke(t, podName)
+	}
+	require.True(t, stopped(), "smoke.sh traffic must fill the 64 KiB left and stop capture")
+
+	// What was admitted before the stop is still written once its 1 s hold
+	// window passes (AC 3): measure only after that.
+	time.Sleep(2 * time.Second)
+	sizeAtStop := fileSizeOrZero(capturePath)
+	out := runSmoke(t, podName)
+	assert.Contains(t, out, "HTTP 200", "the app must still be served once capture has stopped (AC 5)")
+	time.Sleep(3 * time.Second)
+	assert.Equal(t, sizeAtStop, fileSizeOrZero(capturePath), "the stopped capture must not grow")
+	assert.LessOrEqual(t, ownedCaptureBytes(t, dir), int64(maxBytes), "the owned captures must total at most --max-bytes")
+
+	sidecar := podName + "-sidecar"
+	stopOut, err := exec.Command("podman", "stop", "-t", "30", sidecar).CombinedOutput() // #nosec G204 -- sidecar is a test-generated container name, not external input
+	require.NoError(t, err, "podman stop (SIGTERM): %s", stopOut)
+	assert.Equal(t, 0, inspectContainer(t, sidecar).State.ExitCode, "SIGTERM after the stop must end the sidecar with status 0 (AC 6)")
+	logs := sidecarLogs(t, podName)
+	assert.NotContains(t, logs, "app: shutdown failed")
+	warns := logLines(logs, "capture stopped: --max-bytes reached")
+	require.Len(t, warns, 1, "exactly one WARN line (AC 4)")
+	assert.Contains(t, warns[0], `"level":"WARN"`)
+	stats := logLines(logs, "stats")
+	require.NotEmpty(t, stats, "Close must log the final stats line")
+	assert.Contains(t, stats[len(stats)-1], `"capture_state":"stopped_max_bytes"`, "the final stats line must report the stop (AC 37)")
+	sum := fileSHA256(t, capturePath)
+
+	down := exec.Command("./pod-down.sh")
+	down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName)
+	downOut, err := down.CombinedOutput()
+	require.NoError(t, err, "a plain pod-down.sh: %s", downOut)
+	assert.Equal(t, sum, fileSHA256(t, capturePath), "the stopped capture must be kept byte for byte (AC 7)")
+}
+
+// C31 (AC 41, AC 17, at the boundary): a kept capture survives the next
+// RETAIN=1 pod on the same volume, which writes its own beside it.
+func TestPodDown_RetainedCaptureSurvivesNextRetainedPod(t *testing.T) {
+	requireRootfulPodman(t)
+	requireInternetEgress(t)
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-itkeep"
+	t.Cleanup(func() {
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName, "RETAIN=0")
+		_ = down.Run()
+	})
+	plainDown := func() {
+		t.Helper()
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName)
+		out, err := down.CombinedOutput()
+		require.NoError(t, err, "a plain pod-down.sh: %s", out)
+	}
+
+	podUpNoCleanup(t, podName, bin, "RETAIN=1")
+	runSmoke(t, podName)
+	plainDown()
+	dir := volumeMountpoint(t, podName)
+	first := volumeCaptures(t, dir)
+	require.Len(t, first, 1, "precondition: the first pod kept its capture")
+	firstSum := fileSHA256(t, filepath.Join(dir, first[0]))
+
+	podUpNoCleanup(t, podName, bin, "RETAIN=1")
+	runSmoke(t, podName)
+	plainDown()
+
+	captures := volumeCaptures(t, dir)
+	assert.Len(t, captures, 2, "the volume must hold both runs' captures: %v", captures)
+	assert.Contains(t, captures, first[0])
+	assert.Equal(t, firstSum, fileSHA256(t, filepath.Join(dir, first[0])), "the first capture must be unchanged byte for byte")
 }
