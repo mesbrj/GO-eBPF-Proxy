@@ -60,8 +60,12 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 
 	require.NoError(t, a.Close())
 
+	for _, name := range []string{"origdst_by_cookie", "origdst_by_tuple"} {
+		_, statErr := os.Stat(filepath.Join(pinDir, name))
+		assert.Truef(t, os.IsNotExist(statErr), "pin %s removed on close", name)
+	}
 	_, statErr := os.Stat(pinDir)
-	assert.True(t, os.IsNotExist(statErr), "connect4/sockops pins removed on close")
+	assert.NoError(t, statErr, "a pin dir that existed before Start is left in place")
 	_, statErr = os.Stat(cfg.CapturePath)
 	assert.True(t, os.IsNotExist(statErr), "default teardown (Retain=false) must wipe the capture directory")
 }

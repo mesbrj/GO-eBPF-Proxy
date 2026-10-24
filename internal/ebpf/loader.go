@@ -3,6 +3,7 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,10 @@ type Loader struct {
 	objs   bpf.ProxyObjects
 	links  []link.Link
 	pinDir string
+	// ownsPinDir records that Load created pinDir. Close removes only what
+	// Load created: a pre-provisioned pin dir (pod-up.sh creates it as root,
+	// under the root-owned bpffs root the sidecar's UID cannot write) stays.
+	ownsPinDir bool
 }
 
 // Load loads and pins the eBPF objects. It does not attach; call Attach next.
@@ -76,6 +81,8 @@ func Load(cfg Config) (*Loader, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("ebpf: remove memlock: %w", err)
 	}
+	_, statErr := os.Stat(cfg.PinDir)
+	ownsPinDir := errors.Is(statErr, fs.ErrNotExist)
 	if err := os.MkdirAll(cfg.PinDir, 0o700); err != nil {
 		return nil, fmt.Errorf("ebpf: create pin dir: %w", err)
 	}
@@ -85,7 +92,7 @@ func Load(cfg Config) (*Loader, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("ebpf: load objects: %w", err)
 	}
-	return &Loader{objs: objs, pinDir: cfg.PinDir}, nil
+	return &Loader{objs: objs, pinDir: cfg.PinDir, ownsPinDir: ownsPinDir}, nil
 }
 
 // Attach binds connect4 and sockops to the given cgroup v2 path.
@@ -117,7 +124,8 @@ func (l *Loader) OrigDstByTuple() *ciliumebpf.Map {
 	return l.objs.OrigdstByTuple
 }
 
-// Close detaches the programs, closes the objects, and removes the pins.
+// Close detaches the programs, unpins the maps, closes the objects, and
+// removes the pin dir if Load created it.
 func (l *Loader) Close() error {
 	var errs []error
 	for _, lk := range l.links {
@@ -126,11 +134,16 @@ func (l *Loader) Close() error {
 		}
 	}
 	l.links = nil
+	for _, m := range []*ciliumebpf.Map{l.objs.OrigdstByCookie, l.objs.OrigdstByTuple} {
+		if err := m.Unpin(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := l.objs.Close(); err != nil {
 		errs = append(errs, err)
 	}
-	if l.pinDir != "" {
-		if err := os.RemoveAll(l.pinDir); err != nil {
+	if l.ownsPinDir {
+		if err := os.Remove(l.pinDir); err != nil {
 			errs = append(errs, err)
 		}
 	}
