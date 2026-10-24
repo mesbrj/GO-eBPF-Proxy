@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -585,4 +586,109 @@ func TestApp_CaptureStartLogsInfoWithPath(t *testing.T) {
 	assert.FileExists(t, a.capW.Path())
 	assert.Equal(t, dir, filepath.Dir(a.capW.Path()))
 	assert.Regexp(t, `^dump-[0-9]+\.pcapng$`, filepath.Base(a.capW.Path()))
+}
+
+// keylogLine returns a valid NSS keylog line, distinct for each b.
+func keylogLine(b byte) string {
+	return "CLIENT_RANDOM " + strings.Repeat(fmt.Sprintf("%02x", b), 32) + " " + strings.Repeat("cd", 48)
+}
+
+// withKeylog points cfg's keylog socket and file at a fresh temp directory.
+// The socket sits in a not-yet-created subdirectory, so the keylog server
+// creates it 0711 itself (see statsApp).
+func withKeylog(t *testing.T, cfg Config) Config {
+	t.Helper()
+	dir := t.TempDir()
+	cfg.KeylogSocketPath = filepath.Join(dir, "sock", "keylog.sock")
+	cfg.KeylogPath = filepath.Join(dir, "keylog", "sslkeylog.log")
+	return cfg
+}
+
+// sendKeylogLines writes lines over a's keylog socket, then one malformed
+// line, and waits until the server has counted it: every line sent before it
+// has then been handled.
+func sendKeylogLines(t *testing.T, a *App, lines ...string) {
+	t.Helper()
+	rejected := a.keylogSrv.RejectedCount()
+	conn, err := net.Dial("unix", a.cfg.KeylogSocketPath)
+	require.NoError(t, err)
+	_, err = io.WriteString(conn, strings.Join(append(lines, "not an NSS keylog line"), "\n")+"\n")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.Eventually(t, func() bool { return a.keylogSrv.RejectedCount() == rejected+1 }, 2*time.Second, 10*time.Millisecond,
+		"the keylog server must handle every line sent")
+}
+
+// captureSecrets returns the NSS lines in every Decryption Secrets Block of
+// the capture at path, in file order. A pcapng block is {type, total length,
+// body, total length}, and a DSB body is {secrets type, secrets length,
+// data}.
+func captureSecrets(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	var lines []string
+	for len(raw) >= 12 {
+		typ, n := binary.LittleEndian.Uint32(raw[0:4]), binary.LittleEndian.Uint32(raw[4:8])
+		require.True(t, n >= 12 && int(n) <= len(raw), "malformed pcapng block in %s", path)
+		if typ == 0x0000000a {
+			data := raw[16 : 16+binary.LittleEndian.Uint32(raw[12:16])]
+			lines = append(lines, strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")...)
+		}
+		raw = raw[n:]
+	}
+	return lines
+}
+
+// C39 (AC 25, across the socket): a valid keylog line sent over the real unix
+// socket reaches the keylog file and a DSB of the capture only while capture
+// is active.
+func TestApp_KeylogFollowsCaptureState(t *testing.T) {
+	const maxBytes = 10_000
+	for _, tc := range []struct {
+		state capture.State
+		owned int64 // a finished capture already in the directory
+		fill  bool  // write until capture stops
+		kept  bool
+	}{
+		{capture.StateActive, 0, false, true},
+		{capture.StateStoppedMaxBytes, 0, true, false},
+		{capture.StateNotStartedMaxBytes, maxBytes, false, false},
+	} {
+		t.Run(tc.state.String(), func(t *testing.T) {
+			dir := captureDir(t)
+			if tc.owned > 0 {
+				plantCapture(t, dir, "dump-1000000000.pcapng", tc.owned, time.Now())
+			}
+			cfg := withKeylog(t, captureConfig(dir, maxBytes, 0))
+			cfg.Retain = true // keep this run's capture to read it after Close
+			a, _ := captureApp(t, cfg)
+			require.NoError(t, a.openCapture())
+			if tc.fill {
+				fillCapture(t, a)
+			}
+			require.Equal(t, tc.state, a.captureState(), "precondition")
+			require.NoError(t, a.startKeylog())
+
+			line := keylogLine(0x01)
+			sendKeylogLines(t, a, line)
+			keylog, err := os.ReadFile(cfg.KeylogPath)
+			require.NoError(t, err)
+			run := ""
+			if a.capW != nil {
+				run = a.capW.Path()
+			}
+			require.NoError(t, a.Close())
+
+			if tc.kept {
+				assert.Equal(t, line+"\n", string(keylog), "an active capture's line must be appended to the keylog file")
+				assert.Equal(t, []string{line}, captureSecrets(t, run), "an active capture's line must be written in a DSB")
+				return
+			}
+			assert.Empty(t, string(keylog), "the line must not be appended to the keylog file")
+			if run != "" {
+				assert.Empty(t, captureSecrets(t, run), "the line must not be written in the capture")
+			}
+		})
+	}
 }

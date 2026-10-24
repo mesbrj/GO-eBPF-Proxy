@@ -116,22 +116,10 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 		_ = a.Close()
 		return nil, err
 	}
-	var sink func(line string)
-	if a.capW != nil {
-		sink = a.capW.AddSecret
-	}
-
-	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
-		SocketPath: cfg.KeylogSocketPath,
-		KeylogPath: cfg.KeylogPath,
-		Sink:       sink,
-	}, keylog.WithLogger(log))
-	if err != nil {
+	if err := a.startKeylog(); err != nil {
 		_ = a.Close()
-		return nil, fmt.Errorf("app: start keylog socket server: %w", err)
+		return nil, err
 	}
-	a.keylogSrv = keylogSrv
-	go func() { _ = keylogSrv.Run() }()
 
 	if a.capW != nil {
 		live, err := capture.StartLive(cfg.CaptureIface, a.capW)
@@ -192,6 +180,30 @@ func (a *App) openCapture() error {
 	return nil
 }
 
+// startKeylog starts the keylog socket server, streaming every line it
+// appends into this run's capture. Its keylog follows the capture (AD-023):
+// it appends lines only while capture is active, and once capture has
+// stopped, or when it never started, it reads and discards them, so the app
+// never blocks.
+func (a *App) startKeylog() error {
+	var sink func(line string)
+	if a.capW != nil {
+		sink = a.capW.AddSecret
+	}
+	srv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
+		SocketPath: a.cfg.KeylogSocketPath,
+		KeylogPath: a.cfg.KeylogPath,
+		Sink:       sink,
+		Gate:       a.captureActive,
+	}, keylog.WithLogger(a.log))
+	if err != nil {
+		return fmt.Errorf("app: start keylog socket server: %w", err)
+	}
+	a.keylogSrv = srv
+	go func() { _ = srv.Run() }()
+	return nil
+}
+
 // logCaptureStop logs the one WARN line of a capture stopped at --max-bytes
 // (AC 4). owned_bytes is what the finished captures took of --max-bytes, plus
 // this run's capture.
@@ -211,6 +223,12 @@ func (a *App) captureState() capture.State {
 		return capture.StateNotStartedMaxBytes
 	}
 	return a.capW.State()
+}
+
+// captureActive reports whether this run's capture is active: the keylog's
+// gate. It takes no lock, so it is cheap on every keylog line.
+func (a *App) captureActive() bool {
+	return a.captureState() == capture.StateActive
 }
 
 // enforceRetentionPeriodically bounds the capture directory's footprint

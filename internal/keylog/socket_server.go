@@ -27,6 +27,10 @@ type SocketServerConfig struct {
 	// Sink, if set, receives every line the keylog Writer appends (see
 	// WithSink).
 	Sink func(line string)
+	// Gate, if set, makes the keylog Writer discard every valid line while
+	// it reports false (see WithGate). The server still reads and counts
+	// every line, so a client never blocks on a closed gate.
+	Gate func() bool
 }
 
 // ErrWorldAccessibleSocketDir is returned when the socket's parent directory
@@ -91,7 +95,7 @@ func NewSocketServer(cfg SocketServerConfig, opts ...SocketServerOption) (*Socke
 		return nil, fmt.Errorf("keylog: chmod socket %q: %w", cfg.SocketPath, err)
 	}
 
-	w, err := NewWriter(cfg.KeylogPath, WithSink(cfg.Sink))
+	w, err := NewWriter(cfg.KeylogPath, WithSink(cfg.Sink), WithGate(cfg.Gate))
 	if err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("keylog: open keylog writer: %w", err)

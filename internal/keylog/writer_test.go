@@ -138,3 +138,52 @@ func TestWriter_ConcurrentWritesSerialised(t *testing.T) {
 		assert.NoError(t, ValidateLine(l), "no interleaved/corrupted line")
 	}
 }
+
+// C38 (AC 25): while its gate is closed, Append takes a valid new line
+// without error but neither writes it to the keylog file nor hands it to the
+// sink. Once the gate opens, the same line is appended and sunk.
+func TestWriter_DiscardingAppendsNothingAndSinksNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sslkeylog.log")
+	var sunk []string
+	open := false
+	w, err := NewWriter(path,
+		WithSink(func(line string) { sunk = append(sunk, line) }),
+		WithGate(func() bool { return open }),
+	)
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+	line := sampleLine(0x07)
+
+	require.NoError(t, w.Append(line), "a discarded valid line is not an error")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "a closed gate must leave the keylog file's size unchanged")
+	assert.Empty(t, sunk, "a closed gate must not call the sink")
+
+	open = true
+	require.NoError(t, w.Append(line))
+	content, err := os.ReadFile(path) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	assert.Equal(t, line+"\n", string(content), "an open gate must append the line")
+	assert.Equal(t, []string{line}, sunk, "an open gate must sink the line")
+}
+
+// C41 (AC 27): lines discarded while the gate is closed never enter the
+// duplicate set, so it stays the size it had when the gate closed.
+func TestWriter_DiscardingAddsNothingToDedupSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sslkeylog.log")
+	open := true
+	w, err := NewWriter(path, WithGate(func() bool { return open }))
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+	require.NoError(t, w.Append(sampleLine(0xFF)))
+	before := len(w.seen)
+	require.Equal(t, 1, before, "precondition: the line appended while open is in the set")
+
+	open = false
+	for i := range 100 {
+		require.NoError(t, w.Append(sampleLine(byte(i)))) // #nosec G115 -- i < 100, well within byte range
+	}
+
+	assert.Equal(t, before, len(w.seen), "100 distinct lines discarded while closed must not grow the duplicate set")
+}

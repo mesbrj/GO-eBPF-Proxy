@@ -35,7 +35,9 @@ socket layer, and TLS keys read passively from the process that already holds th
    secrets as the app's own libssl derives them, and ships each line over a Unix domain
    socket to the sidecar.
 5. The sidecar's socket server reads those lines, validates and deduplicates them, and
-   writes them as an NSS keylog (on tmpfs, `0600`/`0700`).
+   writes them as an NSS keylog (on tmpfs, `0600`/`0700`). It keeps them only while
+   capture runs: once capture stops, it still reads every line, so the app never waits,
+   and discards it.
 6. The sidecar also captures the relay's outbound leg to a pcapng file, in-process
    (gopacket reading an `AF_PACKET` socket — no libpcap or external capture tool).
    Each key line is written into it as a Decryption Secrets Block as soon as it arrives,

@@ -3,6 +3,8 @@ package keylog
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -166,4 +168,77 @@ func TestSocketServer_RefusesWorldWritableSocketDir(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrWorldAccessibleSocketDir), "must refuse a world-writable socket directory")
+}
+
+// discardingSocketServer starts a SocketServer like newTestSocketServer, but
+// with its keylog gate closed for good: every valid line is discarded.
+func discardingSocketServer(t *testing.T) (*SocketServer, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "sock", "keylog.sock")
+	keylogPath := filepath.Join(dir, "sslkeylog.log")
+	s, err := NewSocketServer(SocketServerConfig{
+		SocketPath: sockPath,
+		KeylogPath: keylogPath,
+		Gate:       func() bool { return false },
+	})
+	require.NoError(t, err)
+	go func() { _ = s.Run() }()
+	t.Cleanup(func() { _ = s.Close() })
+	return s, sockPath, keylogPath
+}
+
+// C40 (AC 26): while discarding, the server keeps reading, so 1,000 lines on
+// one connection never block the writer, and it keeps accepting: a second
+// connection is then served. A malformed line sent last on each connection
+// proves the server read up to it.
+func TestSocketServer_DiscardingKeepsReadingAndAccepting(t *testing.T) {
+	s, sockPath, keylogPath := discardingSocketServer(t)
+
+	conn, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(5*time.Second)))
+	for i := range 1000 {
+		line := "CLIENT_RANDOM " + fmt.Sprintf("%064x", i) + " " + strings.Repeat("cd", 48)
+		_, err := io.WriteString(conn, line+"\n")
+		require.NoError(t, err, "line %d must be written within the 5 s deadline", i)
+	}
+	_, err = io.WriteString(conn, "not an NSS keylog line\n")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	require.Eventually(t, func() bool { return s.RejectedCount() == 1 }, 5*time.Second, 5*time.Millisecond,
+		"the server must read through all 1,000 lines to the malformed one after them")
+
+	second, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	_, err = io.WriteString(second, "not an NSS keylog line\n")
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
+	require.Eventually(t, func() bool { return s.RejectedCount() == 2 }, 5*time.Second, 5*time.Millisecond,
+		"a second connection must be accepted and served")
+
+	info, err := os.Stat(keylogPath)
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "every valid line must have been discarded")
+}
+
+// C42 (AC 28): while discarding, a malformed line is still rejected and
+// counted; only valid lines are discarded.
+func TestSocketServer_DiscardingStillCountsMalformedLines(t *testing.T) {
+	s, sockPath, keylogPath := discardingSocketServer(t)
+
+	conn, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	valid := wellFormedLine()
+	_, err = io.WriteString(conn, valid+"\nnot an NSS keylog line\n"+valid+"\nNOT_A_VALID_LINE too short\n")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	// The second malformed line is the last one sent, so once it is counted
+	// every line has been handled.
+	require.Eventually(t, func() bool { return s.RejectedCount() >= 2 }, 2*time.Second, 5*time.Millisecond)
+	assert.Equal(t, int64(2), s.RejectedCount(), "each malformed line must be counted exactly once")
+	info, err := os.Stat(keylogPath)
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "the valid lines must have been discarded")
 }
