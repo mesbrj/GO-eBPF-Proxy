@@ -340,6 +340,19 @@ func TestRetention_OwnedNameRefusesEveryNearMiss(t *testing.T) {
 	)
 }
 
+// C73 (door 2): an owned name with the largest suffix door 1 creates is an
+// owned capture: it is counted and aged out. A name with a hex suffix, the
+// extension in another case, the extension repeated or the stem repeated is
+// not: it is neither counted nor aged out.
+func TestRetention_OwnedNameAcceptsLongSuffixAndRefusesRepeatsAndCase(t *testing.T) {
+	assertOnlyControlIsOwned(t, "dump-1700000000-999.pcapng",
+		"dump-1700000000-a.pcapng",      // a hex suffix
+		"dump-1700000000.PCAPNG",        // the extension in another case
+		"dump-1700000000.pcapng.pcapng", // a repeated extension
+		"dumpdump-1700000000.pcapng",    // a repeated stem
+	)
+}
+
 // C29 (AC 20, AC 45): teardown deletes this run's capture and nothing else,
 // and with Retain it deletes nothing, leaving the capture byte for byte.
 func TestRetention_CleanupDeletesOnlyThisRunsCapture(t *testing.T) {
