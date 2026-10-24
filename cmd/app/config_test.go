@@ -74,6 +74,22 @@ func TestDefaultConfig_KeylogPathIsTheHarnessTmpfs(t *testing.T) {
 	assert.Equal(t, "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log", DefaultConfig().KeylogPath)
 }
 
+// C65 (AC 46): --retain's help says what it keeps -- this run's capture,
+// which carries its own TLS secrets -- and that the keylog is never kept.
+func TestLoadConfig_RetainHelpSaysOnlyTheCaptureIsKept(t *testing.T) {
+	t.Parallel()
+
+	fs := flag.NewFlagSet("app", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_, err := loadConfig(fs, nil, nil)
+	require.NoError(t, err)
+
+	retain := fs.Lookup("retain")
+	require.NotNil(t, retain, "--retain must be registered")
+	assert.Contains(t, retain.Usage, "this run's capture")
+	assert.Contains(t, retain.Usage, "the keylog is never kept")
+}
+
 func TestLoadConfig_NoSourcesYieldsDefaults(t *testing.T) {
 	t.Parallel()
 

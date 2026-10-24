@@ -47,7 +47,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.String("keylog-path", d.KeylogPath, "path to the NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start")
 	fs.String("capture-iface", d.CaptureIface, "interface to capture the outbound leg from")
 	fs.String("capture-path", d.CapturePath, "template for each run's DSB-embedded pcapng capture: a run writes <stem>-<unix start second><ext> in its directory, never overwriting a file")
-	fs.Bool("retain", d.Retain, "keep capture/keylog artifacts on teardown instead of wiping them")
+	fs.Bool("retain", d.Retain, "keep this run's capture, with its embedded TLS secrets, on teardown instead of deleting it; the keylog is never kept")
 	fs.Int64("max-bytes", d.MaxBytes, "size limit in bytes on the captures in the capture directory, this run's included: reaching it stops capture and keeps the file (0 disables)")
 	fs.Duration("max-age", d.MaxAge, "age past which finished captures are deleted, never the live one (0 disables)")
 	fs.Duration("retention-interval", d.RetentionTick, "how often to enforce retention while running (0 disables)")

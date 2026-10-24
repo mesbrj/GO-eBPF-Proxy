@@ -44,7 +44,8 @@ KEYLOG_SOCKET="$KEYLOG_DIR/keylog.sock"
 # RETAIN must be decided at sidecar startup, not at pod-down.sh time: the
 # app's own --retain flag (cmd/app/main.go) controls whether its graceful
 # shutdown (App.Close -> capture.Retention.Cleanup) deletes this run's capture
-# from /var/log/sidecar. pod-down.sh's own --retain only decides whether to
+# from /var/log/sidecar. It never keeps the keylog: App.Close deletes that
+# either way. pod-down.sh's own --retain only decides whether to
 # remove the podman VOLUME itself -- without also passing --retain here, the
 # app always deletes its capture on shutdown regardless of what pod-down.sh
 # does with the volume. The choice is also

@@ -214,7 +214,7 @@ you:
 | `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start. It holds one run's keys: the sidecar deletes it when it starts and when it stops |
 | `--capture-iface` | `eth0` | Interface to capture the outbound leg from |
 | `--capture-path` | `/var/log/sidecar/dump.pcapng` | Template for each run's DSB-embedded pcapng capture: a run writes `dump-<epoch>.pcapng` (its start time in Unix seconds, then `-1`, `-2`, … if taken) in that directory, never overwriting a file |
-| `--retain` | `false` | Keep the capture and keylog on teardown instead of wiping them |
+| `--retain` | `false` | Keep this run's capture, with its embedded TLS secrets, on teardown instead of deleting it; the keylog is never kept |
 | `--max-bytes` | `104857600` (100 MiB) | Size limit on the captures in the capture directory, this run's included: reaching it stops capture and keeps the file, while the relay keeps serving the app; a run that finds it already reached starts without capture. Nothing is deleted for size; `0` disables it |
 | `--max-age` | `24h` | Each retention pass deletes finished captures older than this, never the running capture or any other file; `0` disables it |
 | `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
