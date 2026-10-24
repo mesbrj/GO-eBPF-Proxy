@@ -3,6 +3,8 @@ AGENTS.md
 .agents
 .github
 .claude
+.cursor
+.windsurf
 .mcp.json
 .specs
 skills-lock.json
