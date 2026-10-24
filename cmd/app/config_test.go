@@ -90,6 +90,22 @@ func TestLoadConfig_RetainHelpSaysOnlyTheCaptureIsKept(t *testing.T) {
 	assert.Contains(t, retain.Usage, "the keylog is never kept")
 }
 
+// C67 (AC 46): --retain's help says the kept capture carries its embedded TLS
+// secrets, which is how an operator learns it is plaintext-equivalent
+// (AD-006).
+func TestLoadConfig_RetainHelpSaysTheCaptureCarriesItsSecrets(t *testing.T) {
+	t.Parallel()
+
+	fs := flag.NewFlagSet("app", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_, err := loadConfig(fs, nil, nil)
+	require.NoError(t, err)
+
+	retain := fs.Lookup("retain")
+	require.NotNil(t, retain, "--retain must be registered")
+	assert.Contains(t, retain.Usage, "with its embedded TLS secrets")
+}
+
 func TestLoadConfig_NoSourcesYieldsDefaults(t *testing.T) {
 	t.Parallel()
 
