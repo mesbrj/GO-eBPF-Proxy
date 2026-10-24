@@ -6,9 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
@@ -195,9 +193,10 @@ func (a *App) logStats() {
 	)
 }
 
-// Close embeds the final keylog into the capture as a DSB, stops every
-// subsystem, and -- unless Config.Retain is set -- wipes the capture
-// directory (ephemeral-by-default teardown).
+// Close stops every subsystem -- the capture is drained and closed, never
+// rewritten: its secrets are already in the DSBs written live (AD-022) -- and,
+// unless Config.Retain is set, wipes the capture directory
+// (ephemeral-by-default teardown).
 func (a *App) Close() error {
 	var errs []error
 	if a.stopTick != nil {
@@ -212,15 +211,12 @@ func (a *App) Close() error {
 	}
 	if a.live != nil {
 		// Stop waits for the packet-reading goroutine to exit, so it must
-		// return before capW is touched: otherwise EmbedKeylog/capW.Close
-		// below can race with a concurrent capW.WritePacket call in that
-		// goroutine (data race on capW's internal bufio.Writer).
+		// return before capW is touched: otherwise capW.Close below can race
+		// with a concurrent capW.WritePacket call in that goroutine (data
+		// race on capW's internal bufio.Writer).
 		errs = append(errs, a.live.Stop())
 	}
 	if a.capW != nil {
-		if lines, err := readKeylogLines(a.cfg.KeylogPath); err == nil {
-			errs = append(errs, a.capW.EmbedKeylog(lines))
-		}
 		errs = append(errs, a.capW.Close())
 	}
 	if a.keylogSrv != nil {
@@ -271,20 +267,4 @@ func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
 			log.Warn("upstream dial failed", slog.String("orig_dst", dst.String()), slog.String("error", err.Error()))
 		}),
 	)
-}
-
-// readKeylogLines reads the keylog file's non-empty lines for embedding as a
-// pcapng Decryption Secrets Block.
-func readKeylogLines(path string) ([]string, error) {
-	data, err := os.ReadFile(path) // #nosec G304 G703 -- operator-supplied config path (flag, env var or config file), not raw user input
-	if err != nil {
-		return nil, err
-	}
-	var lines []string
-	for _, l := range strings.Split(string(data), "\n") {
-		if l != "" {
-			lines = append(lines, l)
-		}
-	}
-	return lines, nil
 }

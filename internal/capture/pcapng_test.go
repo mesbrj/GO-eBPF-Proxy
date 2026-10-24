@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -131,26 +132,25 @@ func TestWriter_DefaultsTimestampToInjectedClock(t *testing.T) {
 	assert.True(t, ci.Timestamp.UTC().Equal(want), "zero timestamp must be stamped from the injected clock")
 }
 
-// UT-03.1: EmbedKeylog's NSS lines land in the pcapng file as a Decryption
-// Secrets Block, and packets written on either side of the call still read
-// back correctly -- embedding never costs a packet, wherever in the session
-// the keylog happens to be handed over.
-func TestWriter_EmbedKeylog_PayloadPresentAndPacketsIntact(t *testing.T) {
+// UT-03.1: a line handed to AddSecret lands in the closed pcapng file as a
+// Decryption Secrets Block, and packets written on either side of it still
+// read back correctly -- a secret never costs a packet, wherever in the
+// session it is handed over. (Was the keylog-embedding API's test; AD-022
+// removed that API, so the claim now holds for the live path, the only one
+// left.)
+func TestWriter_AddSecret_PayloadPresentAndPacketsIntact(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	w, err := NewWriter(path, Options{})
 	require.NoError(t, err)
 
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0xaa}))
-	lines := []string{
-		"CLIENT_RANDOM " + string(make([]byte, 64)) + " " + string(make([]byte, 96)),
-	}
-	require.NoError(t, w.EmbedKeylog(lines))
+	w.AddSecret(nssKeylogLine)
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0xbb}))
 	require.NoError(t, w.Close())
 
 	raw, err := os.ReadFile(path) // #nosec G304 -- test-controlled temp path
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), lines[0], "embedded DSB payload must be present in the file")
+	assert.Equal(t, []string{nssKeylogLine + "\n"}, secretsPayloads(raw), "the line must be in the file as a DSB payload")
 
 	f, err := os.Open(path) // #nosec G304 -- test-controlled temp path
 	require.NoError(t, err)
@@ -160,21 +160,24 @@ func TestWriter_EmbedKeylog_PayloadPresentAndPacketsIntact(t *testing.T) {
 
 	data1, _, err := r.ReadPacketData()
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0xaa}, data1, "packet before the DSB must still read back intact")
+	assert.Equal(t, []byte{0xaa}, data1, "packet written before the secret must still read back intact")
 	data2, _, err := r.ReadPacketData()
 	require.NoError(t, err)
-	assert.Equal(t, []byte{0xbb}, data2, "packet after the DSB must still read back intact")
+	assert.Equal(t, []byte{0xbb}, data2, "packet written after the secret must still read back intact")
 }
 
-// Edge case: embedding no lines is a no-op, not an error.
-func TestWriter_EmbedKeylog_EmptyIsNoop(t *testing.T) {
+// Edge case: an empty line adds nothing -- no Decryption Secrets Block, live
+// or at Close. (Was the keylog-embedding API's empty-is-noop test.)
+func TestWriter_AddSecret_EmptyLineWritesNoSecretsBlock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	w, err := NewWriter(path, Options{})
 	require.NoError(t, err)
-	defer func() { _ = w.Close() }()
 
-	assert.NoError(t, w.EmbedKeylog(nil))
-	assert.NoError(t, w.EmbedKeylog([]string{}))
+	w.AddSecret("")
+	time.Sleep(2 * flushInterval) // a stray DSB would have been drained by now
+	require.NoError(t, w.Close())
+
+	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB}, pcapngBlockTypes(t, path))
 }
 
 // liveBound is how stale the on-disk capture may be while the sidecar runs
@@ -254,8 +257,10 @@ func TestWriter_LiveSecretPrecedesPacketsStillHeld(t *testing.T) {
 	}
 }
 
-// AC 5, AC 9: a live DSB carries exactly the lines handed over since the last
-// drain, newline-terminated, and a line handed over twice is written once.
+// AC 5: a live DSB carries exactly the lines handed over since the last
+// drain, newline-terminated, and a drained line is never written again.
+// Duplicates never reach the Writer: keylog.Writer drops them before its sink
+// (feature 07 C35), so the Writer keeps no set of the lines it has seen.
 func TestWriter_LiveSecretsWrittenOnceEach(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))})
@@ -264,10 +269,8 @@ func TestWriter_LiveSecretsWrittenOnceEach(t *testing.T) {
 
 	first, second := keylogLine(1), keylogLine(2)
 	w.AddSecret(first)
-	w.AddSecret(first)
 	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeDSB) == 1 }, liveBound, 20*time.Millisecond)
 	w.AddSecret(second)
-	w.AddSecret(first)
 	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeDSB) == 2 }, liveBound, 20*time.Millisecond)
 
 	time.Sleep(2 * flushInterval) // a stray third DSB would have been drained by now
@@ -365,10 +368,12 @@ func TestWriter_CloseWritesEveryHeldPacket(t *testing.T) {
 	assert.Equal(t, want, readPackets(t, path), "Close must write every held packet, in order")
 }
 
-// AC 9 / door 3: after Close the capture is exactly SHB -> IDB -> one DSB ->
-// packets, even when its secrets were also written live along the way. The
-// live DSBs are dropped, so no secret appears twice.
-func TestWriter_CloseLeavesOneSecretsBlockWithEachLineOnce(t *testing.T) {
+// Door 3 (feature 07, AD-022): after Close the capture keeps its live layout
+// -- each DSB where the drain wrote it, ahead of the packets held when its
+// lines arrived -- and each line once. Close drains the tail the same way.
+// (Supersedes feature 06 C11, which required the single leading DSB of
+// AD-014's re-emission.)
+func TestWriter_CloseKeepsTheLiveLayoutWithEachLineOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	clock := newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	w, err := NewWriter(path, Options{Clock: clock})
@@ -382,22 +387,112 @@ func TestWriter_CloseLeavesOneSecretsBlockWithEachLineOnce(t *testing.T) {
 		"precondition: the first secret and packet are written live")
 
 	w.AddSecret(second)
-	w.AddSecret(first)
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xbb}))
-	require.NoError(t, w.EmbedKeylog([]string{first, second}))
 	require.NoError(t, w.Close())
 
 	raw := readFile(t, path)
-	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB, blockTypeEPB}, blockTypes(raw),
-		"a closed capture must be laid out SHB -> IDB -> DSB -> packets; block sequence was %s", blockNames(blockTypes(raw)))
-	assert.Equal(t, []string{first + "\n" + second + "\n"}, secretsPayloads(raw), "the one DSB must hold each distinct line once")
+	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB, blockTypeDSB, blockTypeEPB}, blockTypes(raw),
+		"a closed capture must keep the live layout; block sequence was %s", blockNames(blockTypes(raw)))
+	assert.Equal(t, []string{first + "\n", second + "\n"}, secretsPayloads(raw), "each DSB must hold the lines of its own drain, each once")
 	assert.Equal(t, [][]byte{{0xaa}, {0xbb}}, packetPayloads(raw))
 }
 
-// AC 5, AC 8: the capture goroutine, many keylog connections and the
+// C32 (AC 21, door 3): Close never rewrites the capture. The closed file is
+// the very inode written live, it begins with exactly the bytes that were on
+// disk before Close, it still holds every live DSB, and nothing else -- no
+// temporary copy -- is left in the directory.
+func TestWriter_CloseNeverRewritesTheFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sidecar")
+	path := filepath.Join(dir, "dump.pcapng")
+	clock := newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))
+	w, err := NewWriter(path, Options{Clock: clock})
+	require.NoError(t, err)
+
+	lines := []string{keylogLine(1), keylogLine(2), keylogLine(3)}
+	for i, line := range lines[:2] {
+		w.AddSecret(line)
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{byte(0xa0 + i), 0x01}))
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{byte(0xa0 + i), 0x02}))
+		clock.Advance(holdWindow)
+		require.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 2*(i+1) }, liveBound, 20*time.Millisecond,
+			"precondition: drain %d writes its secret and packets live", i+1)
+	}
+	// A tail for Close to drain: a secret and a packet still held.
+	w.AddSecret(lines[2])
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xa2, 0x01}))
+
+	live := readFile(t, path)
+	liveInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, countBlocks(live, blockTypeDSB), 2, "precondition: both live DSBs are on disk before Close")
+
+	require.NoError(t, w.Close())
+
+	closed := readFile(t, path)
+	require.GreaterOrEqual(t, len(closed), len(live))
+	assert.Equal(t, live, closed[:len(live)], "the closed file must begin with exactly the bytes on disk before Close")
+	assert.Equal(t, []string{lines[0] + "\n", lines[1] + "\n", lines[2] + "\n"}, secretsPayloads(closed),
+		"the live DSBs must survive Close, followed by the one Close drained")
+	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB, blockTypeEPB, blockTypeDSB, blockTypeEPB, blockTypeEPB, blockTypeDSB, blockTypeEPB},
+		blockTypes(closed), "block sequence was %s", blockNames(blockTypes(closed)))
+
+	closedInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(liveInfo, closedInfo), "Close must not replace the capture with another file")
+	assert.Equal(t, []string{"dump.pcapng"}, dirNames(t, dir), "Close must leave no other file beside the capture")
+}
+
+// C33 (AC 21): Close never reopens the capture by name, so a capture unlinked
+// while live -- the reproduced retention eviction -- still closes cleanly,
+// and Close does not bring it back.
+func TestWriter_CloseSucceedsAfterFileUnlinked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0x01}))
+	w.AddSecret(nssKeylogLine)
+	require.NoError(t, os.Remove(path))
+
+	assert.NoError(t, w.Close(), "Close must succeed on a capture unlinked while live")
+	assert.Empty(t, dirNames(t, dir), "Close must not recreate the capture or leave any other file")
+}
+
+// C37 (AC 24): the Writer keeps a keylog line only until the drain that writes
+// it. Checked over the struct by reflection, so a field added later to keep
+// lines around -- a slice of every line, a dedup set -- fails here too.
+func TestWriter_KeepsNoLineAfterItsDrain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	const lines = 100
+	for n := range lines {
+		w.AddSecret(keylogLine(n))
+	}
+	require.Eventually(t, func() bool { return len(payloadLines(secretsPayloads(readFile(t, path)))) == lines }, liveBound, 20*time.Millisecond,
+		"precondition: every line is drained into the file")
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	v := reflect.ValueOf(w).Elem()
+	for i := range v.NumField() {
+		field, f := v.Type().Field(i), v.Field(i)
+		switch {
+		case f.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.String:
+			assert.Zero(t, f.Len(), "[]string field %s still holds lines after their drain", field.Name)
+		case f.Kind() == reflect.Map && field.Type.Key().Kind() == reflect.String:
+			assert.Zero(t, f.Len(), "map field %s still holds lines after their drain", field.Name)
+		}
+	}
+}
+
+// C35 (AC 22), AC 8: the capture goroutine, many keylog connections and the
 // periodic drain all reach the Writer at once in the sidecar. Run under
 // -race, this must report no race, and the closed capture must hold every
-// packet in order and every line.
+// packet in order, and each line in exactly one of its live DSBs.
 func TestWriter_ConcurrentPacketsAndSecretsAreRaceFree(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	w, err := NewWriter(path, Options{})
@@ -432,32 +527,39 @@ func TestWriter_ConcurrentPacketsAndSecretsAreRaceFree(t *testing.T) {
 		assert.Equal(t, fmt.Sprintf("pkt-%03d", i), string(data), "packet %d out of order", i)
 	}
 	payloads := secretsPayloads(readFile(t, path))
-	require.Len(t, payloads, 1)
-	lines := strings.Split(strings.TrimSuffix(payloads[0], "\n"), "\n")
-	assert.Len(t, lines, senders*linesPerSender)
+	require.NotEmpty(t, payloads)
+	dsbsHolding := make(map[string]int)
+	for _, payload := range payloads {
+		for _, line := range payloadLines([]string{payload}) {
+			dsbsHolding[line]++
+		}
+	}
+	assert.Len(t, dsbsHolding, senders*linesPerSender, "the DSBs must hold exactly the lines handed over")
 	for n := range senders * linesPerSender {
-		assert.Contains(t, lines, keylogLine(n))
+		assert.Equal(t, 1, dsbsHolding[keylogLine(n)], "line %d must appear in exactly one DSB, once", n)
 	}
 }
 
-// CAPTURE-04/CAPTURE-11 regression: an embedded keylog is only usable if its
+// CAPTURE-04/CAPTURE-11 regression: an embedded secret is only usable if its
 // Decryption Secrets Block PRECEDES the packet blocks it decrypts. pcapng
 // scopes a DSB to the blocks that follow it, and tshark/Wireshark consume a
 // capture strictly sequentially -- so a DSB emitted as the file's last block
-// (which is what appending it at Close produced) is read only after every
-// encrypted packet has already been dissected, and the advertised
+// (which is what appending it at Close once produced) is read only after
+// every encrypted packet has already been dissected, and the advertised
 // "self-decrypting capture" decrypts nothing whatsoever, even though the
-// secrets are plainly present in the file.
-func TestWriter_EmbedKeylog_SecretsBlockPrecedesEveryPacketBlock(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "dump.pcapng")
-	w, err := NewWriter(path, Options{})
+// secrets are plainly present in the file. Since AD-022 the live path is the
+// only one that places secrets: a line handed over while packets are still
+// held must land ahead of all of them in the closed capture. (Was AD-014's
+// keylog-embedding test, which relied on Close's re-emission.)
+func TestWriter_SecretsBlockPrecedesEveryPacketHeldWhenItArrived(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))})
 	require.NoError(t, err)
 
 	for _, data := range [][]byte{{0xaa}, {0xbb}, {0xcc}} {
-		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, data))
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, data))
 	}
-	require.NoError(t, w.EmbedKeylog([]string{nssKeylogLine}))
+	w.AddSecret(nssKeylogLine)
 	require.NoError(t, w.Close())
 
 	types := pcapngBlockTypes(t, path)
@@ -467,18 +569,21 @@ func TestWriter_EmbedKeylog_SecretsBlockPrecedesEveryPacketBlock(t *testing.T) {
 	require.NotEqual(t, -1, firstPacket, "capture must contain packet blocks; block sequence was %s", blockNames(types))
 	assert.Less(t, dsb, firstPacket, "the DSB must precede the first packet block; block sequence was %s", blockNames(types))
 	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB, blockTypeEPB, blockTypeEPB}, types,
-		"a keylog-embedding capture must be laid out SHB -> IDB -> DSB -> packets; block sequence was %s", blockNames(types))
+		"a secret handed over while every packet is held must be laid out SHB -> IDB -> DSB -> packets; block sequence was %s", blockNames(types))
 
-	assert.Contains(t, string(readFile(t, path)), nssKeylogLine, "the embedded secrets must survive the re-emission")
+	assert.Equal(t, []string{nssKeylogLine + "\n"}, secretsPayloads(readFile(t, path)), "the secret must be in the closed capture")
 }
 
-// CAPTURE-01/CAPTURE-04: re-emitting the capture to put the secrets first must
-// not cost or corrupt a single packet, nor lose the link type -- the file has
-// to remain a faithful capture, verified here by reading it back with a
+// CAPTURE-01/CAPTURE-04: interleaving live DSBs with the packets must not cost
+// or corrupt a single packet, nor lose the link type -- the closed file has to
+// remain a faithful capture, verified here by reading it back with a
 // third-party pcapng reader rather than by inspecting how it was produced.
-func TestWriter_EmbedKeylog_ReEmissionPreservesEveryPacketAndLinkType(t *testing.T) {
+// (Was the re-emission's fidelity test; AD-022 removed the re-emission, so
+// the claim now holds for the live path that writes DSBs between packets.)
+func TestWriter_LiveSecretsPreserveEveryPacketAndLinkType(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
-	w, err := NewWriter(path, Options{LinkType: layers.LinkTypeRaw})
+	clock := newManualClock(time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC))
+	w, err := NewWriter(path, Options{LinkType: layers.LinkTypeRaw, Clock: clock})
 	require.NoError(t, err)
 
 	base := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
@@ -487,20 +592,28 @@ func TestWriter_EmbedKeylog_ReEmissionPreservesEveryPacketAndLinkType(t *testing
 	for i := range packets {
 		packets[i] = []byte(fmt.Sprintf("packet-%03d", i))
 		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: base.Add(time.Duration(i) * time.Millisecond)}, packets[i]))
+		if i == packetCount/2 {
+			// Write the first half live, behind one secret, so the second
+			// secret's DSB lands between packet blocks.
+			w.AddSecret(keylogLine(1))
+			clock.Advance(holdWindow)
+			require.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == i+1 }, liveBound, 20*time.Millisecond)
+		}
 	}
-	require.NoError(t, w.EmbedKeylog([]string{nssKeylogLine}))
+	w.AddSecret(keylogLine(2))
 	require.NoError(t, w.Close())
+	require.Equal(t, 2, countBlocks(readFile(t, path), blockTypeDSB), "precondition: two DSBs among the packets")
 
 	f, err := os.Open(path) // #nosec G304 -- test-controlled temp path
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
 	r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
 	require.NoError(t, err)
-	assert.Equal(t, layers.LinkTypeRaw, r.LinkType(), "link type must survive the re-emission")
+	assert.Equal(t, layers.LinkTypeRaw, r.LinkType(), "link type must survive live DSBs")
 
 	for i, want := range packets {
 		got, ci, err := r.ReadPacketData()
-		require.NoError(t, err, "packet %d must still be readable after the re-emission", i)
+		require.NoError(t, err, "packet %d must still be readable among the live DSBs", i)
 		assert.Equal(t, want, got, "packet %d bytes must be preserved exactly", i)
 		assert.True(t, ci.Timestamp.UTC().Equal(base.Add(time.Duration(i)*time.Millisecond)), "packet %d timestamp must round-trip", i)
 	}
@@ -508,32 +621,27 @@ func TestWriter_EmbedKeylog_ReEmissionPreservesEveryPacketAndLinkType(t *testing
 	assert.Error(t, err, "the capture must hold exactly the packets that were written")
 }
 
-// AD-006: the capture is a plaintext-equivalent secret once a keylog is
-// embedded, so embedding must leave the capture -- and nothing else -- in the
-// directory, still at its secret-grade 0600 mode. An abandoned intermediate
-// file would be an unnoticed second copy of the same secrets, and one that
-// retention's own artifact bookkeeping never accounts for.
-func TestWriter_EmbedKeylog_LeavesOnlyTheCaptureAtSecretGradeMode(t *testing.T) {
+// AD-006: the capture is a plaintext-equivalent secret once it holds a DSB,
+// so closing it must leave the capture -- and nothing else -- in the
+// directory, still at its secret-grade 0600 mode. An intermediate file would
+// be an unnoticed second copy of the same secrets, and one that retention's
+// own artifact bookkeeping never accounts for. (Was the keylog-embedding
+// API's test.)
+func TestWriter_CloseLeavesOnlyTheCaptureAtSecretGradeMode(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sidecar")
 	path := filepath.Join(dir, "dump.pcapng")
 	w, err := NewWriter(path, Options{})
 	require.NoError(t, err)
 
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0x01, 0x02}))
-	require.NoError(t, w.EmbedKeylog([]string{nssKeylogLine}))
+	w.AddSecret(nssKeylogLine)
 	require.NoError(t, w.Close())
 
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	assert.Equal(t, []string{"dump.pcapng"}, names, "embedding must leave no stray copy of the secrets behind")
-
+	assert.Equal(t, []string{"dump.pcapng"}, dirNames(t, dir), "Close must leave no stray copy of the secrets behind")
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the capture must stay secret-grade after embedding")
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the capture must stay secret-grade after Close")
+	assert.Equal(t, 1, countBlocks(readFile(t, path), blockTypeDSB), "precondition: the capture holds the secret")
 }
 
 // Edge case: with no keylog to embed the capture is left exactly as written --
@@ -687,6 +795,28 @@ func readPackets(t *testing.T, path string) [][]byte {
 		require.NoError(t, err)
 		packets = append(packets, data)
 	}
+}
+
+// payloadLines splits DSB payloads into their newline-terminated NSS lines,
+// in file order.
+func payloadLines(payloads []string) []string {
+	var lines []string
+	for _, p := range payloads {
+		lines = append(lines, strings.Split(strings.TrimSuffix(p, "\n"), "\n")...)
+	}
+	return lines
+}
+
+// dirNames lists the names of every entry in dir, sorted.
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 func readFile(t *testing.T, path string) []byte {

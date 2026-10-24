@@ -188,11 +188,12 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 
 // IT-03.7 (Acceptance, embedded DSB): the retained capture must decrypt on
 // its own, with NO external keylog paired -- the "self-decrypting capture"
-// the sidecar advertises. Two things make that observable: a graceful stop
-// (SIGTERM -> App.Close, which is what embeds the Decryption Secrets Block;
-// pod-down.sh's `pod rm -f` SIGKILLs and never gets there) and RETAIN=1, so
-// that same graceful shutdown's ephemeral-by-default cleanup keeps the
-// artifact instead of wiping it.
+// the sidecar advertises. Its Decryption Secrets Blocks are the ones written
+// live, ahead of the packets they decrypt (AD-018); a graceful stop (SIGTERM
+// -> App.Close) only drains the hold queue and never rewrites the file
+// (feature 07 C34, AD-022), which this asserts too: the closed capture is the
+// same file and begins with the bytes it held before the stop. RETAIN=1 keeps
+// that graceful shutdown's ephemeral-by-default cleanup from wiping it.
 func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 	requireRootfulPodman(t)
 	requireInternetEgress(t)
@@ -214,8 +215,23 @@ func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 	capturePath := volumeCapturePath(t, podName)
 	runSmoke(t, podName)
 
+	// The file only ever grows while it is live, so whatever this read sees
+	// is a prefix of it, even mid-write.
+	live, err := os.ReadFile(capturePath) // #nosec G304 -- path inside a test-generated podman volume
+	require.NoError(t, err)
+	liveInfo, err := os.Stat(capturePath)
+	require.NoError(t, err)
+
 	stopOut, err := exec.Command("podman", "stop", "-t", "30", podName+"-sidecar").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
 	require.NoError(t, err, "podman stop sidecar (graceful, so App.Close runs): %s", stopOut)
+
+	closed, err := os.ReadFile(capturePath) // #nosec G304 -- path inside a test-generated podman volume
+	require.NoError(t, err)
+	closedInfo, err := os.Stat(capturePath)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(liveInfo, closedInfo), "Close must not replace the capture with another file")
+	require.GreaterOrEqual(t, len(closed), len(live))
+	assert.True(t, bytes.Equal(live, closed[:len(live)]), "the closed capture must begin with the bytes it held before the stop")
 
 	// No external keylog: whatever decrypts can then only have come from the
 	// capture's own embedded secrets.

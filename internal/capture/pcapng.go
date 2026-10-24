@@ -1,11 +1,8 @@
 package capture
 
 import (
-	"bufio"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -66,11 +63,8 @@ const holdWindow = time.Second
 // maxHeldBytes caps the packet bytes the hold queue keeps in memory. Past it
 // the oldest packets are written at once, before their hold window ends:
 // memory stays bounded and nothing is dropped, at the cost of such a burst
-// possibly landing ahead of its keys, which Close's re-emission repairs.
+// possibly landing ahead of its keys, where nothing repairs it (AD-022).
 const maxHeldBytes = 32 << 20
-
-// ngBlockTypeDSB is the pcapng Decryption Secrets Block type.
-const ngBlockTypeDSB = 0x0000000a
 
 // heldPacket is a captured packet waiting out the hold window.
 type heldPacket struct {
@@ -83,31 +77,22 @@ type heldPacket struct {
 // that keeps the capture self-decrypting while it is being written: packets
 // wait out holdWindow, and each NSS keylog line handed to AddSecret is
 // written as a TLS Decryption Secrets Block ahead of every packet still held
-// (AD-018). Close re-emits the capture with all of its secrets in one DSB
-// ahead of every packet block (AD-014). Its methods are safe for concurrent
-// use.
+// (AD-018). Close drains what is still held and closes the file without
+// rewriting it, so the closed capture keeps that live layout (AD-022). Its
+// methods are safe for concurrent use.
 type Writer struct {
 	mu    sync.Mutex
 	f     *os.File
 	ng    *pcapgo.NgWriter
 	clock Clock
-	// path, linkType and headerLen let Close re-emit the capture with the
-	// Decryption Secrets Block ahead of the packet blocks (see
-	// embedSecrets): headerLen is the byte offset at which the initial
-	// SHB/IDB end, i.e. where the blocks that have to be copied over begin.
-	path      string
-	linkType  layers.LinkType
-	headerLen int64
+	path  string // names the capture in errors
 
 	// held is the hold queue, oldest first; heldBytes totals its data.
 	held      []heldPacket
 	heldBytes int
-	// pending are the secrets not yet written to the file; secrets is every
-	// distinct secret in arrival order, for Close's single DSB; seen dedups
-	// both.
+	// pending are the secrets not yet written to the file. A line is kept
+	// only until the drain that writes it.
 	pending []string
-	secrets []string
-	seen    map[string]struct{}
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -145,23 +130,11 @@ func NewWriter(path string, opts Options) (*Writer, error) {
 		return nil, fmt.Errorf("capture: flush initial pcapng headers: %w", err)
 	}
 
-	// Record where the SHB/IDB end. Close streams the blocks written after
-	// them into a re-emitted, secrets-first capture, and must not duplicate
-	// the headers it already wrote.
-	headerLen, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("capture: locate end of pcapng headers in %q: %w", path, err)
-	}
-
 	clock := opts.Clock
 	if clock == nil {
 		clock = SystemClock{}
 	}
-	w := &Writer{
-		f: f, ng: ng, clock: clock, path: path, linkType: linkType, headerLen: headerLen,
-		seen: make(map[string]struct{}), stop: make(chan struct{}), drained: make(chan struct{}),
-	}
+	w := &Writer{f: f, ng: ng, clock: clock, path: path, stop: make(chan struct{}), drained: make(chan struct{})}
 	go w.drainPeriodically()
 	return w, nil
 }
@@ -212,33 +185,18 @@ func (w *Writer) WritePacket(ci gopacket.CaptureInfo, data []byte) error {
 	return w.writeHeld(n)
 }
 
-// AddSecret records one NSS keylog line for the capture. The next drain
-// writes it in a TLS Decryption Secrets Block ahead of every packet still
-// held, and Close embeds it in the capture's single leading DSB. An empty or
-// already added line is ignored.
+// AddSecret records one NSS keylog line for the capture: the next drain (or
+// Close) writes it in a TLS Decryption Secrets Block ahead of every packet
+// still held. It writes every line it is handed, so the caller hands over
+// each line once; the sidecar's keylog.Writer drops duplicates before its
+// sink. An empty line is ignored.
 func (w *Writer) AddSecret(line string) {
 	if line == "" {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, dup := w.seen[line]; dup {
-		return
-	}
-	w.seen[line] = struct{}{}
 	w.pending = append(w.pending, line)
-	w.secrets = append(w.secrets, line)
-}
-
-// EmbedKeylog adds each of lines -- already-validated NSS keylog lines -- as
-// AddSecret does, so tshark/Wireshark decrypt the capture without pairing a
-// separate keylog file. Lines already added are ignored; nil/empty lines add
-// nothing.
-func (w *Writer) EmbedKeylog(lines []string) error {
-	for _, l := range lines {
-		w.AddSecret(l)
-	}
-	return nil
 }
 
 // drainPeriodically drains the hold queue every flushInterval until Close.
@@ -292,10 +250,11 @@ func (w *Writer) writeHeld(n int) error {
 }
 
 // Close stops the periodic drain, writes every packet still held (behind any
-// pending secrets), closes the underlying file and, when any secrets were
-// added, re-emits the capture with all of them in one Decryption Secrets
-// Block ahead of the packet blocks. The capture is complete only once Close
-// has returned.
+// pending secrets), flushes and closes the file. It never reopens, copies or
+// rewrites the capture (AD-022): the closed file is the bytes already on disk
+// followed by that drained tail, so it needs no disk beyond its own size and
+// closes cleanly even once the file has been unlinked. The capture is
+// complete only once Close has returned.
 func (w *Writer) Close() error {
 	w.stopOnce.Do(func() { close(w.stop) })
 	<-w.drained
@@ -310,111 +269,7 @@ func (w *Writer) Close() error {
 	if err := w.f.Close(); err != nil {
 		return fmt.Errorf("capture: close %q: %w", w.path, err)
 	}
-	if len(w.secrets) == 0 {
-		return nil
-	}
-	return w.embedSecrets()
-}
-
-// embedSecrets re-emits the capture as SHB -> IDB -> DSB -> packet blocks: it
-// writes a fresh header plus the Decryption Secrets Block into a sibling
-// temporary file, streams the packet blocks already on disk after it, then
-// renames that file over the capture, so a concurrent reader only ever sees
-// the old or the new capture, never a half-rewritten one. The packet blocks
-// are copied as opaque bytes and never held in memory -- a capture routinely
-// outgrows RAM -- which is sound because an Enhanced Packet Block is
-// position-independent: it refers to its interface only by the id 0 that the
-// re-emitted Interface Description Block registers identically. The live
-// DSBs written while capturing are left out: the leading one holds every
-// secret they did.
-func (w *Writer) embedSecrets() error {
-	src, err := os.Open(w.path) // #nosec G304 -- the very path this Writer created and just closed, not raw user input
-	if err != nil {
-		return fmt.Errorf("capture: reopen %q to embed keylog: %w", w.path, err)
-	}
-	defer func() { _ = src.Close() }()
-	if _, err := src.Seek(w.headerLen, io.SeekStart); err != nil {
-		return fmt.Errorf("capture: seek past pcapng headers in %q: %w", w.path, err)
-	}
-
-	// os.CreateTemp creates 0600, the secret-grade mode the capture itself is
-	// held at (AD-006) and the mode the rename carries over to it.
-	tmp, err := os.CreateTemp(filepath.Dir(w.path), ".dsb-*.pcapng")
-	if err != nil {
-		return fmt.Errorf("capture: create temp capture beside %q: %w", w.path, err)
-	}
-	if err := writeSecretsFirst(tmp, src, w.linkType, w.secrets); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("capture: close temp capture %q: %w", tmp.Name(), err)
-	}
-	if err := os.Rename(tmp.Name(), w.path); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("capture: replace %q with the secrets-first capture: %w", w.path, err)
-	}
 	return nil
-}
-
-// writeSecretsFirst writes a fresh SHB/IDB for linkType to dst, then lines as
-// one TLS Decryption Secrets Block, then every block read from blocks except
-// its Decryption Secrets Blocks.
-func writeSecretsFirst(dst io.Writer, blocks io.Reader, linkType layers.LinkType, lines []string) error {
-	ng, err := pcapgo.NewNgWriter(dst, linkType)
-	if err != nil {
-		return fmt.Errorf("capture: re-emit pcapng headers: %w", err)
-	}
-	if err := ng.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, secretsPayload(lines)); err != nil {
-		return fmt.Errorf("capture: write decryption secrets block: %w", err)
-	}
-	// Flush before copying: the packet blocks go straight to dst, bypassing
-	// the NgWriter's own buffer, so anything still buffered would land after
-	// them (exactly the ordering bug this whole path exists to avoid).
-	if err := ng.Flush(); err != nil {
-		return fmt.Errorf("capture: flush pcapng headers and secrets: %w", err)
-	}
-	if err := copyBlocksExceptSecrets(dst, blocks); err != nil {
-		return fmt.Errorf("capture: copy packet blocks: %w", err)
-	}
-	return nil
-}
-
-// copyBlocksExceptSecrets streams every pcapng block from src to dst as
-// opaque bytes, one block at a time, skipping Decryption Secrets Blocks. Each
-// block is {type uint32, total length uint32, body, total length uint32},
-// little-endian: pcapgo.NgWriter, which wrote every block here, writes no
-// other byte order.
-func copyBlocksExceptSecrets(dst io.Writer, src io.Reader) error {
-	r := bufio.NewReader(src)
-	var hdr [8]byte
-	for {
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		blockType := binary.LittleEndian.Uint32(hdr[0:4])
-		rest := int64(binary.LittleEndian.Uint32(hdr[4:8])) - int64(len(hdr))
-		if rest < 4 {
-			return fmt.Errorf("pcapng block of type %#x declares an impossible length", blockType)
-		}
-		if blockType == ngBlockTypeDSB {
-			if _, err := io.CopyN(io.Discard, r, rest); err != nil {
-				return err
-			}
-			continue
-		}
-		if _, err := dst.Write(hdr[:]); err != nil {
-			return err
-		}
-		if _, err := io.CopyN(dst, r, rest); err != nil {
-			return err
-		}
-	}
 }
 
 // secretsPayload renders lines as a DSB payload: newline-terminated NSS lines.

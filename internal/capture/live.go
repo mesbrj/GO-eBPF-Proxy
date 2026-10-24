@@ -50,9 +50,9 @@ func (l *Live) run(w *Writer) {
 }
 
 // Stop closes the interface handle and waits for the copying goroutine to
-// exit. Once it returns w is no longer written to, so the caller may embed the
-// keylog into w and close it; doing either earlier races with a concurrent
-// w.WritePacket (a data race on w's internal bufio.Writer, caught by -race).
+// exit. Once it returns w is no longer written to, so the caller may close w;
+// closing it earlier races with a concurrent w.WritePacket (a data race on
+// w's internal bufio.Writer, caught by -race).
 func (l *Live) Stop() error {
 	err := l.h.Close()
 	<-l.done
