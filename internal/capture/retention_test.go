@@ -321,6 +321,25 @@ func TestRetention_OwnedNameNeedsDigitEpochAndAtMostOneSuffix(t *testing.T) {
 	)
 }
 
+// C72 (door 2): every near miss of an owned name is refused. A name one token
+// off the template's shape, in the stem, a separator, the epoch, the suffix or
+// the extension, is not an owned capture: it is neither counted nor aged out.
+// The owned name beside it is both.
+func TestRetention_OwnedNameRefusesEveryNearMiss(t *testing.T) {
+	assertOnlyControlIsOwned(t, "dump-1700000000.pcapng",
+		"dump-1-.pcapng",          // an empty suffix
+		"dump1700000000.pcapng",   // no - before the epoch
+		"dump--1700000000.pcapng", // a doubled -
+		"dump_1700000000.pcapng",  // another separator
+		"dump-1700000000",         // no extension
+		"dump-1_2.pcapng",         // another suffix separator
+		"dump-1--2.pcapng",        // a doubled suffix -
+		"-1700000000.pcapng",      // no stem
+		"DUMP-1.pcapng",           // another case
+		"dump-abc.pcapng",         // a non-decimal epoch
+	)
+}
+
 // C29 (AC 20, AC 45): teardown deletes this run's capture and nothing else,
 // and with Retain it deletes nothing, leaving the capture byte for byte.
 func TestRetention_CleanupDeletesOnlyThisRunsCapture(t *testing.T) {
