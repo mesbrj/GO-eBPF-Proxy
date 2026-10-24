@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/netip"
 	"os"
@@ -691,4 +692,146 @@ func TestApp_KeylogFollowsCaptureState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// C43 (AC 29): the startup delete of a leftover keylog removes whatever entry
+// is at the path -- a symlink itself, never its target -- and finds nothing
+// there no error.
+func TestDeleteLeftoverKeylog_RemovesEntryNeverTarget(t *testing.T) {
+	t.Run("regular file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sslkeylog.log")
+		require.NoError(t, os.WriteFile(path, []byte(keylogLine(0x01)+"\n"), 0o600))
+
+		require.NoError(t, deleteKeylog(path))
+		assert.NoFileExists(t, path)
+	})
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		targetBytes := []byte("not the keylog's to delete")
+		require.NoError(t, os.WriteFile(target, targetBytes, 0o600))
+		path := filepath.Join(dir, "sslkeylog.log")
+		require.NoError(t, os.Symlink(target, path))
+
+		require.NoError(t, deleteKeylog(path))
+		_, err := os.Lstat(path)
+		assert.ErrorIs(t, err, fs.ErrNotExist, "the symlink itself must be removed")
+		got, err := os.ReadFile(target) // #nosec G304 -- test-controlled temp path
+		require.NoError(t, err, "the symlink's target must be left in place")
+		assert.Equal(t, targetBytes, got, "the symlink's target must be left unchanged")
+	})
+	t.Run("nothing there", func(t *testing.T) {
+		assert.NoError(t, deleteKeylog(filepath.Join(t.TempDir(), "sslkeylog.log")))
+	})
+}
+
+// C45 (AC 30): Close deletes the keylog file, --retain or not, and an App
+// with no keylog path has nothing to delete.
+func TestApp_CloseDeletesKeylogWithOrWithoutRetain(t *testing.T) {
+	for _, retain := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retain=%t", retain), func(t *testing.T) {
+			cfg := withKeylog(t, captureConfig(captureDir(t), 0, 0))
+			cfg.Retain = retain
+			a, _ := captureApp(t, cfg)
+			require.NoError(t, a.openCapture())
+			require.NoError(t, a.startKeylog())
+			sendKeylogLines(t, a, keylogLine(0x01))
+			require.NotZero(t, fileSize(t, cfg.KeylogPath), "precondition: the keylog holds a line")
+			run := a.capW.Path()
+
+			require.NoError(t, a.Close())
+			assert.NoFileExists(t, cfg.KeylogPath, "Close must delete the keylog file")
+			if retain {
+				assert.FileExists(t, run, "--retain keeps this run's capture")
+			}
+		})
+	}
+	t.Run("no keylog path", func(t *testing.T) {
+		a, _, _ := statsApp(t, missEverything, 0)
+		require.Empty(t, a.cfg.KeylogPath, "precondition")
+
+		assert.NoError(t, a.Close())
+	})
+}
+
+// C46 (AC 31): a leftover at --keylog-path that cannot be deleted, here a
+// non-empty directory, fails Start before it loads eBPF -- no privilege
+// needed to see it -- with an error naming --keylog-path, and the entry is
+// left as it was.
+func TestStart_LeftoverKeylogDeleteFailureFailsBeforeEBPF(t *testing.T) {
+	keylogPath := filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
+	require.NoError(t, os.MkdirAll(keylogPath, 0o700))
+	inside := filepath.Join(keylogPath, "inside")
+	require.NoError(t, os.WriteFile(inside, []byte("x"), 0o600))
+	tmp := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.CgroupPath = "/x"
+	cfg.PinDir = filepath.Join(tmp, "pin")
+	cfg.RelayListen = "127.0.0.1:0"
+	cfg.KeylogSocketPath = filepath.Join(tmp, "sock", "keylog.sock")
+	cfg.KeylogPath = keylogPath
+	cfg.CapturePath = filepath.Join(tmp, "sidecar", "dump.pcapng")
+
+	a, err := Start(cfg, logger.New(io.Discard))
+	if a != nil {
+		_ = a.Close()
+	}
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--keylog-path", "the error must name --keylog-path")
+	assert.Contains(t, err.Error(), keylogPath, "the error must name the keylog path")
+	assert.NotContains(t, err.Error(), "app: load ebpf", "the leftover delete must come before loading eBPF")
+	assert.NoDirExists(t, cfg.PinDir, "loading eBPF creates the pin dir, so it must not exist")
+	assert.NoDirExists(t, filepath.Join(tmp, "sidecar"), "no capture must be started")
+	assert.FileExists(t, inside, "the entry that could not be deleted must be left as it was")
+}
+
+// openFds reports whether this process holds a file descriptor open on path.
+func openFds(t *testing.T, path string) bool {
+	t.Helper()
+	want, err := filepath.EvalSymlinks(path)
+	require.NoError(t, err)
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && target == want {
+			return true
+		}
+	}
+	return false
+}
+
+// C47 (AC 32): a keylog that cannot be deleted at shutdown, here a non-empty
+// directory, fails Close with an error naming the path, yet every other
+// subsystem is still closed: the capture file is flushed and closed, and the
+// relay listener refuses new connections.
+func TestApp_CloseKeylogDeleteFailureStillClosesTheRest(t *testing.T) {
+	cfg := withKeylog(t, captureConfig(captureDir(t), 0, 0))
+	cfg.Retain = true // keep this run's capture to inspect it after Close
+	a, _ := captureApp(t, cfg)
+	require.NoError(t, a.openCapture())
+	require.NoError(t, a.startKeylog())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	a.ln = ln
+	require.NoError(t, writePacket(a, 100))
+	run := a.capW.Path()
+	require.True(t, openFds(t, run), "precondition: the capture file is open")
+	// What is at --keylog-path by shutdown cannot be deleted.
+	require.NoError(t, os.Remove(cfg.KeylogPath))
+	require.NoError(t, os.MkdirAll(filepath.Join(cfg.KeylogPath, "inside"), 0o700))
+
+	err = a.Close()
+
+	require.Error(t, err, "a keylog that cannot be deleted must fail Close")
+	assert.Contains(t, err.Error(), "--keylog-path", "the error must name --keylog-path")
+	assert.Contains(t, err.Error(), cfg.KeylogPath, "the error must name the keylog path")
+	assert.False(t, openFds(t, run), "the capture file must still be closed")
+	assert.Len(t, readCapturePackets(t, run), 1, "the capture must still be drained and flushed")
+	conn, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if dialErr == nil {
+		_ = conn.Close()
+	}
+	assert.Error(t, dialErr, "the relay listener must refuse new connections")
+	assert.NoFileExists(t, cfg.KeylogSocketPath, "the keylog socket server must still be closed")
 }

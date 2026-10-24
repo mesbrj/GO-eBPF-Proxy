@@ -3,9 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -70,18 +72,23 @@ type App struct {
 	stopTick  chan struct{}
 }
 
-// Start refuses a keylog directory that is not on tmpfs, then loads and
-// attaches the eBPF programs, starts the relay, creates this run's capture
-// file when --max-bytes leaves room for one, starts the keylog socket server,
-// and starts capture, with every subsystem logging through log. A run with no
-// room for a capture starts everything else (AC 12). On any failure it tears
-// down whatever was already started before returning the error (never leaks
-// a partial run).
+// Start refuses a keylog directory that is not on tmpfs and deletes any
+// keylog an earlier run left, then loads and attaches the eBPF programs,
+// starts the relay, creates this run's capture file when --max-bytes leaves
+// room for one, starts the keylog socket server, and starts capture, with
+// every subsystem logging through log. A run with no room for a capture
+// starts everything else (AC 12). On any failure it tears down whatever was
+// already started before returning the error (never leaks a partial run).
 func Start(cfg Config, log *logger.Logger) (*App, error) {
 	// First, before anything is loaded or created: a refused keylog leaves
-	// nothing to tear down (AD-023).
+	// nothing to tear down (AD-023). The keylog holds one run's keys, so a
+	// file an earlier run left, killed before its Close, goes before the
+	// keylog socket server opens its own.
 	if err := checkKeylogTmpfs(cfg.KeylogPath); err != nil {
 		return nil, err
+	}
+	if err := deleteKeylog(cfg.KeylogPath); err != nil {
+		return nil, fmt.Errorf("app: delete leftover keylog at --keylog-path: %w", err)
 	}
 	a := &App{cfg: cfg, log: log}
 
@@ -292,7 +299,11 @@ func (a *App) logStats() {
 // Close stops every subsystem -- the capture is drained and closed, never
 // rewritten: its secrets are already in the DSBs written live (AD-022) -- and,
 // unless Config.Retain is set, deletes this run's capture
-// (ephemeral-by-default teardown). Captures kept by earlier runs stay.
+// (ephemeral-by-default teardown). Captures kept by earlier runs stay. Last,
+// it deletes the keylog file, with or without Retain: every key in it is in
+// the capture already, or belongs to a capture just deleted (AD-023). A
+// subsystem that fails to close, or a keylog that cannot be deleted, never
+// keeps the others open.
 func (a *App) Close() error {
 	var errs []error
 	if a.stopTick != nil {
@@ -325,7 +336,23 @@ func (a *App) Close() error {
 		errs = append(errs, a.loader.Close())
 	}
 	errs = append(errs, a.retention.Cleanup())
+	if err := deleteKeylog(a.cfg.KeylogPath); err != nil {
+		errs = append(errs, fmt.Errorf("app: delete keylog at --keylog-path: %w", err))
+	}
 	return errors.Join(errs...)
+}
+
+// deleteKeylog deletes whatever entry is at the keylog path: the keylog file
+// lives for one run (AD-023). A symlink is deleted itself, never its target.
+// Nothing at the path, or no path at all, is not an error.
+func deleteKeylog(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) { // #nosec G703 -- path is operator-supplied config (--keylog-path), not raw user input
+		return err
+	}
+	return nil
 }
 
 // At most missLogBurst resolver misses are logged per missLogInterval:

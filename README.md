@@ -152,7 +152,8 @@ tshark -r "$CAPTURE" \
   -Y 'http or http2' -V
 # -o "tls.keylog_file:" clears any keylog file set in your Wireshark preferences, so
 # only the keys inside the capture are used. To pair the separate keylog instead, copy
-# it off the sidecar's tmpfs first and pass its path:
+# it off the sidecar's tmpfs while the sidecar runs (it deletes the keylog when it
+# stops) and pass its path:
 #   podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
 #   ... -o "tls.keylog_file:/tmp/sslkeylog.log" ...
 # -Y 'http or http2' matches whichever protocol the session negotiated over ALPN:
@@ -174,8 +175,9 @@ keeps its capture when it stops, and the pod records the choice as the label
 the kept volume writes its own capture beside the kept ones. If they already reach
 `--max-bytes`, `pod-up.sh` warns `pod-up: capture not started` and the pod runs without
 capture. The kept capture decrypts with no keylog file,
-and the tmpfs keylog file is never kept: it disappears with the sidecar container, and
-the capture already carries every key it held. `RETAIN=0 pod-down.sh` still wipes a
+and the tmpfs keylog file is never kept: the sidecar deletes it when it stops, `RETAIN=1`
+or not, as the capture already carries every key it held, and a sidecar that starts
+deletes any keylog an earlier run left. `RETAIN=0 pod-down.sh` still wipes a
 retained pod. `pod-down.sh --retain` on a pod brought up without `RETAIN=1` exits `1` and
 removes nothing, because that sidecar wipes its own capture when it stops.
 
@@ -209,7 +211,7 @@ you:
 | `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on |
 | `--pin-dir` | `/sys/fs/bpf/go-ebpf-proxy` | bpffs directory for the pinned maps |
 | `--keylog-socket` | `/var/run/sidecar/keylog.sock` | Unix socket the `LD_PRELOAD` interposer connects to |
-| `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start |
+| `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start. It holds one run's keys: the sidecar deletes it when it starts and when it stops |
 | `--capture-iface` | `eth0` | Interface to capture the outbound leg from |
 | `--capture-path` | `/var/log/sidecar/dump.pcapng` | Template for each run's DSB-embedded pcapng capture: a run writes `dump-<epoch>.pcapng` (its start time in Unix seconds, then `-1`, `-2`, … if taken) in that directory, never overwriting a file |
 | `--retain` | `false` | Keep the capture and keylog on teardown instead of wiping them |

@@ -4,9 +4,11 @@ package main
 
 import (
 	"errors"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,4 +183,83 @@ func TestApp_CloseWithRetainPreservesArtifacts(t *testing.T) {
 	// name template, never created.)
 	_, statErr := os.Stat(run)
 	assert.NoError(t, statErr, "--retain must preserve the capture artifact")
+}
+
+// itConfig returns a Config for a privileged Start of every subsystem, as the
+// tests above build it: fresh bpffs pins and cgroup, a 0700 capture
+// directory, and the keylog under /dev/shm (AD-023). It skips on a box
+// without the privilege to create them.
+func itConfig(t *testing.T) Config {
+	t.Helper()
+	pinDir, err := os.MkdirTemp("/sys/fs/bpf", "gotestpin-")
+	if err != nil {
+		t.Skipf("need privilege + mounted bpffs: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(pinDir) })
+	cg, err := os.MkdirTemp("/sys/fs/cgroup", "gotestcg-")
+	if err != nil {
+		t.Skipf("need privilege + cgroup v2: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(cg) })
+
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.CgroupPath = cg
+	cfg.PinDir = pinDir
+	cfg.KeylogSocketPath = filepath.Join(dir, "sock", "keylog.sock")
+	cfg.RelayListen = "127.0.0.1:0"
+	cfg.KeylogPath = filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
+	cfg.CaptureIface = "lo"
+	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
+	cfg.RetentionTick = 0
+	return cfg
+}
+
+// startIT runs Start on cfg, skipping when the kernel refuses the privileged
+// capture or attach.
+func startIT(t *testing.T, cfg Config) *App {
+	t.Helper()
+	a, err := Start(cfg, logger.New(os.Stderr))
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("privileged capture/attach not permitted: %v", err)
+	}
+	require.NoError(t, err)
+	return a
+}
+
+// C44 (AC 29, at Start): a keylog file an earlier run left at --keylog-path
+// is deleted before the keylog server opens its own, so this run's keylog
+// starts empty.
+func TestApp_StartDeletesLeftoverKeylog(t *testing.T) {
+	cfg := itConfig(t)
+	require.NoError(t, os.MkdirAll(filepath.Dir(cfg.KeylogPath), 0o700))
+	leftover := "CLIENT_RANDOM " + strings.Repeat("ab", 32) + " " + strings.Repeat("cd", 48) + "\n"
+	require.NoError(t, os.WriteFile(cfg.KeylogPath, []byte(leftover), 0o600))
+
+	a := startIT(t, cfg)
+	t.Cleanup(func() { _ = a.Close() })
+
+	assert.Zero(t, fileSize(t, cfg.KeylogPath), "the keylog must hold no line from an earlier run")
+}
+
+// C64 (AC 45, at Start/Close): --retain keeps this run's capture, a pcapng
+// that starts with its Section Header Block, and nothing else: the keylog
+// file is deleted all the same.
+func TestApp_RetainKeepsOnlyThisRunsCapture(t *testing.T) {
+	cfg := itConfig(t)
+	cfg.Retain = true
+
+	a := startIT(t, cfg)
+	require.NotNil(t, a.capW, "precondition: capture started")
+	run := a.capW.Path()
+	require.FileExists(t, cfg.KeylogPath, "precondition: the keylog exists while the sidecar runs")
+
+	require.NoError(t, a.Close())
+
+	got, err := os.ReadFile(run) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err, "--retain must keep this run's capture")
+	require.GreaterOrEqual(t, len(got), 4)
+	assert.Equal(t, []byte{0x0a, 0x0d, 0x0d, 0x0a}, got[:4], "the kept capture must start with the pcapng SHB magic")
+	_, err = os.Lstat(cfg.KeylogPath)
+	assert.ErrorIs(t, err, fs.ErrNotExist, "--retain must never keep the keylog")
 }
