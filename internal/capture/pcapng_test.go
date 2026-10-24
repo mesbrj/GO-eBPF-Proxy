@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -654,6 +656,151 @@ func TestWriter_Close_WithoutKeylogWritesNoSecretsBlock(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeEPB}, pcapngBlockTypes(t, path))
+}
+
+// runStart is the Unix second the run-capture tests start at.
+const runStart = 1761300000
+
+// runOpts returns Options whose clock reads runStart.
+func runOpts() Options { return Options{Clock: newManualClock(time.Unix(runStart, 0))} }
+
+// C21 (AC 14, door 1): each run's file is the template's directory and stem,
+// its start second, and the template's extension, created 0600.
+func TestRunCapture_NamedFromTemplateAndStartSecond(t *testing.T) {
+	for _, tc := range []struct{ template, want string }{
+		{"dump.pcapng", "dump-1761300000.pcapng"},
+		{"cap", "cap-1761300000"},
+		{"a.b.pcapng", "a.b-1761300000.pcapng"},
+	} {
+		t.Run(tc.template, func(t *testing.T) {
+			dir := t.TempDir()
+			w, err := CreateRunCapture(filepath.Join(dir, tc.template), runOpts())
+			require.NoError(t, err)
+			require.NoError(t, w.Close())
+
+			want := filepath.Join(dir, tc.want)
+			assert.Equal(t, want, w.Path())
+			info, err := os.Lstat(want)
+			require.NoError(t, err)
+			assert.True(t, info.Mode().IsRegular())
+			assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+			assert.Equal(t, []string{tc.want}, dirNames(t, dir), "the run must create exactly its own file")
+		})
+	}
+}
+
+// C22 (AC 15, door 1): a taken name is skipped, whatever holds it -- a file, a
+// symlink to one, a dangling symlink or a directory -- for the lowest free
+// suffix. What holds it is left exactly as it was: never written through,
+// never followed, and a dangling symlink's target is never created.
+func TestRunCapture_CollisionTakesLowestFreeSuffix(t *testing.T) {
+	// Each kind plants an entry at path and returns a check that it is
+	// unchanged.
+	kinds := []struct {
+		name  string
+		plant func(t *testing.T, path string) func(t *testing.T)
+	}{
+		{"regular file", func(t *testing.T, path string) func(t *testing.T) {
+			require.NoError(t, os.WriteFile(path, []byte("kept "+path), 0o600))
+			return func(t *testing.T) { assert.Equal(t, []byte("kept "+path), readFile(t, path)) }
+		}},
+		{"symlink to a file", func(t *testing.T, path string) func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "target")
+			require.NoError(t, os.WriteFile(target, []byte("target bytes"), 0o600))
+			require.NoError(t, os.Symlink(target, path))
+			return func(t *testing.T) {
+				got, err := os.Readlink(path)
+				require.NoError(t, err)
+				assert.Equal(t, target, got)
+				assert.Equal(t, []byte("target bytes"), readFile(t, target))
+			}
+		}},
+		{"dangling symlink", func(t *testing.T, path string) func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "missing")
+			require.NoError(t, os.Symlink(target, path))
+			return func(t *testing.T) {
+				got, err := os.Readlink(path)
+				require.NoError(t, err)
+				assert.Equal(t, target, got)
+				assert.NoFileExists(t, target, "a dangling symlink's target must never be created")
+			}
+		}},
+		{"directory", func(t *testing.T, path string) func(t *testing.T) {
+			require.NoError(t, os.Mkdir(path, 0o700))
+			return func(t *testing.T) { assert.Empty(t, dirNames(t, path)) }
+		}},
+	}
+	for _, kind := range kinds {
+		for taken, want := range []string{"dump-1761300000-1.pcapng", "dump-1761300000-2.pcapng"} {
+			t.Run(fmt.Sprintf("%s/%d taken", kind.name, taken+1), func(t *testing.T) {
+				dir := t.TempDir()
+				var checks []func(t *testing.T)
+				for _, name := range []string{"dump-1761300000.pcapng", "dump-1761300000-1.pcapng"}[:taken+1] {
+					checks = append(checks, kind.plant(t, filepath.Join(dir, name)))
+				}
+
+				w, err := CreateRunCapture(filepath.Join(dir, "dump.pcapng"), runOpts())
+				require.NoError(t, err)
+				require.NoError(t, w.Close())
+
+				assert.Equal(t, filepath.Join(dir, want), w.Path())
+				for _, check := range checks {
+					check(t)
+				}
+			})
+		}
+	}
+}
+
+// C23 (AC 16, door 1): suffix 999 is the last one tried. Past it, creation
+// fails naming the capture directory, and creates nothing.
+func TestRunCapture_GivesUpAfterSuffix999(t *testing.T) {
+	// takeNames plants an empty file at the base name and at suffixes 1 to last.
+	takeNames := func(t *testing.T, dir string, last int) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "dump-1761300000.pcapng"), nil, 0o600))
+		for n := 1; n <= last; n++ {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "dump-1761300000-"+strconv.Itoa(n)+".pcapng"), nil, 0o600))
+		}
+	}
+
+	t.Run("suffix 999 free", func(t *testing.T) {
+		dir := t.TempDir()
+		takeNames(t, dir, 998)
+		w, err := CreateRunCapture(filepath.Join(dir, "dump.pcapng"), runOpts())
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+		assert.Equal(t, filepath.Join(dir, "dump-1761300000-999.pcapng"), w.Path())
+	})
+	t.Run("suffixes 1 to 999 taken", func(t *testing.T) {
+		dir := t.TempDir()
+		takeNames(t, dir, 999)
+		before := dirNames(t, dir)
+
+		w, err := CreateRunCapture(filepath.Join(dir, "dump.pcapng"), runOpts())
+		require.Error(t, err)
+		assert.Nil(t, w)
+		assert.Contains(t, err.Error(), dir, "the error must name the capture directory")
+		assert.Equal(t, before, dirNames(t, dir), "no file may be created")
+	})
+}
+
+// C24 (door 1): an open error other than a taken name fails creation at once,
+// naming the file it tried.
+func TestRunCapture_OtherOpenErrorFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the open cannot be made to fail this way")
+	}
+	dir := filepath.Join(t.TempDir(), "sidecar")
+	require.NoError(t, os.Mkdir(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) // #nosec G302 -- restores a test directory so t.TempDir can remove it
+
+	w, err := CreateRunCapture(filepath.Join(dir, "dump.pcapng"), runOpts())
+	require.Error(t, err)
+	assert.Nil(t, w)
+	assert.ErrorIs(t, err, fs.ErrPermission)
+	assert.Contains(t, err.Error(), "dump-1761300000.pcapng", "the error must name the file it tried to create")
+	assert.Empty(t, dirNames(t, dir))
 }
 
 // nssKeylogLine is a syntactically valid but entirely fabricated NSS keylog

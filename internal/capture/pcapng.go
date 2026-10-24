@@ -3,9 +3,11 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -99,16 +101,59 @@ type Writer struct {
 	drained  chan struct{} // closed once the periodic drain has exited
 }
 
-// NewWriter creates (or truncates) the pcapng file at path, creating its
-// parent directory 0700 and the file 0600 -- secret-grade like the keylog
-// file (AD-006), since the DSBs make the capture itself a secret -- writes
-// the initial Section Header + Interface Block, and starts draining the hold
-// queue every flushInterval until Close.
+// maxRunSuffix is the highest suffix CreateRunCapture tries when the names
+// before it are taken.
+const maxRunSuffix = 999
+
+// CreateRunCapture creates this run's capture file from template, the
+// --capture-path (AD-021, door 1): <dir>/<stem>-<start second><ext>, where
+// <dir>, <stem> and <ext> come from template and the start second is
+// opts.Clock's, in Unix seconds. When that name is taken, by any kind of
+// entry, a dangling symlink included, it creates <stem>-<epoch>-<n><ext> for
+// the lowest free n from 1 to 999. Every name is created by NewWriter with
+// O_CREAT|O_EXCL rather than checked first, so an entry already there is
+// never followed, truncated or overwritten. Any other error fails, and so do
+// 999 taken suffixes.
+func CreateRunCapture(template string, opts Options) (*Writer, error) {
+	clock := opts.Clock
+	if clock == nil {
+		clock = SystemClock{}
+	}
+	dir, stem, ext := splitTemplate(template)
+	base := filepath.Join(dir, stem+"-"+strconv.FormatInt(clock.Now().Unix(), 10))
+	for n := 0; n <= maxRunSuffix; n++ {
+		path := base + ext
+		if n > 0 {
+			path = base + "-" + strconv.Itoa(n) + ext
+		}
+		w, err := NewWriter(path, opts)
+		if !errors.Is(err, fs.ErrExist) {
+			return w, err
+		}
+	}
+	return nil, fmt.Errorf("capture: no free capture name in %q: %s%s and its suffixes 1 to %d are all taken", dir, filepath.Base(base), ext, maxRunSuffix)
+}
+
+// splitTemplate splits a --capture-path into the directory, stem and
+// extension every run's capture name is built from.
+func splitTemplate(template string) (dir, stem, ext string) {
+	base := filepath.Base(template)
+	ext = filepath.Ext(base)
+	return filepath.Dir(template), strings.TrimSuffix(base, ext), ext
+}
+
+// NewWriter creates the pcapng file at path, which must not exist yet,
+// creating its parent directory 0700 and the file 0600 -- secret-grade like
+// the keylog file (AD-006), since the DSBs make the capture itself a secret
+// -- writes the initial Section Header + Interface Block, and starts
+// draining the hold queue every flushInterval until Close. An entry already
+// at path fails it with an error wrapping fs.ErrExist: a capture is never
+// truncated or overwritten (AD-021).
 func NewWriter(path string, opts Options) (*Writer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("capture: create capture dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304,G302 -- path is operator-supplied config, not raw user input; 0600 is the intended secret-grade mode
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304,G302 -- path is operator-supplied config, not raw user input; 0600 is the intended secret-grade mode
 	if err != nil {
 		return nil, fmt.Errorf("capture: open %q: %w", path, err)
 	}
@@ -138,6 +183,9 @@ func NewWriter(path string, opts Options) (*Writer, error) {
 	go w.drainPeriodically()
 	return w, nil
 }
+
+// Path returns the capture file's path.
+func (w *Writer) Path() string { return w.path }
 
 // WritePacket queues one packet to be written as an Enhanced Packet Block
 // once it has been held for holdWindow -- sooner when the queue passes

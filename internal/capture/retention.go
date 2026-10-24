@@ -3,25 +3,36 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"regexp"
 	"time"
 )
 
-// Retention bounds a directory of secret-grade artifacts: a size cap AND an
-// age cap (whichever is hit first) with oldest-first rotation, plus
-// ephemeral-by-default cleanup unless Retain is set (the --retain flag).
+// Retention bounds the captures this sidecar owns in the capture directory,
+// and only those (door 2). An owned capture is a regular file directly in
+// Template's directory whose name is one CreateRunCapture gives:
+// <stem>-<epoch><ext> or <stem>-<epoch>-<n><ext>. MaxBytes limits what the
+// owned captures hold together, this run's included: Room is what it leaves
+// for this run's capture, whose Writer stops capture there, and no file is
+// ever deleted for size (AD-020). MaxAge deletes finished owned captures. The
+// keylog file and every other entry of the directory, a fixed-name capture an
+// earlier version wrote included, are never counted or deleted.
 type Retention struct {
-	// Dir is the artifact directory to enforce bounds over.
-	Dir string
-	// MaxBytes is the total-size cap across all files in Dir. Zero disables
-	// the size cap.
+	// Template is the --capture-path every run's capture is named from.
+	Template string
+	// Run is this run's capture file, "" while there is none. Enforce never
+	// deletes it and OwnedBytes never counts it: every other owned capture is
+	// a finished one. It is the only file Cleanup deletes.
+	Run string
+	// MaxBytes is the most the owned captures may hold together. Zero
+	// disables the limit.
 	MaxBytes int64
-	// MaxAge is the age cap: any file older than MaxAge is evicted. Zero
-	// disables the age cap.
+	// MaxAge is the age cap: a finished owned capture whose mtime is older
+	// than MaxAge is deleted. Zero disables the age cap.
 	MaxAge time.Duration
-	// Retain disables Cleanup's purge (the --retain flag).
+	// Retain keeps Run through Cleanup (the --retain flag).
 	Retain bool
 	// Clock supplies "now" for age evaluation; defaults to SystemClock.
 	Clock Clock
@@ -49,83 +60,105 @@ func CheckTarget(dir string) error {
 	return nil
 }
 
-// retentionFile is one directory entry considered for eviction.
+// retentionFile is one finished owned capture.
 type retentionFile struct {
 	path    string
 	size    int64
 	modTime time.Time
 }
 
-// Enforce evicts files oldest-first until Dir's total size is within
-// MaxBytes and no remaining file is older than MaxAge. A missing Dir is not
-// an error (nothing to enforce yet).
-func (r Retention) Enforce() error {
-	entries, err := os.ReadDir(r.Dir)
+// finished returns the finished owned captures: every owned capture in the
+// directory but Run. Each entry is checked with Lstat, so a symlink is never
+// one. A missing directory holds none.
+func (r Retention) finished() ([]retentionFile, error) {
+	dir, stem, ext := splitTemplate(r.Template)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
 		}
-		return fmt.Errorf("capture: read %q: %w", r.Dir, err)
+		return nil, fmt.Errorf("capture: read %q: %w", dir, err)
 	}
+	owned := regexp.MustCompile("^" + regexp.QuoteMeta(stem) + `-[0-9]+(-[0-9]+)?` + regexp.QuoteMeta(ext) + "$")
+	var files []retentionFile
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if !owned.MatchString(e.Name()) || path == filepath.Clean(r.Run) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue // gone since it was listed, or not a regular file
+		}
+		files = append(files, retentionFile{path: path, size: info.Size(), modTime: info.ModTime()})
+	}
+	return files, nil
+}
 
+// OwnedBytes sums the sizes (st_size) of the finished owned captures.
+func (r Retention) OwnedBytes() (int64, error) {
+	files, err := r.finished()
+	var total int64
+	for _, f := range files {
+		total += f.size
+	}
+	return total, err
+}
+
+// Room returns what MaxBytes leaves for this run's capture: MaxBytes less
+// OwnedBytes, which is zero or less once the finished captures alone reach
+// it. Without MaxBytes there is no limit, and Room returns 0, which
+// Options.Room takes as none.
+func (r Retention) Room() (int64, error) {
+	if r.MaxBytes <= 0 {
+		return 0, nil
+	}
+	owned, err := r.OwnedBytes()
+	return r.MaxBytes - owned, err
+}
+
+// Enforce runs one age pass: it deletes every finished owned capture whose
+// mtime is older than MaxAge. It never deletes this run's capture, and never
+// deletes for size. A missing directory is not an error.
+func (r Retention) Enforce() error {
+	if r.MaxAge <= 0 {
+		return nil
+	}
+	files, err := r.finished()
+	if err != nil {
+		return err
+	}
 	clock := r.Clock
 	if clock == nil {
 		clock = SystemClock{}
 	}
 	now := clock.Now()
 
-	var files []retentionFile
-	var total int64
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, retentionFile{path: filepath.Join(r.Dir, e.Name()), size: info.Size(), modTime: info.ModTime()})
-		total += info.Size()
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
-
 	var errs []error
 	for _, f := range files {
-		overAge := r.MaxAge > 0 && now.Sub(f.modTime) > r.MaxAge
-		overSize := r.MaxBytes > 0 && total > r.MaxBytes
-		if !overAge && !overSize {
+		if now.Sub(f.modTime) <= r.MaxAge {
 			continue
 		}
-		if err := os.Remove(f.path); err != nil {
-			errs = append(errs, fmt.Errorf("capture: evict %q: %w", f.path, err))
-			continue
+		if err := os.Remove(f.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("capture: delete expired %q: %w", f.path, err))
 		}
-		total -= f.size
 	}
 	return errors.Join(errs...)
 }
 
-// Cleanup wipes Dir's contents unless Retain is set -- the ephemeral-by-
-// default teardown policy; --retain opts out. A missing Dir is not an error.
+// Cleanup deletes this run's capture unless Retain is set -- the
+// ephemeral-by-default teardown policy; --retain opts out. It deletes nothing
+// else: a capture kept by an earlier run is never this run's to delete (AC 17,
+// AC 20). A capture already gone is not an error.
 // SPEC_DEVIATION: design.md sketches Cleanup(retain bool); the retain flag is
 // carried on the Retention struct instead, so Enforce and Cleanup share one
 // config value rather than two independent sources of truth for it.
 func (r Retention) Cleanup() error {
-	if r.Retain {
+	if r.Retain || r.Run == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(r.Dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("capture: read %q: %w", r.Dir, err)
+	if err := os.Remove(r.Run); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("capture: remove %q: %w", r.Run, err)
 	}
-	var errs []error
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(r.Dir, e.Name())); err != nil {
-			errs = append(errs, fmt.Errorf("capture: remove %q: %w", e.Name(), err))
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }

@@ -113,18 +113,19 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 		_ = a.Close()
 		return nil, err
 	}
-	// Set before any capture file is created so a failure below still wipes
-	// whatever was partially written, unless Retain is set.
-	a.retention = capture.Retention{Dir: captureDir, MaxBytes: cfg.MaxBytes, MaxAge: cfg.MaxAge, Retain: cfg.Retain}
+	a.retention = capture.Retention{Template: cfg.CapturePath, MaxBytes: cfg.MaxBytes, MaxAge: cfg.MaxAge, Retain: cfg.Retain}
 
 	// The capture writer exists before the keylog socket server, so the
 	// server can stream every line it accepts into the capture (AD-018).
-	capW, err := capture.NewWriter(cfg.CapturePath, capture.Options{})
+	capW, err := capture.CreateRunCapture(cfg.CapturePath, capture.Options{})
 	if err != nil {
 		_ = a.Close()
 		return nil, fmt.Errorf("app: open capture writer: %w", err)
 	}
 	a.capW = capW
+	// Set as soon as the file exists, so a failure later in Start still
+	// deletes it, unless Retain is set.
+	a.retention.Run = capW.Path()
 
 	keylogSrv, err := keylog.NewSocketServer(keylog.SocketServerConfig{
 		SocketPath: cfg.KeylogSocketPath,
@@ -201,8 +202,8 @@ func (a *App) logStats() {
 
 // Close stops every subsystem -- the capture is drained and closed, never
 // rewritten: its secrets are already in the DSBs written live (AD-022) -- and,
-// unless Config.Retain is set, wipes the capture directory
-// (ephemeral-by-default teardown).
+// unless Config.Retain is set, deletes this run's capture
+// (ephemeral-by-default teardown). Captures kept by earlier runs stay.
 func (a *App) Close() error {
 	var errs []error
 	if a.stopTick != nil {
@@ -234,9 +235,7 @@ func (a *App) Close() error {
 	if a.loader != nil {
 		errs = append(errs, a.loader.Close())
 	}
-	if a.retention.Dir != "" {
-		errs = append(errs, a.retention.Cleanup())
-	}
+	errs = append(errs, a.retention.Cleanup())
 	return errors.Join(errs...)
 }
 

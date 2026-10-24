@@ -19,7 +19,10 @@ import (
 // keylog socket server, capture) starts and stops cleanly, and teardown
 // honours Config.Retain. Needs CAP_BPF/CAP_PERFMON + a mounted
 // bpffs/cgroupfs + CAP_NET_RAW on the capture interface; skips cleanly on an
-// unprivileged box.
+// unprivileged box. C30 (AC 20): teardown without Retain deletes this run's
+// capture and keeps, byte for byte, one an earlier run left in the directory.
+// (Feature 07: it asserted that the whole capture directory was wiped, by
+// stat-ing the fixed --capture-path, a name no run creates any more.)
 func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	pinDir, err := os.MkdirTemp("/sys/fs/bpf", "gotestpin-")
 	if err != nil {
@@ -36,12 +39,16 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	// t.TempDir()'s own root is 0755 (a Go testing.T quirk: its numbered
 	// subdirectories are created via os.Mkdir(dir, 0777), umask-adjusted to
 	// 0755), which capture.CheckTarget correctly refuses as world-accessible.
-	// Use a not-yet-existing "sidecar" subdirectory instead, matching the
-	// KeylogSocketPath pattern below, so capture.NewWriter creates it fresh
-	// at the intended 0700 (AD-006) -- a real deployment's capture dir is
-	// always pre-secured this way (e.g. pod-up.sh's volume chmod), never a
-	// pre-existing world-readable directory.
+	// Use a "sidecar" subdirectory secured 0700 instead (AD-006), as a real
+	// deployment's capture dir always is (e.g. pod-up.sh's volume chmod),
+	// holding a capture kept by an earlier run.
 	dir := t.TempDir()
+	captureDir := filepath.Join(dir, "sidecar")
+	require.NoError(t, os.Mkdir(captureDir, 0o700))
+	earlier := filepath.Join(captureDir, "dump-1000000000.pcapng")
+	earlierBytes := []byte("a capture kept by an earlier run")
+	require.NoError(t, os.WriteFile(earlier, earlierBytes, 0o600))
+
 	cfg := DefaultConfig()
 	cfg.CgroupPath = cg
 	cfg.PinDir = pinDir
@@ -50,7 +57,7 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	// The keylog must be on tmpfs (AD-023), which t.TempDir() need not be.
 	cfg.KeylogPath = filepath.Join(shmDir(t), "keylog", "sslkeylog.log")
 	cfg.CaptureIface = "lo"
-	cfg.CapturePath = filepath.Join(dir, "sidecar", "dump.pcapng")
+	cfg.CapturePath = filepath.Join(captureDir, "dump.pcapng")
 	cfg.RetentionTick = 0 // deterministic test: no background ticker
 
 	a, err := Start(cfg, logger.New(os.Stderr))
@@ -58,6 +65,9 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 		t.Skipf("privileged capture/attach not permitted: %v", err)
 	}
 	require.NoError(t, err)
+	require.NotNil(t, a.capW, "precondition: capture started")
+	run := a.capW.Path()
+	require.FileExists(t, run, "precondition: this run's capture exists while it runs")
 
 	require.NoError(t, a.Close())
 
@@ -67,8 +77,10 @@ func TestApp_StartAndCloseAllSubsystemsCleanly(t *testing.T) {
 	}
 	_, statErr := os.Stat(pinDir)
 	assert.NoError(t, statErr, "a pin dir that existed before Start is left in place")
-	_, statErr = os.Stat(cfg.CapturePath)
-	assert.True(t, os.IsNotExist(statErr), "default teardown (Retain=false) must wipe the capture directory")
+	assert.NoFileExists(t, run, "default teardown (Retain=false) must delete this run's capture")
+	got, err := os.ReadFile(earlier) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err, "teardown must keep a capture an earlier run left")
+	assert.Equal(t, earlierBytes, got, "an earlier run's capture must be kept byte for byte")
 }
 
 // Teardown honours --retain: artifacts survive Close when Config.Retain is set.
@@ -104,8 +116,13 @@ func TestApp_CloseWithRetainPreservesArtifacts(t *testing.T) {
 	}
 	require.NoError(t, err)
 
+	require.NotNil(t, a.capW, "precondition: capture started")
+	run := a.capW.Path()
+
 	require.NoError(t, a.Close())
 
-	_, statErr := os.Stat(cfg.CapturePath)
+	// (Feature 07: stat this run's capture; the fixed --capture-path is now a
+	// name template, never created.)
+	_, statErr := os.Stat(run)
 	assert.NoError(t, statErr, "--retain must preserve the capture artifact")
 }
