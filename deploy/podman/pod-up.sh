@@ -47,11 +47,15 @@ KEYLOG_SOCKET="$KEYLOG_DIR/keylog.sock"
 # CONTENTS. pod-down.sh's own --retain only decides whether to remove the
 # now-already-emptied-or-not podman VOLUME itself -- without also passing
 # --retain here, the app always wipes its own directory on shutdown
-# regardless of what pod-down.sh does with the volume.
+# regardless of what pod-down.sh does with the volume. The choice is also
+# recorded on the pod as the label go-ebpf-proxy.retain (AD-019), which
+# pod-down.sh follows by default, so RETAIN=1 here is the only switch needed.
 RETAIN="${RETAIN:-0}"
 SIDECAR_RETAIN_FLAG=()
+RETAIN_LABEL=0
 if [[ "$RETAIN" == "1" ]]; then
   SIDECAR_RETAIN_FLAG=(--retain)
+  RETAIN_LABEL=1
 fi
 
 if [[ ! -x "$SIDECAR_BIN" ]]; then
@@ -84,6 +88,7 @@ chown -R 1337:1337 /sys/fs/bpf/go-ebpf-proxy
 podman pod create \
   --name "$POD_NAME" \
   --share net,ipc,uts \
+  --label "go-ebpf-proxy.retain=$RETAIN_LABEL" \
   --replace
 
 podman volume create "$LOG_VOLUME" >/dev/null 2>&1 || true
@@ -161,11 +166,12 @@ if [[ ! -S "$KEYLOG_VOLUME_MOUNT/keylog.sock" ]]; then
   exit 1
 fi
 
-# Also wait for the capture writer's file to exist: it's created after the
-# keylog socket server in the sidecar's own startup sequence (Start()), so
-# the keylog-socket wait above can race ahead of it -- without this, a
+# Also wait for the capture writer's file to exist. The sidecar's Start()
+# now creates it before the keylog socket server (the server streams every
+# key line into it, AD-018), so the wait above already implies it; this
+# check stays as the explicit readiness guarantee -- without the file, a
 # teardown that happens immediately after pod-up returns (no intervening
-# smoke traffic) can find no dump.pcapng at all, even under --retain.
+# smoke traffic) could find no dump.pcapng at all, even under --retain.
 for _ in $(seq 1 100); do
   [[ -f "$LOG_VOLUME_MOUNT/dump.pcapng" ]] && break
   sleep 0.1

@@ -37,13 +37,17 @@ socket layer, and TLS keys read passively from the process that already holds th
 5. The sidecar's socket server reads those lines, validates and deduplicates them, and
    writes them as an NSS keylog (on tmpfs, `0600`/`0700`).
 6. The sidecar also captures the relay's outbound leg to a pcapng file, in-process
-   (gopacket reading an `AF_PACKET` socket — no libpcap or external capture tool),
-   embedding the keylog as a Decryption Secrets Block on close — the capture is
-   self-decrypting.
+   (gopacket reading an `AF_PACKET` socket — no libpcap or external capture tool).
+   Each key line is written into it as a Decryption Secrets Block as soon as it arrives,
+   while every packet waits one second before it is written, so the keys land ahead of
+   the handshake they decrypt. The capture is therefore self-decrypting while it is
+   being written, even if the sidecar is killed. A clean stop re-emits it with all keys
+   in one leading block.
    Retention is bounded (size + age caps) and ephemeral by default: pod teardown wipes
-   the capture directory unless `--retain` is set.
-7. Offline, `tshark`/Wireshark pairs the pcapng (or its embedded DSB) with the keylog to
-   show the app's real traffic in plaintext — proving the whole pipeline end-to-end.
+   the capture directory unless the pod was brought up with `RETAIN=1`.
+7. Offline, `tshark`/Wireshark decrypts the pcapng from its embedded DSBs alone (or
+   paired with the keylog) to show the app's real traffic in plaintext — proving the
+   whole pipeline end-to-end.
 
 ```mermaid
 flowchart LR
@@ -53,7 +57,7 @@ flowchart LR
     relay -. "outbound leg" .-> capture["capture writer<br/>pcapng, bounded + ephemeral"]
     app -. "libssl handshake" .-> interposer["LD_PRELOAD interposer<br/>(SSL_CTX_new + keylog callback)"]
     interposer -- "NSS lines over unix socket" --> keylog["keylog socket server<br/>-> NSS keylog"]
-    keylog -. "embedded as DSB on close" .-> capture
+    keylog -. "streamed in as DSBs" .-> capture
     capture -- "dump.pcapng" --> tshark["tshark / Wireshark<br/>offline decrypt"]
 ```
 
@@ -126,18 +130,25 @@ make build
 make build-preload
 
 # 2. Bring up the pod: sidecar (eBPF redirect + keylog + capture) then the app,
-#    wired with LD_PRELOAD/GOEBPF_PRELOAD_SOCKET automatically
+#    wired with LD_PRELOAD/GOEBPF_PRELOAD_SOCKET automatically. To keep the capture
+#    after teardown, bring it up with: sudo RETAIN=1 deploy/podman/pod-up.sh
 sudo deploy/podman/pod-up.sh
 
 # 3. Prove it end-to-end: a real HTTPS request through the relay, real cert validated
 sudo deploy/podman/smoke.sh
 # smoke: https://example.com -> HTTP 200
 
-# 4. Decrypt the capture offline, pairing it with the interposer-emitted keylog
-podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
+# 4. Decrypt the capture offline. It carries the session keys itself, written as
+#    Decryption Secrets Blocks while it is captured, so it decrypts with no keylog
+#    file: mid-run, after a clean stop, or after the sidecar was killed
 tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')/dump.pcapng" \
-  -o "tls.keylog_file:/tmp/sslkeylog.log" -o tcp.reassemble_out_of_order:TRUE \
+  -o "tls.keylog_file:" -o tcp.reassemble_out_of_order:TRUE \
   -Y 'http or http2' -V
+# -o "tls.keylog_file:" clears any keylog file set in your Wireshark preferences, so
+# only the keys inside the capture are used. To pair the separate keylog instead, copy
+# it off the sidecar's tmpfs first and pass its path:
+#   podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
+#   ... -o "tls.keylog_file:/tmp/sslkeylog.log" ...
 # -Y 'http or http2' matches whichever protocol the session negotiated over ALPN:
 # curl picks HTTP/2, which tshark dissects with a separate "http2" dissector that
 # a plain "http" filter never matches.
@@ -146,9 +157,18 @@ tshark -r "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mount
 # -V (full protocol detail) is required to see the actual decrypted body text --
 # -Y alone only prints a one-line protocol summary per matching packet.
 
-# 5. Tear down — wipes /var/log/sidecar by default; add --retain to keep the capture/keylog
+# 5. Tear down — wipes /var/log/sidecar unless the pod was brought up with RETAIN=1
 sudo deploy/podman/pod-down.sh
 ```
+
+Keeping the artifacts is decided once, when the pod comes up.
+`RETAIN=1` on `pod-up.sh` alone keeps the capture through teardown: the sidecar then
+keeps its capture directory when it stops, and the pod records the choice as the label
+`go-ebpf-proxy.retain=1`, which a plain `pod-down.sh` follows. The kept `dump.pcapng` decrypts with no keylog file,
+and the tmpfs keylog file is never kept: it disappears with the sidecar container, and
+the capture already carries every key it held. `RETAIN=0 pod-down.sh` still wipes a
+retained pod. `pod-down.sh --retain` on a pod brought up without `RETAIN=1` exits `1` and
+removes nothing, because that sidecar wipes its own capture when it stops.
 
 `POD_NAME`, `APP_IMAGE`, `CAPTURE_IFACE` and friends are all overridable env vars on
 `pod-up.sh` (see the script header); the smoke test targets `URL=${URL:-https://example.com}`.

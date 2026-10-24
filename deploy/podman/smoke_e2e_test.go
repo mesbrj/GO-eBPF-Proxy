@@ -3,12 +3,15 @@
 package podman
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -200,10 +203,11 @@ func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 	podName := "go-ebpf-proxy-it7dsb"
 	podUpNoCleanup(t, podName, bin, "RETAIN=1")
 	t.Cleanup(func() {
-		// No --retain here: the volume (a plaintext-equivalent secret once
-		// the keylog is embedded in it) goes away with the pod.
+		// RETAIN=0: the volume (a plaintext-equivalent secret once the
+		// keylog is embedded in it) goes away with the pod, overriding the
+		// go-ebpf-proxy.retain=1 label this RETAIN=1 pod carries (AD-019).
 		down := exec.Command("./pod-down.sh")
-		down.Env = append(os.Environ(), "POD_NAME="+podName)
+		down.Env = append(os.Environ(), "POD_NAME="+podName, "RETAIN=0")
 		_ = down.Run()
 	})
 
@@ -251,4 +255,154 @@ func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	t.Cleanup(func() {
 		_ = exec.Command("podman", "volume", "rm", "-f", podNameRetain+"-sidecar-logs").Run()
 	})
+}
+
+// AC 6 (AD-018): a sidecar killed without Close -- SIGKILL, as an OOM kill or
+// an expired stop timeout delivers -- must still leave a capture that
+// decrypts with no keylog file, for the app's TLS 1.3/HTTP2 session and its
+// TLS 1.2/HTTP1.1 session alike. The keys reach the capture only through the
+// interposer and the keylog socket, live, since Close never runs.
+func TestSmoke_KilledSidecarCaptureSelfDecrypts(t *testing.T) {
+	requireRootfulPodman(t)
+	requireInternetEgress(t)
+	if _, err := exec.LookPath("tshark"); err != nil {
+		t.Skip("tshark not installed; cannot assert decrypted application data")
+	}
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-itkill"
+	podUpNoCleanup(t, podName, bin)
+	t.Cleanup(func() {
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(os.Environ(), "POD_NAME="+podName)
+		_ = down.Run()
+	})
+	capturePath := volumeCapturePath(t, podName)
+
+	runSmoke(t, podName)
+	out, err := exec.Command("podman", "exec", podName+"-app", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", // #nosec G204 -- podName is a test-generated pod name, not external input
+		"--tlsv1.2", "--tls-max", "1.2", "--http1.1", "https://example.com").CombinedOutput()
+	require.NoError(t, err, "TLS 1.2 request: %s", out)
+	require.Equal(t, "200", strings.TrimSpace(string(out)), "the TLS 1.2 HTTP/1.1 request must succeed end-to-end")
+
+	time.Sleep(3 * time.Second)
+	killOut, err := exec.Command("podman", "kill", "-s", "KILL", podName+"-sidecar").CombinedOutput() // #nosec G204 -- podName is a test-generated pod name, not external input
+	require.NoError(t, err, "podman kill -s KILL sidecar: %s", killOut)
+
+	decrypted, err := decryptAppData(t, capturePath, "")
+	require.NoError(t, err)
+	assert.Contains(t, decrypted, ":status: 200", "the TLS 1.3 HTTP/2 response must decrypt from the killed sidecar's capture alone")
+	assert.Contains(t, decrypted, "HTTP/1.1 200 OK", "the TLS 1.2 HTTP/1.1 response must decrypt from the killed sidecar's capture alone")
+}
+
+// AC 11, AC 12 (AD-019): RETAIN=1 at pod-up.sh is the only switch. The pod
+// records it, and a plain pod-down.sh then keeps what the sidecar kept.
+func TestPodDown_PlainTeardownKeepsWhatPodUpRetained(t *testing.T) {
+	requireRootfulPodman(t)
+	bin := buildSidecarBinary(t)
+	podName := "go-ebpf-proxy-itplain"
+	podUpNoCleanup(t, podName, bin, "RETAIN=1")
+	t.Cleanup(func() {
+		_ = exec.Command("podman", "volume", "rm", "-f", podName+"-sidecar-logs").Run() // #nosec G204 -- podName is a test-generated pod name, not external input
+	})
+	assert.Equal(t, "1", podLabel(t, podName, "go-ebpf-proxy.retain"), "RETAIN=1 must be recorded on the pod")
+	capturePath := volumeCapturePath(t, podName)
+
+	down := exec.Command("./pod-down.sh")
+	down.Env = append(envWithout("RETAIN"), "POD_NAME="+podName)
+	out, err := down.CombinedOutput()
+	require.NoError(t, err, "a plain pod-down.sh must exit 0: %s", out)
+	_, err = os.Stat(capturePath)
+	assert.NoError(t, err, "a plain pod-down.sh must keep the capture of a pod brought up with RETAIN=1")
+}
+
+// envWithout returns the environment minus any variable named in keys, so a
+// test's own choice of e.g. RETAIN cannot be overridden by the caller's shell.
+func envWithout(keys ...string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.Contains(keys, name) {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
+// AC 12-16 (AD-019): pod-down.sh's retain decision, every row of pod state x
+// request. Bare pods (no containers) stand in for real ones: the decision
+// reads nothing but the pod's label, and its outcome shows on the pod and the
+// two volumes. A refusal must leave all three untouched.
+func TestPodDown_RetainDecisionTable(t *testing.T) {
+	requireRootfulPodman(t)
+	type outcome string
+	const (
+		keep   outcome = "keep"
+		wipe   outcome = "wipe"
+		refuse outcome = "refuse"
+	)
+	rows := []struct {
+		pod    string // "1", "0", "unlabelled" or "missing"
+		retain string // RETAIN at pod-down.sh; "" leaves it unset
+		flag   bool   // --retain
+		want   outcome
+	}{
+		{"1", "", false, keep}, {"1", "", true, keep}, {"1", "1", false, keep}, {"1", "0", false, wipe}, {"1", "0", true, keep},
+		{"0", "", false, wipe}, {"0", "", true, refuse}, {"0", "1", false, refuse}, {"0", "0", false, wipe}, {"0", "0", true, refuse},
+		{"unlabelled", "", false, wipe}, {"unlabelled", "", true, keep}, {"unlabelled", "1", false, keep}, {"unlabelled", "0", false, wipe},
+		{"missing", "", false, wipe}, {"missing", "", true, keep}, {"missing", "1", false, keep}, {"missing", "0", false, wipe},
+	}
+	require.Len(t, rows, 18)
+	for i, r := range rows {
+		t.Run(fmt.Sprintf("pod=%s/RETAIN=%q/flag=%t", r.pod, r.retain, r.flag), func(t *testing.T) {
+			podName := fmt.Sprintf("go-ebpf-proxy-ittable%02d", i)
+			logVol, sockVol := podName+"-sidecar-logs", podName+"-keylog-sock"
+			t.Cleanup(func() {
+				_ = exec.Command("podman", "pod", "rm", "-f", podName).Run()            // #nosec G204 -- test-generated name
+				_ = exec.Command("podman", "volume", "rm", "-f", logVol, sockVol).Run() // #nosec G204 -- test-generated names
+			})
+			for _, v := range []string{logVol, sockVol} {
+				out, err := exec.Command("podman", "volume", "create", v).CombinedOutput() // #nosec G204 -- test-generated name
+				require.NoError(t, err, "podman volume create %s: %s", v, out)
+			}
+			create := []string{"pod", "create", "--name", podName}
+			switch r.pod {
+			case "1", "0":
+				create = append(create, "--label", "go-ebpf-proxy.retain="+r.pod)
+			}
+			if r.pod != "missing" {
+				out, err := exec.Command("podman", create...).CombinedOutput() // #nosec G204 -- test-generated arguments
+				require.NoError(t, err, "podman pod create: %s", out)
+			}
+
+			var args []string
+			if r.flag {
+				args = append(args, "--retain")
+			}
+			down := exec.Command("./pod-down.sh", args...)
+			down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName)
+			if r.retain != "" {
+				down.Env = append(down.Env, "RETAIN="+r.retain)
+			}
+			var stderr bytes.Buffer
+			down.Stderr = &stderr
+			err := down.Run()
+
+			switch r.want {
+			case refuse:
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr, "pod-down.sh must refuse: %s", stderr.String())
+				assert.Equal(t, 1, exitErr.ExitCode())
+				assert.True(t, podExists(t, podName), "a refusal must leave the pod in place")
+				assert.True(t, volumeExists(t, logVol), "a refusal must leave the log volume in place")
+				assert.True(t, volumeExists(t, sockVol), "a refusal must leave the keylog socket volume in place")
+				assert.Contains(t, stderr.String(), "RETAIN=1")
+				assert.Contains(t, stderr.String(), "pod-up.sh")
+			case keep, wipe:
+				require.NoError(t, err, "pod-down.sh must exit 0: %s", stderr.String())
+				assert.False(t, podExists(t, podName), "the pod must be removed")
+				assert.False(t, volumeExists(t, sockVol), "the keylog socket volume is always removed")
+				assert.Equal(t, r.want == keep, volumeExists(t, logVol), "log volume kept must be %t", r.want == keep)
+			}
+		})
+	}
 }
