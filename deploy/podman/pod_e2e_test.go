@@ -76,7 +76,9 @@ func inspectContainer(t *testing.T, name string) podmanInspect {
 
 func podUp(t *testing.T, podName, sidecarBin string) {
 	t.Helper()
-	env := append(os.Environ(), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
+	// A RETAIN exported by the caller's shell must not leak into a test that
+	// asserts what pod-up.sh does without one (AD-019).
+	env := append(envWithout("RETAIN"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
 	up := exec.Command("./pod-up.sh")
 	up.Env = env
 	out, err := up.CombinedOutput()

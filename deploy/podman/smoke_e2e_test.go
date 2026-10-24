@@ -40,7 +40,7 @@ func requireInternetEgress(t *testing.T) {
 // RETAIN=1, which pod-up.sh forwards to the sidecar's own --retain flag).
 func podUpNoCleanup(t *testing.T, podName, sidecarBin string, extraEnv ...string) {
 	t.Helper()
-	env := append(os.Environ(), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
+	env := append(envWithout("RETAIN"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
 	env = append(env, extraEnv...)
 	up := exec.Command("./pod-up.sh")
 	up.Env = env
@@ -278,7 +278,10 @@ func TestSmoke_KilledSidecarCaptureSelfDecrypts(t *testing.T) {
 	})
 	capturePath := volumeCapturePath(t, podName)
 
-	runSmoke(t, podName)
+	h2, err := exec.Command("podman", "exec", podName+"-app", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{http_version}", // #nosec G204 -- podName is a test-generated pod name, not external input
+		"--tlsv1.3", "--http2", "https://example.com").CombinedOutput()
+	require.NoError(t, err, "TLS 1.3 request: %s", h2)
+	require.Equal(t, "200 2", strings.TrimSpace(string(h2)), "the TLS 1.3 HTTP/2 request must succeed end-to-end")
 	out, err := exec.Command("podman", "exec", podName+"-app", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", // #nosec G204 -- podName is a test-generated pod name, not external input
 		"--tlsv1.2", "--tls-max", "1.2", "--http1.1", "https://example.com").CombinedOutput()
 	require.NoError(t, err, "TLS 1.2 request: %s", out)
@@ -383,7 +386,8 @@ func TestPodDown_RetainDecisionTable(t *testing.T) {
 			if r.retain != "" {
 				down.Env = append(down.Env, "RETAIN="+r.retain)
 			}
-			var stderr bytes.Buffer
+			var stdout, stderr bytes.Buffer
+			down.Stdout = &stdout
 			down.Stderr = &stderr
 			err := down.Run()
 
@@ -397,11 +401,17 @@ func TestPodDown_RetainDecisionTable(t *testing.T) {
 				assert.True(t, volumeExists(t, sockVol), "a refusal must leave the keylog socket volume in place")
 				assert.Contains(t, stderr.String(), "RETAIN=1")
 				assert.Contains(t, stderr.String(), "pod-up.sh")
+				assert.Empty(t, stdout.String(), "a refusal must print nothing on stdout")
 			case keep, wipe:
 				require.NoError(t, err, "pod-down.sh must exit 0: %s", stderr.String())
 				assert.False(t, podExists(t, podName), "the pod must be removed")
 				assert.False(t, volumeExists(t, sockVol), "the keylog socket volume is always removed")
 				assert.Equal(t, r.want == keep, volumeExists(t, logVol), "log volume kept must be %t", r.want == keep)
+				wantLine := fmt.Sprintf("pod-down: pod %s removed, %s and %s wiped\n", podName, logVol, sockVol)
+				if r.want == keep {
+					wantLine = fmt.Sprintf("pod-down: retaining, keeping volume %s (%s removed)\n", logVol, sockVol)
+				}
+				assert.Equal(t, wantLine, stdout.String(), "pod-down.sh must print exactly its one outcome line")
 			}
 		})
 	}
