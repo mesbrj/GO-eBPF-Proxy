@@ -2,11 +2,14 @@ package capture
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,12 +177,18 @@ func TestWriter_EmbedKeylog_EmptyIsNoop(t *testing.T) {
 	assert.NoError(t, w.EmbedKeylog([]string{}))
 }
 
+// liveBound is how stale the on-disk capture may be while the sidecar runs
+// (AC 10): a packet waits out holdWindow, then at most one flushInterval for
+// the next drain, plus scheduling slack.
+const liveBound = 1500 * time.Millisecond
+
 // CAPTURE-01/CAPTURE-11 regression: the file on disk must be non-empty right
-// after NewWriter (the SHB/IDB header), and must grow after each WritePacket
-// -- all WITHOUT calling Close. pcapgo.NgWriter buffers internally (bufio),
-// so a missing Flush left the file at 0 bytes for an entire live session
-// (only visible once the sidecar was torn down), which is what a real
-// end-to-end smoke test run surfaced as an apparently-empty dump.pcapng.
+// after NewWriter (the SHB/IDB header), and must grow after a WritePacket
+// within liveBound -- all WITHOUT calling Close, and with nothing written
+// after it. pcapgo.NgWriter buffers internally (bufio), so a missing Flush
+// left the file at 0 bytes for an entire live session (only visible once the
+// sidecar was torn down), which is what a real end-to-end smoke test run
+// surfaced as an apparently-empty dump.pcapng.
 func TestWriter_FileVisibleOnDiskWithoutClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dump.pcapng")
 	w, err := NewWriter(path, Options{})
@@ -190,7 +199,202 @@ func TestWriter_FileVisibleOnDiskWithoutClose(t *testing.T) {
 	assert.Positive(t, sizeAfterOpen, "file must contain the SHB/IDB header on disk before any packet is written")
 
 	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{0x01, 0x02, 0x03}))
-	assert.Greater(t, fileSize(t, path), sizeAfterOpen, "file must grow on disk after WritePacket, without Close")
+	assert.Eventually(t, func() bool { return fileSize(t, path) > sizeAfterOpen }, liveBound, 20*time.Millisecond,
+		"a lone packet must reach the file on disk within %s, without Close or any later packet", liveBound)
+}
+
+// AC 10: the tail of a burst must not wait for the next packet. Packets that
+// arrive within one flush interval of each other used to sit in the buffer
+// until something else arrived, for as long as the interface stayed quiet.
+func TestWriter_BurstTailReachesDiskWithoutLaterTraffic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	for i := range 3 {
+		if i > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte{byte(i)}))
+	}
+	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 3 }, liveBound, 20*time.Millisecond,
+		"all three packets of the burst must be on disk within %s of the last one, without Close", liveBound)
+}
+
+// AC 5 (AD-018): a secret that arrives while a packet is still inside the hold
+// window is written ahead of it -- in the file on disk, before Close -- since
+// tshark decrypts a TLS 1.3 session only when its secrets precede the
+// session's ServerHello, which is captured before the client can derive them.
+func TestWriter_LiveSecretPrecedesPacketsStillHeld(t *testing.T) {
+	for _, age := range []time.Duration{0, 500 * time.Millisecond, 990 * time.Millisecond} {
+		t.Run(age.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "dump.pcapng")
+			clock := newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+			w, err := NewWriter(path, Options{Clock: clock})
+			require.NoError(t, err)
+			defer func() { _ = w.Close() }()
+
+			require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xaa}))
+			clock.Advance(age)
+			w.AddSecret(nssKeylogLine)
+
+			assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeDSB) == 1 }, liveBound, 20*time.Millisecond,
+				"the secret must reach the file on disk without Close")
+			assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB}, blockTypes(readFile(t, path)),
+				"a packet held for %s must not be written before the secret that arrived after it", age)
+
+			clock.Advance(holdWindow)
+			assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 1 }, liveBound, 20*time.Millisecond,
+				"the packet must be written once it has been held for %s", holdWindow)
+			assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB}, blockTypes(readFile(t, path)),
+				"the live DSB must precede the packet it may decrypt")
+			assert.Equal(t, []string{nssKeylogLine + "\n"}, secretsPayloads(readFile(t, path)))
+		})
+	}
+}
+
+// AC 5, AC 9: a live DSB carries exactly the lines handed over since the last
+// drain, newline-terminated, and a line handed over twice is written once.
+func TestWriter_LiveSecretsWrittenOnceEach(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	first, second := keylogLine(1), keylogLine(2)
+	w.AddSecret(first)
+	w.AddSecret(first)
+	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeDSB) == 1 }, liveBound, 20*time.Millisecond)
+	w.AddSecret(second)
+	w.AddSecret(first)
+	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeDSB) == 2 }, liveBound, 20*time.Millisecond)
+
+	time.Sleep(2 * flushInterval) // a stray third DSB would have been drained by now
+	assert.Equal(t, []string{first + "\n", second + "\n"}, secretsPayloads(readFile(t, path)),
+		"each live DSB must hold exactly the new lines, each once")
+}
+
+// AC 7: the hold queue is bounded. Holding exactly maxHeldBytes writes
+// nothing early; one byte more writes the oldest packets until the held
+// total is back within the cap -- here exactly one, the oldest.
+func TestWriter_HoldCapWritesOldestPacketsFirst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{Clock: newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))})
+	require.NoError(t, err)
+	defer func() { _ = w.Close() }()
+
+	const size = 64 << 10
+	for i := range maxHeldBytes / size {
+		data := make([]byte, size)
+		data[0] = byte(i) // packet 0 is the oldest
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, data))
+	}
+	time.Sleep(2 * flushInterval)
+	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB}, blockTypes(readFile(t, path)),
+		"holding exactly %d bytes must not write any packet before its hold window ends", maxHeldBytes)
+
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xff}))
+	assert.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 1 }, liveBound, 20*time.Millisecond,
+		"one byte past the cap must write the oldest packet at once")
+	time.Sleep(2 * flushInterval)
+	packets := packetPayloads(readFile(t, path))
+	require.Len(t, packets, 1, "only as many packets as it takes to get back within the cap may be written early")
+	assert.Equal(t, byte(0), packets[0][0], "the packet written early must be the oldest")
+	assert.Len(t, packets[0], size)
+}
+
+// AC 8: Close writes every packet handed to WritePacket, in order, including
+// the ones still inside the hold window.
+func TestWriter_CloseWritesEveryHeldPacket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+
+	var want [][]byte
+	for i := range 5 {
+		data := []byte(fmt.Sprintf("held-%d", i))
+		want = append(want, data)
+		require.NoError(t, w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, data))
+	}
+	require.NoError(t, w.Close())
+
+	assert.Equal(t, want, readPackets(t, path), "Close must write every held packet, in order")
+}
+
+// AC 9 / door 3: after Close the capture is exactly SHB -> IDB -> one DSB ->
+// packets, even when its secrets were also written live along the way. The
+// live DSBs are dropped, so no secret appears twice.
+func TestWriter_CloseLeavesOneSecretsBlockWithEachLineOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	clock := newManualClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	w, err := NewWriter(path, Options{Clock: clock})
+	require.NoError(t, err)
+
+	first, second := keylogLine(1), keylogLine(2)
+	w.AddSecret(first)
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xaa}))
+	clock.Advance(holdWindow)
+	require.Eventually(t, func() bool { return countBlocks(readFile(t, path), blockTypeEPB) == 1 }, liveBound, 20*time.Millisecond,
+		"precondition: the first secret and packet are written live")
+
+	w.AddSecret(second)
+	w.AddSecret(first)
+	require.NoError(t, w.WritePacket(gopacket.CaptureInfo{}, []byte{0xbb}))
+	require.NoError(t, w.EmbedKeylog([]string{first, second}))
+	require.NoError(t, w.Close())
+
+	raw := readFile(t, path)
+	assert.Equal(t, []uint32{blockTypeSHB, blockTypeIDB, blockTypeDSB, blockTypeEPB, blockTypeEPB}, blockTypes(raw),
+		"a closed capture must be laid out SHB -> IDB -> DSB -> packets; block sequence was %s", blockNames(blockTypes(raw)))
+	assert.Equal(t, []string{first + "\n" + second + "\n"}, secretsPayloads(raw), "the one DSB must hold each distinct line once")
+	assert.Equal(t, [][]byte{{0xaa}, {0xbb}}, packetPayloads(raw))
+}
+
+// AC 5, AC 8: the capture goroutine, many keylog connections and the
+// periodic drain all reach the Writer at once in the sidecar. Run under
+// -race, this must report no race, and the closed capture must hold every
+// packet in order and every line.
+func TestWriter_ConcurrentPacketsAndSecretsAreRaceFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.pcapng")
+	w, err := NewWriter(path, Options{})
+	require.NoError(t, err)
+
+	const packets, senders, linesPerSender = 400, 8, 8
+	var wg sync.WaitGroup
+	wg.Add(1 + senders)
+	go func() {
+		defer wg.Done()
+		for i := range packets {
+			_ = w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now()}, []byte(fmt.Sprintf("pkt-%03d", i)))
+			if i%50 == 0 {
+				time.Sleep(flushInterval / 2) // let drains interleave with the writes
+			}
+		}
+	}()
+	for s := range senders {
+		go func() {
+			defer wg.Done()
+			for l := range linesPerSender {
+				w.AddSecret(keylogLine(s*linesPerSender + l))
+			}
+		}()
+	}
+	wg.Wait()
+	require.NoError(t, w.Close())
+
+	got := readPackets(t, path)
+	require.Len(t, got, packets)
+	for i, data := range got {
+		assert.Equal(t, fmt.Sprintf("pkt-%03d", i), string(data), "packet %d out of order", i)
+	}
+	payloads := secretsPayloads(readFile(t, path))
+	require.Len(t, payloads, 1)
+	lines := strings.Split(strings.TrimSuffix(payloads[0], "\n"), "\n")
+	assert.Len(t, lines, senders*linesPerSender)
+	for n := range senders * linesPerSender {
+		assert.Contains(t, lines, keylogLine(n))
+	}
 }
 
 // CAPTURE-04/CAPTURE-11 regression: an embedded keylog is only usable if its
@@ -348,6 +552,98 @@ func blockNames(types []uint32) string {
 		}
 	}
 	return strings.Join(names, ", ")
+}
+
+// keylogLine returns a distinct, fabricated NSS keylog line for n.
+func keylogLine(n int) string {
+	return fmt.Sprintf("CLIENT_RANDOM %064x %096x", n, n)
+}
+
+// pcapngBlock is one complete block of a pcapng file: its type and body.
+type pcapngBlock struct {
+	typ  uint32
+	body []byte
+}
+
+// completeBlocks walks raw's block stream and returns every complete block,
+// stopping silently at a trailing block that is still being written: a live
+// capture can be read mid-flush, which pcapngBlockTypes would reject.
+func completeBlocks(raw []byte) []pcapngBlock {
+	var blocks []pcapngBlock
+	for off := 0; off+8 <= len(raw); {
+		length := int(binary.LittleEndian.Uint32(raw[off+4 : off+8]))
+		if length < 12 || off+length > len(raw) {
+			break
+		}
+		blocks = append(blocks, pcapngBlock{typ: binary.LittleEndian.Uint32(raw[off : off+4]), body: raw[off+8 : off+length-4]})
+		off += length
+	}
+	return blocks
+}
+
+func blockTypes(raw []byte) []uint32 {
+	var types []uint32
+	for _, b := range completeBlocks(raw) {
+		types = append(types, b.typ)
+	}
+	return types
+}
+
+func countBlocks(raw []byte, typ uint32) int {
+	n := 0
+	for _, b := range completeBlocks(raw) {
+		if b.typ == typ {
+			n++
+		}
+	}
+	return n
+}
+
+// secretsPayloads returns the payload of every Decryption Secrets Block in
+// raw, in file order. A DSB body is {secrets type, secrets length, data}.
+func secretsPayloads(raw []byte) []string {
+	var payloads []string
+	for _, b := range completeBlocks(raw) {
+		if b.typ == blockTypeDSB {
+			n := binary.LittleEndian.Uint32(b.body[4:8])
+			payloads = append(payloads, string(b.body[8:8+n]))
+		}
+	}
+	return payloads
+}
+
+// packetPayloads returns the captured bytes of every Enhanced Packet Block in
+// raw, in file order. An EPB body is {interface id, timestamp high, timestamp
+// low, captured length, original length, data}.
+func packetPayloads(raw []byte) [][]byte {
+	var packets [][]byte
+	for _, b := range completeBlocks(raw) {
+		if b.typ == blockTypeEPB {
+			n := binary.LittleEndian.Uint32(b.body[12:16])
+			packets = append(packets, b.body[20:20+n])
+		}
+	}
+	return packets
+}
+
+// readPackets reads every packet of the capture at path through gopacket's
+// own pcapng reader -- a third-party reader, independent of the Writer.
+func readPackets(t *testing.T, path string) [][]byte {
+	t.Helper()
+	f, err := os.Open(path) // #nosec G304 -- test-controlled temp path
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
+	require.NoError(t, err)
+	var packets [][]byte
+	for {
+		data, _, err := r.ReadPacketData()
+		if errors.Is(err, io.EOF) {
+			return packets
+		}
+		require.NoError(t, err)
+		packets = append(packets, data)
+	}
 }
 
 func readFile(t *testing.T, path string) []byte {
