@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -238,4 +239,80 @@ func keys[V any](m map[string]V) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// postStep returns the post job's step with the given name.
+func postStep(t *testing.T, name string) (int, step) {
+	t.Helper()
+	post := repoWorkflow(t, "review.yml").job(t, "post")
+	for i, s := range post.Steps {
+		if s.Name == name {
+			return i, s
+		}
+	}
+	require.Failf(t, "post step missing", "%q", name)
+	return -1, step{}
+}
+
+// C55 (door 4): the App token asks for exactly Contents read and Pull requests
+// write; Metadata read comes with every installation token.
+func TestReviewWorkflow_PostTokenRequestsOnlyContentsReadAndPullRequestsWrite(t *testing.T) {
+	mint, ok := stepUsing(repoWorkflow(t, "review.yml").job(t, "post"), "actions/create-github-app-token@")
+	require.True(t, ok, "post does not mint an App token")
+	perms := map[string]any{}
+	for k, v := range mint.With {
+		if strings.HasPrefix(k, "permission-") {
+			perms[k] = v
+		}
+	}
+	assert.Equal(t, map[string]any{"permission-contents": "read", "permission-pull-requests": "write"}, perms)
+}
+
+// C55 (door 4): before posting, post checks with the App token that the bot is
+// installed on this repository alone, and fails otherwise.
+func TestReviewWorkflow_PostAssertsTheBotIsInstalledOnThisRepositoryOnly(t *testing.T) {
+	const name = "Confirm the bot is installed on this repository only"
+	idx, confirm := postStep(t, name)
+	post := repoWorkflow(t, "review.yml").job(t, "post")
+	mintIdx := -1
+	for i, s := range post.Steps {
+		if strings.HasPrefix(s.Uses, "actions/create-github-app-token@") {
+			mintIdx = i
+		}
+	}
+	postIdx := stepIndex(post, regexp.MustCompile(`post_review\.py`))
+	assert.Greater(t, idx, mintIdx, "the check needs the App token")
+	assert.Less(t, idx, postIdx, "the check must run before anything is posted")
+	assert.Equal(t, "${{ steps.app-token.outputs.token }}", confirm.Env["GH_TOKEN"])
+
+	installation := func(selection string, repos ...string) string {
+		var list []string
+		for _, r := range repos {
+			list = append(list, `{"full_name":"`+r+`"}`)
+		}
+		return `{"total_count":` + strconv.Itoa(len(repos)) + `,"repository_selection":"` + selection + `","repositories":[` + strings.Join(list, ",") + `]}`
+	}
+	cases := []struct {
+		name, response string
+		ok             bool
+	}{
+		{"selected, this repository only", installation("selected", testRepo), true},
+		{"installed on all repositories", installation("all", testRepo), false},
+		{"selected, another repository too", installation("selected", testRepo, "mesbrj/other"), false},
+		{"selected, another repository only", installation("selected", "mesbrj/other"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := newFakeGH(t, map[string]ghResponse{"GET installation/repositories": {Stdout: tc.response}})
+			r := runStep(t, confirm.Run, gh.env("GITHUB_REPOSITORY="+testRepo, "RUNNER_TEMP="+t.TempDir()))
+			if tc.ok {
+				require.Equal(t, 0, r.code, r.output())
+				assert.Contains(t, nonEmptyLines(r.stdout), "installation repository_selection: selected")
+				assert.Contains(t, nonEmptyLines(r.stdout), "installation repositories: "+testRepo)
+			} else {
+				assert.NotEqual(t, 0, r.code, r.output())
+			}
+			assert.Equal(t, []string{"GET installation/repositories"}, callKeys(gh.calls()), "one read, no write")
+		})
+	}
 }
