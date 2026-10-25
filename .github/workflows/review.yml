@@ -180,6 +180,22 @@ jobs:
           permission-contents: read
           permission-pull-requests: write
 
+      # Door 4: the App is installed on this repository alone. Checked with the
+      # App's own token, because gh's OAuth token cannot read a private App.
+      - name: Confirm the bot is installed on this repository only
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api installation/repositories >"$RUNNER_TEMP/installation.json"
+          selection=$(jq -r .repository_selection "$RUNNER_TEMP/installation.json")
+          repos=$(jq -r '[.repositories[].full_name] | join(",")' "$RUNNER_TEMP/installation.json")
+          echo "installation repository_selection: $selection"
+          echo "installation repositories: $repos"
+          if [[ "$selection" != selected || "$repos" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::the review bot must be installed on $GITHUB_REPOSITORY only"
+            exit 1
+          fi
+
       - name: Post the review as the bot
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
