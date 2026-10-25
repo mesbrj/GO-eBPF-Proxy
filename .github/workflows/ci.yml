@@ -1,0 +1,186 @@
+# Every merge gate, folded into the one required check, ci-ok (AD-024).
+# Each gate job calls a Makefile target: CI never re-spells a gate's command.
+# A new gate joins by being listed in ci-ok's needs; the ruleset is not edited.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: make lint-workflows
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          install-only: true
+      - run: make lint
+      # make lint runs go fmt, which rewrites a file and still exits 0.
+      - name: Fail when go fmt rewrote a file
+        run: |
+          if ! git diff --exit-code --name-only; then
+            echo "::error::go fmt rewrote the files listed above: run make fmt and commit the result"
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        link_mode: [static, dynamic]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - run: make build LINK_MODE=${{ matrix.link_mode }}
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      # internal/repopolicy runs make lint-workflows, which needs uvx.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: make test
+
+  test-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      # tshark for the decryption tests, libssl-dev for the LD_PRELOAD interposer.
+      - name: Install tshark and the OpenSSL headers
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark libssl-dev
+      # The tests attach to temporary child cgroups and skip unless root. Ubuntu's
+      # sudo secure_path would drop setup-go's Go from PATH, hence env PATH.
+      - run: sudo -E env "PATH=$PATH" make test-integration
+
+  generate-drift:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - name: Install clang, llvm and bpftool
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm linux-tools-common "linux-tools-$(uname -r)"
+      - name: Show the runner kernel's BTF and the toolchain
+        run: |
+          uname -r
+          test -r /sys/kernel/btf/vmlinux
+          bpftool version
+          clang --version
+      - run: make generate
+      - name: Fail when the committed eBPF objects drift from proxy.bpf.c
+        run: |
+          if ! git diff --exit-code --name-only -- bpf/; then
+            echo "::error::make generate changed the files listed above: regenerate them with make generate and commit the result"
+            exit 1
+          fi
+
+  preload:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the OpenSSL headers
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libssl-dev
+      - run: make build-preload
+
+  govulncheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - run: make vuln
+
+  ci-ok:
+    if: always()
+    needs:
+      - workflow-lint
+      - lint
+      - build
+      - test
+      - test-integration
+      - generate-drift
+      - preload
+      - govulncheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every gate to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<<"$NEEDS")
+          if [[ -n "$failed" ]]; then
+            while IFS= read -r line; do
+              echo "::error::gate did not succeed: $line"
+            done <<<"$failed"
+            exit 1
+          fi
+          echo "every gate succeeded"
