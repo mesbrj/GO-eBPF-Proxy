@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -422,44 +424,52 @@ func TestReviewWorkflow_JudgeJobIsPinned(t *testing.T) {
 	}
 }
 
-// claudeProjectConfig is the Claude Code project configuration main must not
-// track: three files, and three directories, written with a trailing slash.
-var claudeProjectConfig = []string{
-	".claude/settings.json",
-	".claude/settings.local.json",
-	".mcp.json",
-	".claude/hooks/",
-	".claude/agents/",
-	".claude/commands/",
+// judgeSkillFiles are the only tracked paths with a .claude path component
+// that door 5's restated caveat allows: the-judge's 7 files.
+var judgeSkillFiles = []string{
+	".claude/skills/the-judge/.skill-meta.json",
+	".claude/skills/the-judge/SKILL.md",
+	".claude/skills/the-judge/references/comment-voice.md",
+	".claude/skills/the-judge/references/review-standards.md",
+	".claude/skills/the-judge/scripts/post_review.py",
+	".claude/skills/the-judge/scripts/review_gate.py",
+	".claude/skills/the-judge/scripts/scan_bypasses.py",
 }
 
-// C87 (door 5 scope and accepted caveat; fix round 5): claude-code-action
-// restores .claude/ and .mcp.json from the base branch, and Claude Code loads
-// its settings, hooks and MCP servers from them, so main tracks none. Python
-// imports a file beside judge's scripts ahead of the standard-library module
-// it is named after, so their directory holds exactly the three scripts.
+// C87 (door 5's caveat, restated in fix round 6): claude-code-action restores
+// .claude/ and .mcp.json from the base branch, and Claude Code loads settings,
+// hooks, subagents and MCP servers from them, through a symlink as well. So
+// git's tracked paths decide: those with a .claude component, at any depth,
+// are exactly the-judge's 7 regular files, which leaves nothing beside judge's
+// scripts to shadow a module they import, and no path is named .mcp.json.
 func TestReviewWorkflow_CheckoutCarriesNoClaudeConfig(t *testing.T) {
-	cmd := exec.Command("git", "ls-files", "-z")
+	cmd := exec.Command("git", "ls-files", "-s", "-z")
 	cmd.Dir = repoRoot(t)
 	res := run(t, cmd)
 	require.Zero(t, res.code, "git ls-files: %s", res.stderr)
-	tracked := strings.Split(strings.TrimSuffix(res.stdout, "\x00"), "\x00")
-	require.Contains(t, tracked, ".github/workflows/review.yml", "git ls-files did not list this repository")
 
-	var config, scripts []string
-	for _, path := range tracked {
-		for _, c := range claudeProjectConfig {
-			if path == c || (strings.HasSuffix(c, "/") && strings.HasPrefix(path, c)) {
-				config = append(config, path)
-			}
+	var tracked, claude, mcp []string
+	for _, entry := range strings.Split(strings.TrimSuffix(res.stdout, "\x00"), "\x00") {
+		// <mode> SP <object> SP <stage> TAB <path>
+		info, p, ok := strings.Cut(entry, "\t")
+		require.True(t, ok, "git ls-files -s entry %q has no path", entry)
+		tracked = append(tracked, p)
+		if slices.Contains(strings.Split(p, "/"), ".claude") {
+			mode, _, _ := strings.Cut(info, " ")
+			claude = append(claude, mode+" "+p)
 		}
-		if name, ok := strings.CutPrefix(path, judgeScripts+"/"); ok {
-			scripts = append(scripts, name)
+		if path.Base(p) == ".mcp.json" {
+			mcp = append(mcp, p)
 		}
 	}
-	assert.Empty(t, config, "tracked Claude Code project configuration")
-	assert.ElementsMatch(t, []string{"post_review.py", "review_gate.py", "scan_bypasses.py"}, scripts,
-		"tracked files under %s, with no subdirectory", judgeScripts)
+	require.Contains(t, tracked, ".github/workflows/review.yml", "git ls-files did not list this repository")
+
+	want := make([]string, 0, len(judgeSkillFiles))
+	for _, p := range judgeSkillFiles {
+		want = append(want, "100644 "+p)
+	}
+	assert.ElementsMatch(t, want, claude, "tracked paths with a .claude component, as <mode> <path>")
+	assert.Empty(t, mcp, "tracked paths named .mcp.json")
 }
 
 func keys[V any](m map[string]V) []string {
