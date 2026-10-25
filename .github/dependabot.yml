@@ -1,0 +1,25 @@
+# Grouped weekly updates, each at least 7 days after release. github.com/cilium/ebpf
+# stays out of the gomod group: its bump needs `make generate` and arrives alone.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gomod:
+        patterns: ["*"]
+        update-types: [minor, patch]
+        exclude-patterns: [github.com/cilium/ebpf]
