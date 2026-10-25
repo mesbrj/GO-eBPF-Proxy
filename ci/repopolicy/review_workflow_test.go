@@ -394,10 +394,10 @@ func TestReviewWorkflow_ClaudeStepInputsArePinned(t *testing.T) {
 	assert.ElementsMatch(t, judgeAllowedTools, splitRules(words[n], ","), "the --allowedTools value's rules against door 5's closed list")
 }
 
-// statusFunction matches a status check function other than success(). An if:
-// that calls one loses GitHub's implicit success(), so its step can run after
-// the claude step failed.
-var statusFunction = regexp.MustCompile(`(?i)\b(always|failure|cancelled)\s*\(`)
+// statusFunction matches a call to any status check function. An if: that calls
+// one, success() included, loses GitHub's implicit success(), so its step can
+// run after the claude step failed, as with if: "!success()".
+var statusFunction = regexp.MustCompile(`(?i)\b(success|always|failure|cancelled)\s*\(`)
 
 // C14 (feature 09, AC 13): when the Opus session cannot complete, judge fails
 // before it uploads findings, so review-post finds no artifact and posts
