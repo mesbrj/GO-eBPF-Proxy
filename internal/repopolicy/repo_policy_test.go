@@ -74,7 +74,22 @@ func compliantRepo(t *testing.T) map[string]ghResponse {
 		"GET " + policyAPI + "/rulesets/" + liveRulesetID:                          {Stdout: liveRuleset(t, nil)},
 		"GET " + policyAPI + "/environments/review-bot":                            {Stdout: `{"name":"review-bot","deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}`},
 		"GET " + policyAPI + "/environments/review-bot/deployment-branch-policies": {Stdout: `{"total_count":1,"branch_policies":[{"id":1,"node_id":"MDE2","name":"main","type":"branch"}]}`},
+		repositorySecrets: repositorySecretsListing(),
 	}
+}
+
+// repositorySecrets lists the repository's own Actions secrets; GitHub lists
+// environment secrets under each environment instead (C84, door 3).
+const repositorySecrets = "GET " + policyAPI + "/actions/secrets"
+
+// repositorySecretsListing is GitHub's answer to repositorySecrets holding
+// the named secrets (the API never returns a value).
+func repositorySecretsListing(names ...string) ghResponse {
+	entries := make([]string, len(names))
+	for i, n := range names {
+		entries[i] = fmt.Sprintf(`{"name":%q,"created_at":"2026-10-25T10:00:00Z","updated_at":"2026-10-25T10:00:00Z"}`, n)
+	}
+	return ghResponse{Stdout: fmt.Sprintf(`{"total_count":%d,"secrets":[%s]}`, len(names), strings.Join(entries, ","))}
 }
 
 // driftedRepo is compliantRepo with exactly the named setting off-policy.
@@ -156,7 +171,7 @@ func TestRepoPolicy_CheckExitsOneNamingEachDifferingSetting(t *testing.T) {
 	}
 }
 
-// C62 (AC 62)
+// C62 (AC 62), with C84's 13th line: the 12 settings and no repository secret.
 func TestRepoPolicy_CheckExitsZeroWhenEverySettingMatches(t *testing.T) {
 	gh := newFakeGH(t, compliantRepo(t))
 	r := repoPolicy(t, gh, "check")
@@ -166,6 +181,8 @@ func TestRepoPolicy_CheckExitsZeroWhenEverySettingMatches(t *testing.T) {
 	for _, s := range policySettings {
 		want = append(want, "ok "+s)
 	}
+	want = append(want, "ok repository_actions_secrets")
+	require.Len(t, want, 13)
 	assert.ElementsMatch(t, want, nonEmptyLines(r.stdout))
 	for _, c := range gh.calls() {
 		assert.True(t, strings.HasPrefix(c.Key, "GET "), "check made a write: %s", c.Key)
@@ -319,6 +336,97 @@ func TestRepoPolicy_CheckRejectsEveryOtherReviewBotBranchRule(t *testing.T) {
 			}
 			require.Len(t, wants, 1, "only review-bot's rule differs:\n%s", r.stdout)
 			assert.Regexp(t, `\breview_bot_deployment_branches$`, wants[0])
+		})
+	}
+}
+
+// secretNames are the repository secrets the listings below report; no output
+// line may carry one.
+var secretNames = []string{"LEFTOVER_TOKEN", "DEPLOY_KEY", "OLD_APP_KEY"}
+
+// C84 (door 3): check counts the repository's own Actions secrets and accepts
+// none; it prints the count, never a name, and never lists an environment's.
+func TestRepoPolicy_CheckRejectsRepositoryActionsSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		listing ghResponse
+		code    int
+		line    string // the line naming repository_actions_secrets; "" when any but ok will do
+	}{
+		{"0", repositorySecretsListing(), 0, "ok repository_actions_secrets"},
+		{"1", repositorySecretsListing(secretNames[0]), 1, "want 0 got 1 for repository_actions_secrets"},
+		{"3", repositorySecretsListing(secretNames...), 1, "want 0 got 3 for repository_actions_secrets"},
+		{"listing unreadable", ghResponse{
+			Stdout: `{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/actions/secrets#list-repository-secrets","status":"403"}`,
+			Stderr: "gh: Resource not accessible by integration (HTTP 403)\n",
+			Exit:   1,
+		}, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := compliantRepo(t)
+			state[repositorySecrets] = tc.listing
+			gh := newFakeGH(t, state)
+			r := repoPolicy(t, gh, "check")
+			assert.Equal(t, tc.code, r.code, r.output())
+
+			var named []string
+			for _, l := range nonEmptyLines(r.stdout) {
+				if strings.Contains(l, "repository_actions_secrets") {
+					named = append(named, l)
+				}
+			}
+			require.Len(t, named, 1, "one line names repository_actions_secrets:\n%s", r.stdout)
+			if tc.line != "" {
+				assert.Equal(t, tc.line, named[0])
+			} else {
+				assert.NotEqual(t, "ok repository_actions_secrets", named[0])
+			}
+			for _, s := range policySettings {
+				assert.Contains(t, nonEmptyLines(r.stdout), "ok "+s)
+			}
+			for _, n := range secretNames {
+				assert.NotContains(t, r.output(), n, "check printed a secret's name")
+			}
+
+			var secretReads []string
+			for _, c := range gh.calls() {
+				if strings.Contains(c.Key, "secrets") {
+					secretReads = append(secretReads, c.Key)
+				}
+			}
+			assert.Equal(t, []string{repositorySecrets}, secretReads, "check reads the repository's listing only")
+		})
+	}
+}
+
+// C84 (door 3): apply neither creates nor deletes a secret, and with one at
+// the repository level it exits 1 as check does.
+func TestRepoPolicy_ApplyNeverWritesRepositorySecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		listing ghResponse
+		code    int
+	}{
+		{"no repository secret", repositorySecretsListing(), 0},
+		{"one repository secret", repositorySecretsListing(secretNames[0]), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := compliantRepo(t)
+			state[repositorySecrets] = tc.listing
+			gh := newFakeGH(t, state)
+			r := repoPolicy(t, gh, "apply")
+			assert.Equal(t, tc.code, r.code, r.output())
+			if tc.code == 1 {
+				assert.Contains(t, nonEmptyLines(r.stdout), "want 0 got 1 for repository_actions_secrets")
+			}
+			assert.NotContains(t, r.output(), secretNames[0], "apply printed a secret's name")
+
+			for _, c := range gh.calls() {
+				assert.False(t, strings.HasPrefix(c.Key, "secret "), "apply ran gh %s", c.Key)
+				if strings.Contains(c.Key, "secrets") {
+					assert.Equal(t, repositorySecrets, c.Key, "apply touched a secret")
+				}
+			}
 		})
 	}
 }

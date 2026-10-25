@@ -32,6 +32,9 @@ readonly VULNERABILITY_ALERTS=enabled
 readonly AUTOMATED_SECURITY_FIXES=enabled
 # Door 11: review-bot admits deployments from the branch main only.
 readonly REVIEW_BOT_DEPLOYMENT_BRANCHES="custom branch:main"
+# Door 3: no repository-level secret, since every job could reference one; the
+# secrets live in the environments. check counts them; apply never writes one.
+readonly REPOSITORY_ACTIONS_SECRETS=0
 
 usage() {
   {
@@ -97,6 +100,15 @@ review_bot_deployment_branches() {
   esac
 }
 
+# Prints how many Actions secrets the repository itself holds (GitHub lists
+# environment secrets per environment, not here), or "unreadable". gh hands
+# back the count only, so no secret's name reaches this script.
+repository_actions_secrets() {
+  local count
+  count=$(gh api "repos/$REPO/actions/secrets" --jq .total_count) || { echo unreadable; return; }
+  echo "$count"
+}
+
 # compare <name> <want> <got>
 compare() {
   if [[ "$2" == "$3" ]]; then
@@ -127,6 +139,7 @@ check() {
   compare vulnerability_alerts "$VULNERABILITY_ALERTS" "$(vulnerability_alerts)" || status=1
   compare automated_security_fixes "$AUTOMATED_SECURITY_FIXES" "$fixes" || status=1
   compare review_bot_deployment_branches "$REVIEW_BOT_DEPLOYMENT_BRANCHES" "$(review_bot_deployment_branches)" || status=1
+  compare repository_actions_secrets "$REPOSITORY_ACTIONS_SECRETS" "$(repository_actions_secrets)" || status=1
   return "$status"
 }
 
