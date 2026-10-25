@@ -1,6 +1,8 @@
 package repopolicy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
 
 // C37 (AC 29, AC 30)
@@ -380,6 +383,42 @@ func TestReviewWorkflow_ClaudeStepInputsArePinned(t *testing.T) {
 	assert.Equal(t, "--allowedTools", words[0], "claude_args's flag")
 	require.Len(t, judgeAllowedTools, 10)
 	assert.ElementsMatch(t, judgeAllowedTools, splitRules(words[1], ","), "the --allowedTools value's rules against door 5's closed list")
+}
+
+// judgeExecutedScripts are the SHA-256 digests of the files from the checked-out
+// pull request that judge executes: the gather step runs scan_bypasses.py
+// before Claude, and the gate command Claude may run executes review_gate.py.
+var judgeExecutedScripts = map[string]string{ // #nosec G101 -- SHA-256 digests, not credentials
+	"scan_bypasses.py": "dcef32fd8dd27cb88cfa325be50e270cf8774a7ec82d5aed2c87b91b534a6294",
+	"review_gate.py":   "279f0a119907c6a0a178d2be7cb8b3f1a5642f99a83fc4008c92bfbf3faf486d",
+}
+
+// C86 (door 5, AC 34; fix round 4): door 5's "no permission mode" also rests
+// on the rest of the run. A step, a job or workflow default, or a script from
+// the pull request could write ~/.claude/settings.json before Claude starts,
+// so the job is pinned whole against the golden copy and the scripts by hash.
+func TestReviewWorkflow_JudgeJobIsPinned(t *testing.T) {
+	review := repoWorkflow(t, "review.yml")
+
+	raw, err := os.ReadFile(filepath.Join("testdata", "judge.golden.yml")) // #nosec G304 -- a fixture under testdata
+	require.NoError(t, err)
+	var want, got map[string]any
+	require.NoError(t, yaml.Unmarshal(raw, &want))
+	require.NoError(t, review.jobNode(t, "judge").Decode(&got))
+	assert.Equal(t, want, got, "judge against testdata/judge.golden.yml")
+
+	defaults := mappingValue(review.root, "defaults")
+	require.NotNil(t, defaults, "review.yml has no workflow-level defaults")
+	var gotDefaults map[string]any
+	require.NoError(t, defaults.Decode(&gotDefaults))
+	assert.Equal(t, map[string]any{"run": map[string]any{"shell": "bash"}}, gotDefaults, "review.yml's workflow-level defaults")
+	assert.Nil(t, mappingValue(review.root, "env"), "review.yml has a top-level env")
+
+	require.Len(t, judgeExecutedScripts, 2)
+	for name, want := range judgeExecutedScripts {
+		sum := sha256.Sum256(readRepoFile(t, judgeScripts+"/"+name))
+		assert.Equal(t, want, hex.EncodeToString(sum[:]), "SHA-256 of %s/%s", judgeScripts, name)
+	}
 }
 
 func keys[V any](m map[string]V) []string {
