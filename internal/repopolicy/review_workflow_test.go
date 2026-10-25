@@ -238,19 +238,27 @@ func TestReviewWorkflow_JudgeFailsWhenCiOkNeverConcludes(t *testing.T) {
 	}
 	require.NotEmpty(t, gather.Run, "judge has no wait-and-gather step")
 
+	// The fake applies the step's --jq to what gh pr checks --json name,bucket
+	// prints: every check of the pull request, ci-ok among them once it exists.
+	// With --json, gh exits 0 whatever the checks' state; with no check at all
+	// it exits 1.
 	cases := []struct {
-		state string
-		exit  int
+		name   string
+		checks ghResponse
 	}{
-		{"pending", 8}, {"absent", 0}, {"pass", 0}, {"fail", 1},
+		{"pending", ghResponse{Stdout: `[{"name":"lint","bucket":"pass"},{"name":"ci-ok","bucket":"pending"}]`}},
+		{"absent", ghResponse{Stdout: `[{"name":"lint","bucket":"pending"},{"name":"judge","bucket":"pending"}]`}},
+		{"absent, no check reported yet", ghResponse{Stderr: "no checks reported on the 'feat/x' branch\n", Exit: 1}},
+		{"pass", ghResponse{Stdout: `[{"name":"lint","bucket":"pass"},{"name":"ci-ok","bucket":"pass"},{"name":"judge","bucket":"pending"}]`}},
+		{"fail", ghResponse{Stdout: `[{"name":"lint","bucket":"fail"},{"name":"ci-ok","bucket":"fail"},{"name":"judge","bucket":"pending"}]`}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.state, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			require.NoError(t, os.Symlink(repoPath(t, ".claude"), filepath.Join(dir, ".claude")))
 			gh := newFakeGH(t, map[string]ghResponse{
-				"pr checks 7 --json": {Stdout: tc.state + "\n", Exit: tc.exit},
-				"pr checks 7":        {Stdout: "ci-ok\t" + tc.state + "\n"},
+				"pr checks 7 --json": tc.checks,
+				"pr checks 7":        {Stdout: "ci-ok\t" + tc.name + "\n"},
 				"pr view 7":          {Stdout: `{"number":7}`},
 				"pr diff 7":          {Stdout: "diff --git a/x b/x\n"},
 				"GET repos/" + testRepo + "/pulls/7/reviews": {Stdout: "[[]]"},
@@ -258,7 +266,7 @@ func TestReviewWorkflow_JudgeFailsWhenCiOkNeverConcludes(t *testing.T) {
 			r := runStepIn(t, dir, gather.Run, gh.env("PR=7", "GITHUB_REPOSITORY="+testRepo, "GH_REPO="+testRepo,
 				"CI_OK_WAIT_ATTEMPTS=2", "CI_OK_WAIT_SECONDS=0"))
 
-			concluded := tc.state == "pass" || tc.state == "fail"
+			concluded := tc.name == "pass" || tc.name == "fail"
 			if concluded {
 				require.Equal(t, 0, r.code, r.output())
 				assert.FileExists(t, filepath.Join(dir, ".judge", "pr.json"))

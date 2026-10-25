@@ -122,7 +122,7 @@ func reviewResponses(author string) map[string]ghResponse {
 	return map[string]ghResponse{
 		"pr view":   {Stdout: `{"number":7,"author":{"login":"` + author + `"}}`},
 		"repo view": {Stdout: `{"owner":{"login":"mesbrj"},"name":"GO-eBPF-Proxy"}`},
-		"GET user":  {Stdout: "mesbrj\n"},
+		"GET user":  {Stdout: `{"login":"mesbrj","type":"User"}`},
 		"POST repos/" + testRepo + "/pulls/7/reviews": {Stdout: `{"html_url":"https://github.com/mesbrj/GO-eBPF-Proxy/pull/7#pullrequestreview-1"}`},
 	}
 }

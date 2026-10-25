@@ -2,9 +2,11 @@ package repopolicy
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,7 +37,10 @@ type ghCall struct {
 // fakeGH stands in for GitHub's CLI. A response key matches a call whose key
 // equals it, or, failing that, starts with it followed by a space; the longest
 // such key wins. An unanswered gh api write succeeds with "{}"; any other
-// unanswered call fails, so a read the test did not expect cannot pass.
+// unanswered call fails, so a read the test did not expect cannot pass. A call
+// that passes --jq (or -q) gets its canned stdout filtered through jq -r, as gh
+// prints only the matching values, strings unquoted (gh help formatting): a
+// response holds what GitHub returns, and the script's own filter runs on it.
 type fakeGH struct {
 	t   *testing.T
 	dir string
@@ -215,9 +220,37 @@ func runFakeGH(args []string) int {
 		}
 		resp = ghResponse{Stdout: "{}"}
 	}
-	_, _ = fmt.Fprint(os.Stdout, resp.Stdout)
+	stdout := resp.Stdout
+	if filter := jqFilter(args); filter != "" && resp.Exit == 0 {
+		out, err := applyJQ(filter, stdout)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fake gh:", err)
+			return 1
+		}
+		stdout = out
+	}
+	_, _ = fmt.Fprint(os.Stdout, stdout)
 	_, _ = fmt.Fprint(os.Stderr, resp.Stderr)
 	return resp.Exit
+}
+
+// jqFilter returns the expression a gh call passes with --jq or -q.
+func jqFilter(args []string) string {
+	if f := flagValue(args, "--jq"); f != "" {
+		return f
+	}
+	return flagValue(args, "-q")
+}
+
+func applyJQ(filter, input string) (string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("jq", "-r", filter) // #nosec G204 G702 -- the filter the script under test passed to gh
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("jq -r %q: %w: %s", filter, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
 func appendCall(dir string, call ghCall) error {
