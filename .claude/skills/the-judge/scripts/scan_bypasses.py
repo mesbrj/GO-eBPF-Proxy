@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Modified 2026-10-25 for GO-eBPF-Proxy from the-judge v1.4.0 (tech-leads-club/agent-skills,
+# Felipe Rodrigues, CC-BY-4.0): adds a sync-hack marker for Go's time.Sleep(, which the
+# upstream pattern (Python's lowercase time.sleep) misses. Every upstream marker is unchanged.
 # invariant: hits are Pass F candidates, never findings; always exit 0 so a detector cannot block the review.
 import re
 import sys
@@ -24,6 +27,7 @@ MARKERS = [
     ("error-swallow", re.compile(r"except(\s+\w+)?\s*:\s*pass\b|catch\s*(\([^)]*\))?\s*\{\s*\}")),
     ("unsafe-html", re.compile(r"dangerouslySetInnerHTML|bypassSecurityTrust")),
     ("sync-hack", re.compile(r"\btime\.sleep\s*\(|\bThread\.sleep\s*\(")),
+    ("sync-hack", re.compile(r"\btime\.Sleep\s*\(")),
 ]
 
 FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
