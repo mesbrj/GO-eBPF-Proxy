@@ -2,6 +2,7 @@ package repopolicy
 
 import (
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"sort"
 	"strings"
@@ -271,6 +272,53 @@ func TestRepoPolicy_ApplyCreatesTheMainBranchPolicyOnlyWhenAbsent(t *testing.T) 
 			for _, c := range creates {
 				assert.Equal(t, map[string]string{"name": "main", "type": "branch"}, apiFields(c.Args))
 			}
+		})
+	}
+}
+
+// C80 (AC 71, door 11): review-bot is ok only with custom branch policies on
+// and exactly one policy, main of type branch; every other state is a want line.
+func TestRepoPolicy_CheckRejectsEveryOtherReviewBotBranchRule(t *testing.T) {
+	const (
+		env      = "GET " + policyAPI + "/environments/review-bot"
+		policies = "GET " + policyAPI + "/environments/review-bot/deployment-branch-policies"
+		custom   = `{"name":"review-bot","deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}`
+	)
+	listing := func(entries ...string) ghResponse {
+		return ghResponse{Stdout: fmt.Sprintf(`{"total_count":%d,"branch_policies":[%s]}`, len(entries), strings.Join(entries, ","))}
+	}
+	branchMain := `{"id":1,"node_id":"MDE2","name":"main","type":"branch"}`
+
+	for _, tc := range []struct {
+		name          string
+		env, policies ghResponse
+	}{
+		{"no policy", ghResponse{Stdout: `{"name":"review-bot","deployment_branch_policy":null}`}, listing()},
+		{"protected branches", ghResponse{Stdout: `{"name":"review-bot","deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}`}, listing()},
+		{"protected branches with custom also reported", ghResponse{Stdout: `{"name":"review-bot","deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":true}}`}, listing(branchMain)},
+		{"custom with no policy", ghResponse{Stdout: custom}, listing()},
+		{"custom with another branch", ghResponse{Stdout: custom}, listing(`{"id":2,"node_id":"MDE3","name":"master","type":"branch"}`)},
+		{"custom with every branch", ghResponse{Stdout: custom}, listing(`{"id":2,"node_id":"MDE3","name":"*","type":"branch"}`)},
+		{"custom with a policy beside main", ghResponse{Stdout: custom}, listing(branchMain, `{"id":2,"node_id":"MDE3","name":"release/*","type":"branch"}`)},
+		{"custom with main as a tag", ghResponse{Stdout: custom}, listing(`{"id":2,"node_id":"MDE3","name":"main","type":"tag"}`)},
+		{"environment absent", ghResponse{Stderr: "gh: Not Found (HTTP 404)\n", Exit: 1}, listing(branchMain)},
+		{"policies unreadable", ghResponse{Stdout: custom}, ghResponse{Stderr: "gh: Server Error (HTTP 500)\n", Exit: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := compliantRepo(t)
+			state[env] = tc.env
+			state[policies] = tc.policies
+			r := repoPolicy(t, newFakeGH(t, state), "check")
+			assert.Equal(t, 1, r.code, r.output())
+
+			var wants []string
+			for _, l := range nonEmptyLines(r.stdout) {
+				if strings.HasPrefix(l, "want ") {
+					wants = append(wants, l)
+				}
+			}
+			require.Len(t, wants, 1, "only review-bot's rule differs:\n%s", r.stdout)
+			assert.Regexp(t, `\breview_bot_deployment_branches$`, wants[0])
 		})
 	}
 }

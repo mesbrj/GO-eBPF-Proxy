@@ -82,11 +82,12 @@ vulnerability_alerts() {
 }
 
 # Prints review-bot's deployment branch rule: "custom" and its sorted
-# type:name policies, "protected", "none", or "unreadable".
+# type:name policies when only custom branch policies are on, "protected" for
+# any other rule, "none" when there is no rule, or "unreadable".
 review_bot_deployment_branches() {
   local env policies
   env=$(gh api "repos/$REPO/environments/review-bot") || { echo unreadable; return; }
-  case "$(jq -r 'if .deployment_branch_policy == null then "none" elif .deployment_branch_policy.custom_branch_policies then "custom" else "protected" end' <<<"$env")" in
+  case "$(jq -r 'if .deployment_branch_policy == null then "none" elif .deployment_branch_policy.custom_branch_policies and (.deployment_branch_policy.protected_branches | not) then "custom" else "protected" end' <<<"$env")" in
   custom)
     policies=$(gh api "repos/$REPO/environments/review-bot/deployment-branch-policies") || { echo unreadable; return; }
     echo "custom $(jq -r '[.branch_policies[] | "\(.type):\(.name)"] | sort | join(",")' <<<"$policies")"
