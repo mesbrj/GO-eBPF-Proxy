@@ -232,3 +232,8 @@ func TestCIWorkflow_PreloadRunsMakeBuildPreload(t *testing.T) {
 func TestCIWorkflow_GovulncheckJobRunsMakeVuln(t *testing.T) {
 	assert.GreaterOrEqual(t, stepIndex(repoWorkflow(t, "ci.yml").job(t, "govulncheck"), runLine("make vuln")), 0)
 }
+
+// C24 (AC 17, AC 18, door 9)
+func TestCIWorkflow_WorkflowLintJobRunsMakeLintWorkflows(t *testing.T) {
+	assert.GreaterOrEqual(t, stepIndex(repoWorkflow(t, "ci.yml").job(t, "workflow-lint"), runLine("make lint-workflows")), 0)
+}
