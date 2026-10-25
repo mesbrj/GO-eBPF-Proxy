@@ -3,10 +3,10 @@
 A sidecar that transparently redirects an unmodified application's outbound IPv4 TCP
 egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables`/NAT),
 **passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
-its OpenSSL library, and **captures the same egress to a DSB-embedded pcapng** so the
-still end-to-end encrypted TLS 1.2/1.3 traffic can be decrypted and inspected offline
-with Wireshark/tshark. The Podman scripts under `deploy/podman/` bring up a complete
-app+sidecar pod end-to-end (see [Quick start](#quick-start)).
+its OpenSSL library, and **captures the pod's network traffic to a DSB-embedded pcapng**
+so the still end-to-end encrypted TLS 1.2/1.3 traffic can be decrypted and inspected
+offline with Wireshark/tshark. The Podman scripts under `deploy/podman/` bring up a
+complete app+sidecar pod end-to-end (see [Quick start](#quick-start)).
 
 **No TLS termination. No MITM. No CA.** The app's handshake stays end-to-end with the
 real server; its certificate validation is never weakened, so certificate pinning is a
@@ -37,9 +37,12 @@ socket layer, and TLS keys read passively from the process that already holds th
 5. The sidecar's socket server reads those lines, validates and deduplicates them, and
    writes them as an NSS keylog (on tmpfs, `0600`/`0700`). It keeps them only while
    capture runs: once capture stops, it still reads every line, so the app never waits,
-   and discards it.
-6. The sidecar also captures the relay's outbound leg to a pcapng file, in-process
-   (gopacket reading an `AF_PACKET` socket — no libpcap or external capture tool).
+   and discards it. The keylog file lives one run: the sidecar deletes it when it starts
+   and when it stops, `--retain` or not.
+6. The sidecar also captures every frame on `--capture-iface`, both directions and
+   unfiltered (the relay's outbound leg and all other pod traffic, ingress included),
+   to a pcapng file, in-process (gopacket reading an `AF_PACKET` socket — no libpcap
+   or external capture tool).
    Each key line is written into it as a Decryption Secrets Block as soon as it arrives,
    while every packet waits one second before it is written, so the keys land ahead of
    the handshake they decrypt. The capture is therefore self-decrypting while it is
@@ -57,8 +60,9 @@ socket layer, and TLS keys read passively from the process that already holds th
 flowchart LR
     app["app process<br/>(unmodified, LD_PRELOAD set)"] -- "connect()" --> kern["connect4 + sockops<br/>(eBPF)"]
     kern -- "redirect" --> relay["pass-through relay<br/>127.0.0.1:15001"]
-    relay -- "raw pipe (end-to-end TLS)" --> upstream["Upstream server"]
-    relay -. "outbound leg" .-> capture["capture writer<br/>pcapng, bounded + ephemeral"]
+    relay -- "raw pipe (end-to-end TLS)" --> eth0["pod eth0"]
+    eth0 --> upstream["Upstream server"]
+    eth0 -. "every frame, both directions" .-> capture["capture writer<br/>pcapng, bounded + ephemeral"]
     app -. "libssl handshake" .-> interposer["LD_PRELOAD interposer<br/>(SSL_CTX_new + keylog callback)"]
     interposer -- "NSS lines over unix socket" --> keylog["keylog socket server<br/>-> NSS keylog"]
     keylog -. "streamed in as DSBs" .-> capture
@@ -69,16 +73,16 @@ flowchart LR
 
 `go-ebpf-proxy` runs as a second container in the same pod as the target app, sharing its
 network, IPC and UTS namespaces plus the host's cgroup namespace (no shared PID
-namespace — the interposer needs no PID/inode resolution). **Any app container that
-links OpenSSL's `libssl` and has the interposer's `LD_PRELOAD`/`GOEBPF_PRELOAD_SOCKET`
-env vars set gets transparent redirection and TLS key extraction** — no app code
-change, no rebuild, no trust-store edit.
+namespace — the interposer needs no PID/inode resolution). **Every other container in
+the pod gets transparent redirection; one that dynamically links OpenSSL 3.x's `libssl`
+and has the interposer's `LD_PRELOAD`/`GOEBPF_PRELOAD_SOCKET` env vars set also gets TLS
+key extraction** — no app code change, no rebuild, no trust-store edit.
 
 ```mermaid
 flowchart TB
     subgraph pod["Pod (shared net/ipc/uts ns + host cgroup ns)"]
         subgraph appc["app container — LD_PRELOAD=libkeylogpreload.so"]
-            app["app process<br/>connect(dst:443)"]
+            app["app process<br/>connect(dst:any port)"]
             libssl["libssl (TLS 1.2/1.3)"]
             interposer["LD_PRELOAD interposer"]
         end
@@ -88,6 +92,7 @@ flowchart TB
             keylog["keylog socket server"]
             capture["capture writer<br/>pcapng + embedded DSB<br/>bounded, ephemeral retention"]
         end
+        eth0["eth0 (shared pod network ns)"]
     end
     kernel["Kernel: connect4 + sockops<br/>(attached at the pod's common parent cgroup)"]
 
@@ -96,26 +101,28 @@ flowchart TB
     libssl -. "handshake secrets read via SSL_CTX keylog callback" .-> interposer
     interposer -- "NSS lines over<br/>shared unix socket volume" --> keylog
     loader -. "attach cgroup programs" .-> kernel
-    relay == "raw pipe (real cert validated by the app)" ==> upstream["Upstream server"]
-    relay -. "outbound leg" .-> capture
-    keylog -. "NSS keylog (tmpfs)" .-> capture
+    relay == "raw pipe (real cert validated by the app)" ==> eth0
+    eth0 ==> upstream["Upstream server"]
+    eth0 -. "every frame, both directions<br/>(AF_PACKET, unfiltered)" .-> capture
+    keylog -. "streamed in as DSBs" .-> capture
     capture -- "dump-epoch.pcapng" --> disk[("/var/log/sidecar<br/>(host-visible volume)")]
-    disk -. "tshark -o tls.keylog_file:..." .-> decrypted(["decrypted plaintext"])
+    disk -. "tshark (keys from the embedded DSBs)" .-> decrypted(["decrypted plaintext"])
 ```
 
 Swap in a different app container image — same or different language, any process that
-links `libssl` and carries the interposer env vars — and the sidecar keeps working
-unchanged: the `connect4`/`sockops` programs redirect at the socket layer regardless of
-what wrote the syscall, and the interposer hooks the *library*, not any particular app
-binary.
+dynamically links OpenSSL 3.x's `libssl` and carries the interposer env vars — and the
+sidecar keeps working unchanged: the `connect4`/`sockops` programs redirect at the socket
+layer regardless of what wrote the syscall, and the interposer hooks the *library*, not
+any particular app binary.
 
 ## Requirements
 
-- Linux kernel ≥ 5.10 (BTF/CO-RE)
+- Linux kernel ≥ 5.10 (BTF/CO-RE) with cgroup v2 (the eBPF programs attach to a cgroup v2
+  path)
 - `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_SYS_RESOURCE` (raises `RLIMIT_MEMLOCK` on eBPF load)
   and `CAP_NET_RAW` (opens the capture socket) — on the sidecar container only
 - Go ≥ 1.25, `clang`/`llvm` ≥ 14 and `bpftool` (for building the eBPF programs), a C
-  compiler + OpenSSL headers (for building the `LD_PRELOAD` interposer)
+  compiler + OpenSSL 3.x headers (for building the `LD_PRELOAD` interposer)
 - Rootful Podman (local dev setup)
 - Supported platforms: Ubuntu 24.04 LTS is the reference platform — see the
   [technical design document](https://curious-quince-eb8.notion.site/Techinical-Design-Document-3e08ea6a94c880cc9dfccc6fd2fed274#3e18ea6a94c8802d8e5de603f8f49b0e) for the full supported-platform matrix
@@ -208,11 +215,11 @@ you:
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--cgroup-path` | none (required) | Pod common-parent cgroup v2 path the eBPF programs attach to |
-| `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on |
+| `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on. Leave it at the default: `connect4` always redirects to `127.0.0.1:15001` (compiled in), so any other address leaves redirected connections with no listener |
 | `--pin-dir` | `/sys/fs/bpf/go-ebpf-proxy` | bpffs directory for the pinned maps |
 | `--keylog-socket` | `/var/run/sidecar/keylog.sock` | Unix socket the `LD_PRELOAD` interposer connects to |
 | `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start. It holds one run's keys: the sidecar deletes it when it starts and when it stops |
-| `--capture-iface` | `eth0` | Interface to capture the outbound leg from |
+| `--capture-iface` | `eth0` | Interface to capture: every frame, both directions, unfiltered (the relay's outbound leg and all other pod traffic) |
 | `--capture-path` | `/var/log/sidecar/dump.pcapng` | Template for each run's DSB-embedded pcapng capture: a run writes `dump-<epoch>.pcapng` (its start time in Unix seconds, then `-1`, `-2`, … if taken) in that directory, never overwriting a file |
 | `--retain` | `false` | Keep this run's capture, with its embedded TLS secrets, on teardown instead of deleting it; the keylog is never kept |
 | `--max-bytes` | `104857600` (100 MiB) | Size limit on the captures in the capture directory, this run's included: reaching it stops capture and keeps the file, while the relay keeps serving the app; a run that finds it already reached starts without capture. Nothing is deleted for size; `0` disables it |
@@ -258,18 +265,26 @@ internal/proxy/  original-dst resolver (fail-closed) + pass-through L4 relay
 internal/keylog/ keylog socket server, NSS keylog validation/writer
 internal/capture/ live AF_PACKET capture, pcapng writer + embedded DSB, retention
 internal/capture/capturetest/ tshark offline-decryption check (test support only)
-preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new, ships keylog lines
+preload/         LD_PRELOAD interposer (C): hooks SSL_CTX_new/SSL_CTX_new_ex, ships keylog lines
 internal/shared/ structured logging, shared infra
 cmd/app/         sidecar entrypoint (loads configuration; wires loader, relay, keylog socket server, capture)
 deploy/podman/   rootful Podman dev environment (pod scripts)
 ```
 
-## Out of scope (MVP)
+## Current scope
 
-`sockmap`/`sk_msg` acceleration; IPv6 (`connect6`); UDP/QUIC/HTTP-3; production Kubernetes; live in-band: DPI, IPFIX export; TLS-library modules beyond OpenSSL (BoringSSL/GnuTLS/NSS/GoTLS are interface-only).
-
-A user interface is not deferred: the project has none and will not add one (see
-[Configuration](#configuration)).
+- **Interception**: `connect4` + `sockops` redirect every IPv4 TCP `connect()` from any
+  container in the pod, on any destination port (not only 443), to the relay. Only the
+  sidecar's own UID 1337 and loopback destinations are skipped. For now the relay only
+  forwards raw TCP to whatever IP and port the app dialed; a future release will
+  analyze and inspect that traffic, passively.
+- **TLS keys**: the `LD_PRELOAD` interposer logs the session keys of every TLS handshake,
+  for any protocol over TLS (not only HTTPS), client or server side, in any app that
+  dynamically links OpenSSL 3.x (not Go `crypto/tls`, Java, or a statically linked TLS
+  library).
+- **Capture**: the pcapng records every frame on `--capture-iface` in both directions,
+  unfiltered (TCP on any port, UDP, ICMP, ingress included), not only HTTPS, with the
+  TLS keys embedded as Decryption Secrets Blocks.
 
 ## Project Documentation
 
@@ -278,6 +293,7 @@ A user interface is not deferred: the project has none and will not add one (see
 ## Skills reference
 
 - [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/)
+- [tlc-spec-lean](https://agent-skills.techleads.club/skills/tlc-spec-lean/)
 - [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/)
 - [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior)
 
