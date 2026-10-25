@@ -130,11 +130,13 @@ func TestCIWorkflow_LintFailsWhenGoFmtRewritesAFile(t *testing.T) {
 }
 
 // C10 (AC 4)
-func TestCIWorkflow_LintRunsMakeLintWithGolangciLintV2_13_2(t *testing.T) {
+func TestCIWorkflow_LintRunsMakeLintWithGolangciLintV2_15_0(t *testing.T) {
 	lint := repoWorkflow(t, "ci.yml").job(t, "lint")
 	install, ok := stepUsing(lint, "golangci/golangci-lint-action@")
 	require.True(t, ok, "lint does not install golangci-lint")
-	assert.Equal(t, "v2.13.2", install.With["version"])
+	assert.Equal(t, "v2.15.0", install.With["version"])
+	assert.Equal(t, true, install.With["install-only"], "make lint runs golangci-lint, not the action")
+	assert.NotContains(t, install.With, "install-mode", "the prebuilt release binary, not go install")
 	assert.GreaterOrEqual(t, stepIndex(lint, runLine("make lint")), 0, "lint does not run make lint")
 }
 
@@ -174,6 +176,37 @@ func TestCIWorkflow_GenerateDriftDiffsTheFourGeneratedFiles(t *testing.T) {
 	for _, f := range []string{"bpf/proxy_bpfel.go", "bpf/proxy_bpfeb.go", "bpf/proxy_bpfel.o", "bpf/proxy_bpfeb.o"} {
 		assert.FileExists(t, repoPath(t, f))
 	}
+}
+
+// Door 10: generate-drift runs upstream's static bpftool v7.7.0, checked
+// against a pinned sha256 before use, ahead of make generate, and prints its
+// version in a step of its own for C3's proof.
+func TestCIWorkflow_GenerateDriftInstallsPinnedBpftool(t *testing.T) {
+	gd := repoWorkflow(t, "ci.yml").job(t, "generate-drift")
+	install := stepIndex(gd, regexp.MustCompile(`github\.com/libbpf/bpftool/releases/download/`))
+	require.GreaterOrEqual(t, install, 0, "generate-drift does not download bpftool from libbpf/bpftool's releases")
+	s := gd.Steps[install]
+	assert.Equal(t, "v7.7.0", s.Env["BPFTOOL_VERSION"])
+	assert.Equal(t, "09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c", s.Env["BPFTOOL_SHA256"])
+	verify := strings.Index(s.Run, "sha256sum -c")
+	extract := strings.Index(s.Run, "tar ")
+	require.GreaterOrEqual(t, verify, 0, "the download is not checked against its sha256")
+	require.GreaterOrEqual(t, extract, 0, "the download is not extracted")
+	assert.Less(t, verify, extract, "the sha256 check must come before the archive is opened")
+	assert.Contains(t, s.Run, "GITHUB_PATH")
+
+	version := -1
+	for i, st := range gd.Steps {
+		if st.Name == "Print the bpftool version" {
+			version = i
+			assert.Equal(t, "bpftool version", strings.TrimSpace(st.Run))
+		}
+	}
+	require.GreaterOrEqual(t, version, 0, "no step named \"Print the bpftool version\"")
+	gen := stepIndex(gd, runLine("make generate"))
+	assert.Less(t, install, version)
+	assert.Less(t, version, gen)
+	assert.Equal(t, -1, stepIndex(gd, regexp.MustCompile(`apt-get install[^\n]*linux-tools`)), "bpftool must not come from Ubuntu's linux-tools")
 }
 
 // C17 (AC 10)

@@ -46,7 +46,7 @@ jobs:
           check-latest: true
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13.2
+          version: v2.15.0
           install-only: true
       - run: make lint
       # make lint runs go fmt, which rewrites a file and still exits 0.
@@ -117,16 +117,32 @@ jobs:
         with:
           go-version: 1.27.x
           check-latest: true
-      - name: Install clang, llvm and bpftool
+      - name: Install clang and llvm
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm linux-tools-common "linux-tools-$(uname -r)"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm
+      # Upstream's static bpftool, the dev box's version: Ubuntu's linux-tools
+      # wrapper has no bpftool for the runner's HWE kernel. The archive is
+      # checked against its pinned sha256 before it is opened.
+      - name: Install bpftool from its upstream release
+        env:
+          BPFTOOL_VERSION: v7.7.0
+          BPFTOOL_SHA256: 09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c
+        run: |
+          tarball="$RUNNER_TEMP/bpftool-$BPFTOOL_VERSION-amd64.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_VERSION/bpftool-$BPFTOOL_VERSION-amd64.tar.gz"
+          echo "$BPFTOOL_SHA256  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bpftool"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/bpftool" bpftool
+          chmod 0755 "$RUNNER_TEMP/bpftool/bpftool"
+          echo "$RUNNER_TEMP/bpftool" >>"$GITHUB_PATH"
       - name: Show the runner kernel's BTF and the toolchain
         run: |
           uname -r
           test -r /sys/kernel/btf/vmlinux
-          bpftool version
           clang --version
+      - name: Print the bpftool version
+        run: bpftool version
       - run: make generate
       - name: Fail when the committed eBPF objects drift from proxy.bpf.c
         run: |
