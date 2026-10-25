@@ -220,6 +220,42 @@ func TestReviewWorkflow_ClaudeStepAllowsNoGitHubWriteCommand(t *testing.T) {
 	}
 }
 
+// C83 (door 5 amended 2026-10-25): Claude changes no file it can execute,
+// and it can still write findings.json and run the gate on it.
+func TestReviewWorkflow_ClaudeCanWriteOnlyFindingsJSON(t *testing.T) {
+	args, _ := claudeStep(t).With["claude_args"].(string)
+	rules := allowedTools(args)
+	require.NotEmpty(t, rules, "claude_args passes no --allowedTools")
+
+	// Claude Code checks each file-writing tool against Edit(path) rules only;
+	// a /path rule given on the command line anchors at the checkout root.
+	var writeRules []string
+	for _, rule := range rules {
+		switch tool, _, _ := strings.Cut(rule, "("); tool {
+		case "Write", "Edit", "MultiEdit", "NotebookEdit":
+			writeRules = append(writeRules, rule)
+		}
+	}
+	assert.Equal(t, []string{"Edit(/findings.json)"}, writeRules, "the file-writing rules")
+
+	const gate = ".claude/skills/the-judge/scripts/review_gate.py"
+	refused := []string{"python3 -c pass", "python3 " + gate, "python3 " + gate + " other.json", "python3 .judge/scan.py"}
+	for _, git := range []string{"git log", "git show", "git diff", "git blame"} {
+		refused = append(refused, git+" --output="+gate, git+" -1 --output "+gate)
+	}
+	for _, cmd := range refused {
+		for _, rule := range rules {
+			assert.False(t, admits(rule, cmd), "rule %q admits %q", rule, cmd)
+		}
+	}
+
+	runsGate := false
+	for _, rule := range rules {
+		runsGate = runsGate || admits(rule, "python3 "+gate+" findings.json")
+	}
+	assert.True(t, runsGate, "no rule lets Claude run the gate on findings.json")
+}
+
 func keys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
