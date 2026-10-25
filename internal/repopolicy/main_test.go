@@ -89,9 +89,16 @@ func run(t *testing.T, cmd *exec.Cmd) result {
 // defaults.run.shell: bash.
 func runStep(t *testing.T, script string, env []string) result {
 	t.Helper()
+	return runStepIn(t, "", script, env)
+}
+
+// runStepIn is runStep with dir as the working directory.
+func runStepIn(t *testing.T, dir, script string, env []string) result {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "step.sh")
 	require.NoError(t, os.WriteFile(path, []byte(script), 0o600))
 	cmd := exec.Command("bash", "--noprofile", "--norc", "-eo", "pipefail", path) // #nosec G204 -- a temp script written by the test
+	cmd.Dir = dir
 	cmd.Env = env
 	return run(t, cmd)
 }

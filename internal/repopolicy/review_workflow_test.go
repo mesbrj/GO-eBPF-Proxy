@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -57,10 +56,11 @@ func guardStep(t *testing.T) step {
 	return step{}
 }
 
-// C42 (AC 33): over each of the 3 conditions, on both paths.
+// C42 (AC 33, amended 2026-10-25): over each of the 3 conditions, on both
+// paths; the post side is C79.
 func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 	review := repoWorkflow(t, "review.yml")
-	judge, post := review.job(t, "judge"), review.job(t, "post")
+	judge := review.job(t, "judge")
 
 	conditions := map[string]string{
 		"draft":           "!github.event.pull_request.draft",
@@ -69,11 +69,10 @@ func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 	}
 	for name, cond := range conditions {
 		assert.Contains(t, judge.If, cond, "judge's if: lacks the %s condition", name)
-		assert.Contains(t, post.If, cond, "post's if: lacks the %s condition", name)
 	}
 
-	// The dispatch path: the guard step decides, and every later judge step and
-	// the post job wait on its output.
+	// The dispatch path: the guard step decides, and every later judge step
+	// waits on its output, so nothing is uploaded for post to find.
 	guard := guardStep(t)
 	gate := "steps." + guard.ID + ".outputs.eligible == 'true'"
 	afterGuard := false
@@ -85,8 +84,6 @@ func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 		require.True(t, afterGuard, "a judge step runs before the guard: %q", s.Name)
 		assert.Equal(t, gate, strings.TrimSpace(s.If), "judge step %q does not wait on the guard", s.Name)
 	}
-	assert.Equal(t, "${{ steps."+guard.ID+".outputs.eligible }}", judge.Outputs["eligible"])
-	assert.Contains(t, post.If, "needs.judge.outputs.eligible == 'true'")
 
 	cases := []struct {
 		name, pr string
@@ -216,23 +213,6 @@ func TestReviewWorkflow_ClaudeStepAllowsNoGitHubWriteCommand(t *testing.T) {
 	}
 }
 
-// C45 (AC 36, door 5)
-func TestReviewWorkflow_PostJobRunsNoClaudeStep(t *testing.T) {
-	post := repoWorkflow(t, "review.yml").job(t, "post")
-	require.NotEmpty(t, post.Steps)
-	_, ok := stepUsing(post, "anthropics/claude-code-action@")
-	assert.False(t, ok)
-}
-
-// C46 (AC 37)
-func TestReviewWorkflow_PostNeedsJudgeWithoutAlwaysCondition(t *testing.T) {
-	post := repoWorkflow(t, "review.yml").job(t, "post")
-	assert.Contains(t, []string(post.Needs), "judge")
-	for _, fn := range []string{"always()", "failure()", "cancelled()"} {
-		assert.NotContains(t, post.If, fn)
-	}
-}
-
 func keys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -241,78 +221,49 @@ func keys[V any](m map[string]V) []string {
 	return out
 }
 
-// postStep returns the post job's step with the given name.
-func postStep(t *testing.T, name string) (int, step) {
-	t.Helper()
-	post := repoWorkflow(t, "review.yml").job(t, "post")
-	for i, s := range post.Steps {
-		if s.Name == name {
-			return i, s
+// C81 (AC 68): judge fails, leaving nothing to post, when ci-ok never concludes.
+func TestReviewWorkflow_JudgeFailsWhenCiOkNeverConcludes(t *testing.T) {
+	var gather step
+	for _, s := range repoWorkflow(t, "review.yml").job(t, "judge").Steps {
+		if s.Name == "Wait for ci-ok and gather the review inputs" {
+			gather = s
 		}
 	}
-	require.Failf(t, "post step missing", "%q", name)
-	return -1, step{}
-}
+	require.NotEmpty(t, gather.Run, "judge has no wait-and-gather step")
 
-// C55 (door 4): the App token asks for exactly Contents read and Pull requests
-// write; Metadata read comes with every installation token.
-func TestReviewWorkflow_PostTokenRequestsOnlyContentsReadAndPullRequestsWrite(t *testing.T) {
-	mint, ok := stepUsing(repoWorkflow(t, "review.yml").job(t, "post"), "actions/create-github-app-token@")
-	require.True(t, ok, "post does not mint an App token")
-	perms := map[string]any{}
-	for k, v := range mint.With {
-		if strings.HasPrefix(k, "permission-") {
-			perms[k] = v
-		}
-	}
-	assert.Equal(t, map[string]any{"permission-contents": "read", "permission-pull-requests": "write"}, perms)
-}
-
-// C55 (door 4): before posting, post checks with the App token that the bot is
-// installed on this repository alone, and fails otherwise.
-func TestReviewWorkflow_PostAssertsTheBotIsInstalledOnThisRepositoryOnly(t *testing.T) {
-	const name = "Confirm the bot is installed on this repository only"
-	idx, confirm := postStep(t, name)
-	post := repoWorkflow(t, "review.yml").job(t, "post")
-	mintIdx := -1
-	for i, s := range post.Steps {
-		if strings.HasPrefix(s.Uses, "actions/create-github-app-token@") {
-			mintIdx = i
-		}
-	}
-	postIdx := stepIndex(post, regexp.MustCompile(`post_review\.py`))
-	assert.Greater(t, idx, mintIdx, "the check needs the App token")
-	assert.Less(t, idx, postIdx, "the check must run before anything is posted")
-	assert.Equal(t, "${{ steps.app-token.outputs.token }}", confirm.Env["GH_TOKEN"])
-
-	installation := func(selection string, repos ...string) string {
-		var list []string
-		for _, r := range repos {
-			list = append(list, `{"full_name":"`+r+`"}`)
-		}
-		return `{"total_count":` + strconv.Itoa(len(repos)) + `,"repository_selection":"` + selection + `","repositories":[` + strings.Join(list, ",") + `]}`
-	}
 	cases := []struct {
-		name, response string
-		ok             bool
+		state string
+		exit  int
 	}{
-		{"selected, this repository only", installation("selected", testRepo), true},
-		{"installed on all repositories", installation("all", testRepo), false},
-		{"selected, another repository too", installation("selected", testRepo, "mesbrj/other"), false},
-		{"selected, another repository only", installation("selected", "mesbrj/other"), false},
+		{"pending", 8}, {"absent", 0}, {"pass", 0}, {"fail", 1},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			gh := newFakeGH(t, map[string]ghResponse{"GET installation/repositories": {Stdout: tc.response}})
-			r := runStep(t, confirm.Run, gh.env("GITHUB_REPOSITORY="+testRepo, "RUNNER_TEMP="+t.TempDir()))
-			if tc.ok {
+		t.Run(tc.state, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.Symlink(repoPath(t, ".claude"), filepath.Join(dir, ".claude")))
+			gh := newFakeGH(t, map[string]ghResponse{
+				"pr checks 7 --json": {Stdout: tc.state + "\n", Exit: tc.exit},
+				"pr checks 7":        {Stdout: "ci-ok\t" + tc.state + "\n"},
+				"pr view 7":          {Stdout: `{"number":7}`},
+				"pr diff 7":          {Stdout: "diff --git a/x b/x\n"},
+				"GET repos/" + testRepo + "/pulls/7/reviews": {Stdout: "[[]]"},
+			})
+			r := runStepIn(t, dir, gather.Run, gh.env("PR=7", "GITHUB_REPOSITORY="+testRepo, "GH_REPO="+testRepo,
+				"CI_OK_WAIT_ATTEMPTS=2", "CI_OK_WAIT_SECONDS=0"))
+
+			concluded := tc.state == "pass" || tc.state == "fail"
+			if concluded {
 				require.Equal(t, 0, r.code, r.output())
-				assert.Contains(t, nonEmptyLines(r.stdout), "installation repository_selection: selected")
-				assert.Contains(t, nonEmptyLines(r.stdout), "installation repositories: "+testRepo)
-			} else {
-				assert.NotEqual(t, 0, r.code, r.output())
+				assert.FileExists(t, filepath.Join(dir, ".judge", "pr.json"))
+				return
 			}
-			assert.Equal(t, []string{"GET installation/repositories"}, callKeys(gh.calls()), "one read, no write")
+			assert.Equal(t, 1, r.code, r.output())
+			assert.Regexp(t, `(?m)^::error::.*ci-ok`, r.stdout)
+			assert.NoFileExists(t, filepath.Join(dir, ".judge", "pr.json"))
+			for _, c := range gh.calls() {
+				assert.True(t, strings.HasPrefix(c.Key, "pr checks 7 --json"), "gathered review input anyway: %s", c.Key)
+			}
+			assert.Len(t, gh.calls(), 2, "the overridden attempt count")
 		})
 	}
 }
