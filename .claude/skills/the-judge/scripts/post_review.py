@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Modified 2026-10-25 for GO-eBPF-Proxy from the-judge v1.4.0 (tech-leads-club/agent-skills,
+# Felipe Rodrigues, CC-BY-4.0): adds a CI mode. With JUDGE_BOT_LOGIN set, the script skips
+# `gh api user`, posts as that login, submits every verdict as COMMENT and appends
+# "Intended verdict: **<verdict>**" for APPROVE and REQUEST_CHANGES, so the review bot never
+# approves. With JUDGE_BOT_LOGIN unset it behaves exactly as upstream v1.4.0.
 # invariant: refuse to POST if review_gate.py is non-zero so a failed lint cannot reach GitHub.
 # hazard: GitHub returns 422 on APPROVE/REQUEST_CHANGES of your own PR; fall back to COMMENT.
 import json
@@ -42,12 +47,20 @@ def main():
     number, author = pr["number"], pr["author"]["login"]
     repo = gh_json(["repo", "view", "--json", "owner,name"])
     owner, name = repo["owner"]["login"], repo["name"]
-    rc, me, err = run(["gh", "api", "user", "--jq", ".login"])
-    if rc != 0:
-        sys.exit(f"gh api user failed: {err}")
+    bot = os.environ.get("JUDGE_BOT_LOGIN", "")
+    if bot:
+        me = bot
+    else:
+        rc, me, err = run(["gh", "api", "user", "--jq", ".login"])
+        if rc != 0:
+            sys.exit(f"gh api user failed: {err}")
 
     event = verdict
-    if me == author and verdict != "COMMENT":
+    if bot:
+        event = "COMMENT"
+        if verdict != "COMMENT":
+            body = f"{body}\n\n---\nIntended verdict: **{verdict}**"
+    elif me == author and verdict != "COMMENT":
         event = "COMMENT"
         body = (
             f"{body}\n\n---\n_Intended verdict: **{verdict}**. "
