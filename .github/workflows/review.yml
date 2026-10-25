@@ -115,8 +115,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Claude can write findings.json only (Claude Code checks every file
+          # tool against Edit rules) and runs git only in Claude Code's own
+          # read-only forms, so it can change no file it executes, the gate
+          # included. A Bash(git log:*) rule would admit git log --output=<file>.
           claude_args: >-
-            --allowedTools "Read,Glob,Grep,Write,Edit,WebFetch,WebSearch,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
+            --allowedTools "Read,Glob,Grep,Edit(/findings.json),WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
           prompt: |
             Review this repository's pull request with the-judge, running in CI.
             Read .claude/skills/the-judge/SKILL.md and follow it, with these changes:
@@ -131,7 +135,8 @@ jobs:
               output for the diff.
             - Steps 2 to 6 as written. Write findings.json at the repository root and run
               `python3 .claude/skills/the-judge/scripts/review_gate.py findings.json`
-              until it exits 0.
+              until it exits 0. findings.json is the only file you can write, and git
+              runs only in its read-only forms (log, show, diff, blame without --output).
             - Step 7: do not post. A later workflow posts findings.json as the review bot, as a
               comment that carries your verdict. Do not run post_review.py and do not
               write to GitHub in any other way.
