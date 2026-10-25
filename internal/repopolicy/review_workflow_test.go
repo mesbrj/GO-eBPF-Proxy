@@ -70,6 +70,13 @@ func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 	for name, cond := range conditions {
 		assert.Contains(t, judge.If, cond, "judge's if: lacks the %s condition", name)
 	}
+	// Whole, so that a draft passing the if: (an || between the conditions) or
+	// a pull_request path that never runs (&& with the dispatch path) fails.
+	wantIf := "github.event_name == 'workflow_dispatch' || (" +
+		conditions["draft"] + " && " + conditions["dependabot[bot]"] + " && " + conditions["fork head"] + ")"
+	gotIf := strings.TrimSpace(judge.If)
+	gotIf = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(gotIf, "${{"), "}}"))
+	assert.Equal(t, wantIf, strings.Join(strings.Fields(gotIf), " "), "judge's if:")
 
 	// The dispatch path: the guard step decides, and every later judge step
 	// waits on its output, so nothing is uploaded for post to find.
