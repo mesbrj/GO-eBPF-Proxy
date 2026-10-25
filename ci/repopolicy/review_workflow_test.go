@@ -356,8 +356,13 @@ func TestReviewWorkflow_ClaudeCanWriteOnlyFindingsJSON(t *testing.T) {
 	assert.ElementsMatch(t, judgeAllowedTools, got, "judge's --allowedTools rules against door 5's closed list")
 }
 
+// judgeModelArgs are the words claude_args passes before the allowlist (feature
+// 09, door 3): judge's full model ID and effort, with no alias and no fallback.
+var judgeModelArgs = []string{"--model", "claude-opus-5-5", "--effort", "high", "--allowedTools"}
+
 // C85 (door 5, AC 34; fix round 3): door 5 rests on "an Agent SDK run with no
-// permission mode", so the step passes nothing beside the allowlist. A
+// permission mode", so the step passes nothing beside the model, the effort
+// (feature 09's C10, which supersedes C85's two words) and the allowlist. A
 // permission mode, a settings file or input, an env: or a second flag would
 // each override or extend the rules C83 pins.
 func TestReviewWorkflow_ClaudeStepInputsArePinned(t *testing.T) {
@@ -382,10 +387,56 @@ func TestReviewWorkflow_ClaudeStepInputsArePinned(t *testing.T) {
 	args, ok := with["claude_args"].(string)
 	require.True(t, ok, "claude_args is not a string")
 	words := shellWords(args)
-	require.Len(t, words, 2, "claude_args must be --allowedTools and one value: %q", words)
-	assert.Equal(t, "--allowedTools", words[0], "claude_args's flag")
+	n := len(judgeModelArgs)
+	require.Len(t, words, n+1, "claude_args must be %q and one value: %q", judgeModelArgs, words)
+	assert.Equal(t, judgeModelArgs, words[:n], "claude_args's words before the allowlist")
 	require.Len(t, judgeAllowedTools, 10)
-	assert.ElementsMatch(t, judgeAllowedTools, splitRules(words[1], ","), "the --allowedTools value's rules against door 5's closed list")
+	assert.ElementsMatch(t, judgeAllowedTools, splitRules(words[n], ","), "the --allowedTools value's rules against door 5's closed list")
+}
+
+// statusFunction matches a status check function other than success(). An if:
+// that calls one loses GitHub's implicit success(), so its step can run after
+// the claude step failed.
+var statusFunction = regexp.MustCompile(`(?i)\b(always|failure|cancelled)\s*\(`)
+
+// C14 (feature 09, AC 13): when the Opus session cannot complete, judge fails
+// before it uploads findings, so review-post finds no artifact and posts
+// nothing; no other model reviews in its place.
+func TestReviewWorkflow_NoFindingsArtifactWhenClaudeFails(t *testing.T) {
+	// continue-on-error is not a field of the step type, so the steps are
+	// read from the job's YAML node.
+	stepsNode := mappingValue(repoWorkflow(t, "review.yml").jobNode(t, "judge"), "steps")
+	require.NotNil(t, stepsNode, "judge has no steps")
+	var steps []map[string]any
+	require.NoError(t, stepsNode.Decode(&steps))
+
+	claude, upload := -1, -1
+	for i, s := range steps {
+		uses, _ := s["uses"].(string)
+		switch {
+		case strings.HasPrefix(uses, claudeCodeAction):
+			require.Equal(t, -1, claude, "judge has more than one claude-code-action step")
+			claude = i
+		case strings.HasPrefix(uses, "actions/upload-artifact@"):
+			if with, _ := s["with"].(map[string]any); with["name"] == "findings" {
+				upload = i
+			}
+		}
+	}
+	require.NotEqual(t, -1, claude, "judge has no claude-code-action step")
+	require.Greater(t, upload, claude, "judge must upload findings after the claude step")
+
+	assert.NotContains(t, steps[claude], "continue-on-error", "the claude step's failure must fail judge")
+	for _, s := range steps[claude+1:] {
+		cond, _ := s["if"].(string)
+		assert.False(t, statusFunction.MatchString(cond), "step %q runs after a failed claude step: if: %s", s["name"], cond)
+	}
+
+	with, _ := steps[claude]["with"].(map[string]any)
+	args, _ := with["claude_args"].(string)
+	for _, w := range shellWords(args) {
+		assert.False(t, strings.HasPrefix(w, "--fallback-model"), "claude_args names a fallback model: %q", w)
+	}
 }
 
 // judgeExecutedScripts are the SHA-256 digests of the files from the checked-out

@@ -1,5 +1,6 @@
 # The judge job of .github/workflows/review.yml as committed at b929adf (C86,
-# door 5). TestReviewWorkflow_JudgeJobIsPinned requires the committed job to
+# door 5), with feature 09's model, effort and claude-code-action pin (C10,
+# C11). TestReviewWorkflow_JudgeJobIsPinned requires the committed job to
 # equal this one key for key, so a change to judge changes this file in the
 # same diff.
 
@@ -95,7 +96,7 @@ steps:
       # read-only forms, so it can change no file it executes, the gate
       # included. A Bash(git log:*) rule would admit git log --output=<file>.
       claude_args: >-
-        --allowedTools "Read,Glob,Grep,Edit(/findings.json),WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
+        --model claude-opus-5-5 --effort high --allowedTools "Read,Glob,Grep,Edit(/findings.json),WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
       prompt: |
         Review this repository's pull request with the-judge, running in CI.
         Read .claude/skills/the-judge/SKILL.md and follow it, with these changes:
