@@ -117,10 +117,10 @@ jobs:
         with:
           go-version: 1.27.x
           check-latest: true
-      - name: Install clang and llvm
+      - name: Install clang, llvm and the libbpf headers
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm libbpf-dev
       # Upstream's static bpftool, the dev box's version: Ubuntu's linux-tools
       # wrapper has no bpftool for the runner's HWE kernel. The archive is
       # checked against its pinned sha256 before it is opened.
