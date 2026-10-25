@@ -1,8 +1,9 @@
 # One advisory review per pull request by the-judge (AD-026, AD-027).
-# judge runs Claude with a read-only GITHUB_TOKEN and hands findings.json on as
-# an artifact; post runs no Claude step and posts it as the review bot, whose
-# every review is a COMMENT (post_review.py CI mode), so it never approves.
-# A re-review is a manual dispatch with the pull request number.
+# judge runs Claude with a read-only GITHUB_TOKEN and leaves findings.json as
+# the artifact "findings". review-post.yml, started when this workflow
+# completes, posts it as the review bot from main's code only (door 5). A
+# re-review is a manual dispatch on the pull request's head branch:
+#   gh workflow run review.yml --ref <head branch> -f pr=<number>
 name: review
 
 on:
@@ -40,10 +41,6 @@ jobs:
       contents: read
       pull-requests: read
     timeout-minutes: 60
-    outputs:
-      eligible: ${{ steps.guard.outputs.eligible }}
-      pr: ${{ steps.guard.outputs.pr }}
-      head: ${{ steps.guard.outputs.head }}
     steps:
       - name: Skip a pull request that is closed, a draft, from Dependabot or from a fork
         id: guard
@@ -79,6 +76,8 @@ jobs:
       # the-judge's Step 0 and Step 1 inputs, gathered here so that Claude needs
       # neither `gh api` nor make: the pull request, its diff, this bot's earlier
       # reviews, the bypass scan and the CI results once ci-ok has concluded.
+      # If ci-ok has not concluded by the end of the wait, judge fails and
+      # leaves nothing to post (AC 68); dispatch a re-review later.
       - name: Wait for ci-ok and gather the review inputs
         if: steps.guard.outputs.eligible == 'true'
         env:
@@ -86,14 +85,23 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR: ${{ steps.guard.outputs.pr }}
         run: |
-          mkdir -p .judge
+          attempts=${CI_OK_WAIT_ATTEMPTS:-90}
+          interval=${CI_OK_WAIT_SECONDS:-30}
           state=absent
-          for _ in $(seq 90); do
+          for ((i = 1; i <= attempts; i++)); do
             state=$(gh pr checks "$PR" --json name,bucket --jq '[.[] | select(.name == "ci-ok") | .bucket][0] // "absent"' || true)
             case "$state" in pass | fail | cancel | skipping) break ;; esac
-            sleep 30
+            if ((i < attempts)); then sleep "$interval"; fi
           done
           echo "ci-ok: $state"
+          case "$state" in
+          pass | fail | cancel | skipping) ;;
+          *)
+            echo "::error::ci-ok had not concluded after $attempts checks (last seen: $state); nothing is reviewed or posted"
+            exit 1
+            ;;
+          esac
+          mkdir -p .judge
           gh pr checks "$PR" >.judge/ci-checks.txt || true
           gh pr view "$PR" --json number,title,body,author,url,baseRefName,headRefName,additions,deletions,changedFiles,files >.judge/pr.json
           gh pr diff "$PR" >.judge/pr.diff
@@ -124,7 +132,7 @@ jobs:
             - Steps 2 to 6 as written. Write findings.json at the repository root and run
               `python3 .claude/skills/the-judge/scripts/review_gate.py findings.json`
               until it exits 0.
-            - Step 7: do not post. A later job posts findings.json as the review bot, as a
+            - Step 7: do not post. A later workflow posts findings.json as the review bot, as a
               comment that carries your verdict. Do not run post_review.py and do not
               write to GitHub in any other way.
 
@@ -135,71 +143,10 @@ jobs:
         if: steps.guard.outputs.eligible == 'true'
         run: test -s findings.json
 
-      - name: Hand findings.json to the post job
+      - name: Hand findings.json to review-post.yml
         if: steps.guard.outputs.eligible == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: findings
           path: findings.json
           if-no-files-found: error
-
-  post:
-    needs: judge
-    if: >-
-      needs.judge.outputs.eligible == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (!github.event.pull_request.draft &&
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: ubuntu-24.04
-    environment: review-bot
-    permissions:
-      contents: read
-    steps:
-      # The pull request's own copy of the scripts: pull requests come only from
-      # collaborators (AC 58), and this workflow file comes from the pull request too.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.judge.outputs.head }}
-          persist-credentials: false
-          sparse-checkout: .claude/skills/the-judge/scripts
-
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: findings
-
-      - name: Gate findings.json
-        run: python3 .claude/skills/the-judge/scripts/review_gate.py findings.json
-
-      - name: Mint the review bot's token
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ vars.REVIEW_BOT_APP_ID }}
-          private-key: ${{ secrets.REVIEW_BOT_PRIVATE_KEY }}
-          permission-contents: read
-          permission-pull-requests: write
-
-      # Door 4: the App is installed on this repository alone. Checked with the
-      # App's own token, because gh's OAuth token cannot read a private App.
-      - name: Confirm the bot is installed on this repository only
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          gh api installation/repositories >"$RUNNER_TEMP/installation.json"
-          selection=$(jq -r .repository_selection "$RUNNER_TEMP/installation.json")
-          repos=$(jq -r '[.repositories[].full_name] | join(",")' "$RUNNER_TEMP/installation.json")
-          echo "installation repository_selection: $selection"
-          echo "installation repositories: $repos"
-          if [[ "$selection" != selected || "$repos" != "$GITHUB_REPOSITORY" ]]; then
-            echo "::error::the review bot must be installed on $GITHUB_REPOSITORY only"
-            exit 1
-          fi
-
-      - name: Post the review as the bot
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_REPO: ${{ github.repository }}
-          JUDGE_BOT_LOGIN: ${{ vars.REVIEW_BOT_LOGIN }}
-          PR: ${{ needs.judge.outputs.pr }}
-        run: python3 .claude/skills/the-judge/scripts/post_review.py findings.json --pr "$PR"

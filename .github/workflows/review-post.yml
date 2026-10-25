@@ -1,0 +1,121 @@
+# Posts the advisory review that review.yml's judge job left as the artifact
+# "findings" (AD-026, AD-027, door 5). workflow_run always runs the default
+# branch's copy of this file, and the scripts it checks out come from that same
+# commit, so no pull request code ever runs next to the review bot's key. The
+# artifact is data: the pull request comes from the reviewed commit through
+# GitHub's API, never from findings.json. The bot posts every review as a
+# COMMENT (post_review.py CI mode), so it never approves.
+name: review-post
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- runs only main's definition and scripts; the artifact is data and the pull request comes from the head commit
+    workflows: [review]
+    types: [completed]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  post:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+      github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    environment: review-bot
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # judge uploads nothing for a pull request its guard skipped.
+      - name: Check that the review run left findings
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" >"$RUNNER_TEMP/artifacts.json"
+          if jq -e '.artifacts | any(.name == "findings" and (.expired | not))' "$RUNNER_TEMP/artifacts.json" >/dev/null; then
+            echo "found=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::review run $RUN_ID left no findings artifact: nothing to post"
+            echo "found=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      # The reviewed commit names the pull request; a dispatched re-review runs
+      # on the pull request's head branch, so its head commit is the same.
+      - name: Find the pull request of the reviewed commit
+        id: pr
+        if: steps.artifact.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls" >"$RUNNER_TEMP/pulls.json"
+          numbers=$(jq -r --arg sha "$HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" \
+            '[.[] | select(.state == "open" and .head.sha == $sha and .head.repo.full_name == $repo) | .number | tostring] | join(" ")' \
+            "$RUNNER_TEMP/pulls.json")
+          read -ra found <<<"$numbers"
+          if [[ ${#found[@]} -ne 1 ]]; then
+            echo "::notice::commit $HEAD_SHA heads ${#found[@]} open pull requests from $GITHUB_REPOSITORY, not exactly one: nothing to post"
+            exit 0
+          fi
+          echo "number=${found[0]}" >>"$GITHUB_OUTPUT"
+
+      # No ref: this is the workflow_run's own commit, the head of main.
+      - if: steps.pr.outputs.number != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .claude/skills/the-judge/scripts
+
+      - if: steps.pr.outputs.number != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: findings
+          run-id: ${{ github.event.workflow_run.id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Gate findings.json
+        if: steps.pr.outputs.number != ''
+        run: python3 .claude/skills/the-judge/scripts/review_gate.py findings.json
+
+      - name: Mint the review bot's token
+        id: app-token
+        if: steps.pr.outputs.number != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.REVIEW_BOT_APP_ID }}
+          private-key: ${{ secrets.REVIEW_BOT_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      # Door 4: the App is installed on this repository alone. Checked with the
+      # App's own token, because gh's OAuth token cannot read a private App.
+      - name: Confirm the bot is installed on this repository only
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api installation/repositories >"$RUNNER_TEMP/installation.json"
+          selection=$(jq -r .repository_selection "$RUNNER_TEMP/installation.json")
+          repos=$(jq -r '[.repositories[].full_name] | join(",")' "$RUNNER_TEMP/installation.json")
+          echo "installation repository_selection: $selection"
+          echo "installation repositories: $repos"
+          if [[ "$selection" != selected || "$repos" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::the review bot must be installed on $GITHUB_REPOSITORY only"
+            exit 1
+          fi
+
+      - name: Post the review as the bot
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          JUDGE_BOT_LOGIN: ${{ vars.REVIEW_BOT_LOGIN }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: python3 .claude/skills/the-judge/scripts/post_review.py findings.json --pr "$PR"

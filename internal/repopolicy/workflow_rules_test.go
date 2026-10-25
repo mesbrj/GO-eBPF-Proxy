@@ -33,7 +33,7 @@ var workflowRules = []workflowRule{
 	{"AC 13", ruleCINoSecretOnlyContentsRead},
 	{"AC 14", ruleCIUploadsNoArtifact},
 	{"AC 15", ruleUsesPinnedToSHA},
-	{"AC 19", ruleNoPullRequestTargetOrWorkflowRun},
+	{"AC 19", ruleNoPullRequestTargetAndWorkflowRunOnlyInReviewPost},
 	{"AC 20", ruleTopLevelPermissions},
 	{"AC 21", ruleReviewEnvironmentsOneJobEach},
 	{"AC 22", ruleClaudeCodeActionIsAnthropics},
@@ -194,14 +194,26 @@ func ruleUsesPinnedToSHA(files []workflowFile) []violation {
 	return out
 }
 
-// AC 19: no pull_request_target and no workflow_run trigger.
-func ruleNoPullRequestTargetOrWorkflowRun(files []workflowFile) []violation {
+// AC 19 (amended 2026-10-25): no pull_request_target anywhere; workflow_run
+// only in review-post.yml, and only on the completion of review.
+func ruleNoPullRequestTargetAndWorkflowRunOnlyInReviewPost(files []workflowFile) []violation {
 	var out []violation
 	for _, f := range files {
-		for _, ev := range []string{"pull_request_target", "workflow_run"} {
-			if _, ok := triggers(f.wf)[ev]; ok {
-				out = append(out, violation{file: f.name, detail: "triggers on " + ev})
-			}
+		on := triggers(f.wf)
+		if _, ok := on["pull_request_target"]; ok {
+			out = append(out, violation{file: f.name, detail: "triggers on pull_request_target"})
+		}
+		cfg, ok := on["workflow_run"]
+		if !ok {
+			continue
+		}
+		if f.name != "review-post.yml" {
+			out = append(out, violation{file: f.name, detail: "triggers on workflow_run, which only review-post.yml may"})
+			continue
+		}
+		m, _ := cfg.(map[string]any)
+		if fmt.Sprint(m["workflows"]) != "[review]" || fmt.Sprint(m["types"]) != "[completed]" {
+			out = append(out, violation{file: f.name, detail: fmt.Sprintf("workflow_run must be workflows [review], types [completed], got %v", cfg)})
 		}
 	}
 	return out
@@ -221,11 +233,11 @@ func ruleTopLevelPermissions(files []workflowFile) []violation {
 // reviewEnvironments maps each review environment to the one job allowed to use it.
 var reviewEnvironments = map[string][2]string{
 	"claude-review": {"review.yml", "judge"},
-	"review-bot":    {"review.yml", "post"},
+	"review-bot":    {"review-post.yml", "post"},
 }
 
-// AC 21: claude-review and review-bot are each referenced by exactly one job,
-// review.yml's judge and post respectively.
+// AC 21 (amended 2026-10-25): claude-review and review-bot are each referenced
+// by exactly one job, review.yml's judge and review-post.yml's post.
 func ruleReviewEnvironmentsOneJobEach(files []workflowFile) []violation {
 	var out []violation
 	for _, env := range []string{"claude-review", "review-bot"} {
@@ -348,9 +360,11 @@ func TestWorkflows_PinEveryUsesToACommitSHAWithVersionComment(t *testing.T) {
 	assert.Positive(t, n, "the workflows use no action at all, so the rule checked nothing")
 }
 
-// C26 (AC 19)
-func TestWorkflows_DeclareNoPullRequestTargetOrWorkflowRun(t *testing.T) {
+// C26 (AC 19, amended 2026-10-25)
+func TestWorkflows_DeclareNoPullRequestTargetAndWorkflowRunOnlyInReviewPost(t *testing.T) {
 	assertRuleHolds(t, "AC 19")
+	_, ok := triggers(repoWorkflow(t, "review-post.yml").wf)["workflow_run"]
+	assert.True(t, ok, "review-post.yml must be the workflow_run workflow")
 }
 
 // C27 (AC 20)
@@ -363,7 +377,7 @@ func TestWorkflows_EachReviewEnvironmentHasExactlyOneJob(t *testing.T) {
 	assertRuleHolds(t, "AC 21")
 	review := repoWorkflow(t, "review.yml")
 	assert.Equal(t, "claude-review", environmentName(review.job(t, "judge").Environment))
-	assert.Equal(t, "review-bot", environmentName(review.job(t, "post").Environment))
+	assert.Equal(t, "review-bot", environmentName(repoWorkflow(t, "review-post.yml").job(t, "post").Environment))
 }
 
 // C29 (AC 22)
@@ -407,7 +421,7 @@ func TestWorkflows_EveryJobRunsOnUbuntu2404(t *testing.T) {
 	for _, f := range repoWorkflows(t) {
 		n += len(f.wf.Jobs)
 	}
-	assert.Equal(t, 12, n, "jobs across ci.yml (9), review.yml (2) and platform-e2e.yml (1)")
+	assert.Equal(t, 12, n, "jobs across ci.yml (9), review.yml (1), review-post.yml (1) and platform-e2e.yml (1)")
 }
 
 // C35 (AC 28): each of the 10 rules, broken alone in a copy of the workflows,
@@ -430,8 +444,8 @@ func TestWorkflowRules_EachViolationIsReportedWithRuleAndFile(t *testing.T) {
 		{"AC 15", "ci.yml", func(t *testing.T, dir string) {
 			mutateFileRegexp(t, dir, "ci.yml", `actions/checkout@[0-9a-f]{40} # v\S+`, "actions/checkout@v7")
 		}},
-		{"AC 19", "review.yml", func(t *testing.T, dir string) {
-			mutateFile(t, dir, "review.yml", "on:\n  pull_request:\n", "on:\n  pull_request_target:\n  pull_request:\n")
+		{"AC 19", "ci.yml", func(t *testing.T, dir string) {
+			mutateFile(t, dir, "ci.yml", "on:\n  pull_request:\n", "on:\n  workflow_run:\n    workflows: [review]\n    types: [completed]\n  pull_request:\n")
 		}},
 		{"AC 20", "platform-e2e.yml", func(t *testing.T, dir string) {
 			mutateFile(t, dir, "platform-e2e.yml", "permissions: {}\n", "")

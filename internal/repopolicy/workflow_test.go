@@ -15,6 +15,7 @@ import (
 
 // workflow is the subset of a GitHub Actions workflow the checks read.
 type workflow struct {
+	Name        string         `yaml:"name"`
 	On          any            `yaml:"on"`
 	Permissions any            `yaml:"permissions"`
 	Jobs        map[string]job `yaml:"jobs"`
