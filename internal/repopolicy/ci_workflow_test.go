@@ -209,6 +209,15 @@ func TestCIWorkflow_GenerateDriftInstallsPinnedBpftool(t *testing.T) {
 	assert.Equal(t, -1, stepIndex(gd, regexp.MustCompile(`apt-get install[^\n]*linux-tools`)), "bpftool must not come from Ubuntu's linux-tools")
 }
 
+// generate-drift compiles proxy.bpf.c, which includes libbpf's headers
+// (bpf/bpf_helpers.h, bpf/bpf_endian.h): Ubuntu's libbpf-dev, the dev box's.
+func TestCIWorkflow_GenerateDriftInstallsLibbpfHeaders(t *testing.T) {
+	gd := repoWorkflow(t, "ci.yml").job(t, "generate-drift")
+	install := stepIndex(gd, regexp.MustCompile(`apt-get install\b[^\n]*\blibbpf-dev\b`))
+	require.GreaterOrEqual(t, install, 0, "generate-drift does not install libbpf-dev")
+	assert.Less(t, install, stepIndex(gd, runLine("make generate")))
+}
+
 // C17 (AC 10)
 func TestCIWorkflow_PreloadRunsMakeBuildPreload(t *testing.T) {
 	pre := repoWorkflow(t, "ci.yml").job(t, "preload")
