@@ -17,6 +17,7 @@ docs/prd/
 !.github/dependabot.yml
 !.github/CODEOWNERS
 !.github/rulesets/
+!.github/scripts/
 
 # .claude: only the-judge is tracked, because review.yml runs it on the runner
 .claude/*

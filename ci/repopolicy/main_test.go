@@ -1,6 +1,6 @@
 // Package repopolicy pins the repository's CI and review policy (feature
 // 08-ci-pipeline): the workflows, Dependabot, the main ruleset and CODEOWNERS
-// under .github, the Makefile's pinned tool targets, deploy/github/repo-policy.sh
+// under .github, the Makefile's pinned tool targets, .github/scripts/repo-policy.sh
 // and the vendored the-judge scripts. It holds tests only. go test ./... skips
 // dot-directories, so the tests live here and read those files from the
 // repository root.
