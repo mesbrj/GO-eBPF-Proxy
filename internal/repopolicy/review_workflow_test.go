@@ -126,10 +126,13 @@ func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 	}
 }
 
+// claudeCodeAction is the uses: prefix of judge's Claude step.
+const claudeCodeAction = "anthropics/claude-code-action@"
+
 // claudeStep returns judge's claude-code-action step.
 func claudeStep(t *testing.T) step {
 	t.Helper()
-	s, ok := stepUsing(repoWorkflow(t, "review.yml").job(t, "judge"), "anthropics/claude-code-action@")
+	s, ok := stepUsing(repoWorkflow(t, "review.yml").job(t, "judge"), claudeCodeAction)
 	require.True(t, ok, "judge has no claude-code-action step")
 	return s
 }
@@ -345,6 +348,38 @@ func TestReviewWorkflow_ClaudeCanWriteOnlyFindingsJSON(t *testing.T) {
 		got = append(got, splitRules(v, ",")...)
 	}
 	assert.ElementsMatch(t, judgeAllowedTools, got, "judge's --allowedTools rules against door 5's closed list")
+}
+
+// C85 (door 5, AC 34; fix round 3): door 5 rests on "an Agent SDK run with no
+// permission mode", so the step passes nothing beside the allowlist. A
+// permission mode, a settings file or input, an env: or a second flag would
+// each override or extend the rules C83 pins.
+func TestReviewWorkflow_ClaudeStepInputsArePinned(t *testing.T) {
+	// The step type keeps only the keys other checks read, so the step's own
+	// keys come from its YAML node.
+	stepsNode := mappingValue(repoWorkflow(t, "review.yml").jobNode(t, "judge"), "steps")
+	require.NotNil(t, stepsNode, "judge has no steps")
+	var steps, claude []map[string]any
+	require.NoError(t, stepsNode.Decode(&steps))
+	for _, s := range steps {
+		if uses, _ := s["uses"].(string); strings.HasPrefix(uses, claudeCodeAction) {
+			claude = append(claude, s)
+		}
+	}
+	require.Len(t, claude, 1, "judge's claude-code-action steps")
+	assert.ElementsMatch(t, []string{"name", "if", "uses", "with"}, keys(claude[0]), "the claude step's keys (no env)")
+
+	with := claudeStep(t).With
+	assert.ElementsMatch(t, []string{"claude_code_oauth_token", "github_token", "claude_args", "prompt"}, keys(with),
+		"the claude step's with: inputs")
+
+	args, ok := with["claude_args"].(string)
+	require.True(t, ok, "claude_args is not a string")
+	words := shellWords(args)
+	require.Len(t, words, 2, "claude_args must be --allowedTools and one value: %q", words)
+	assert.Equal(t, "--allowedTools", words[0], "claude_args's flag")
+	require.Len(t, judgeAllowedTools, 10)
+	assert.ElementsMatch(t, judgeAllowedTools, splitRules(words[1], ","), "the --allowedTools value's rules against door 5's closed list")
 }
 
 func keys[V any](m map[string]V) []string {
