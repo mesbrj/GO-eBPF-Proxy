@@ -120,7 +120,7 @@ jobs:
           # read-only forms, so it can change no file it executes, the gate
           # included. A Bash(git log:*) rule would admit git log --output=<file>.
           claude_args: >-
-            --allowedTools "Read,Glob,Grep,Edit(/findings.json),WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
+            --model claude-opus-5-5 --effort high --allowedTools "Read,Glob,Grep,Edit(/findings.json),WebFetch,WebSearch,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)"
           prompt: |
             Review this repository's pull request with the-judge, running in CI.
             Read .claude/skills/the-judge/SKILL.md and follow it, with these changes:
