@@ -46,6 +46,14 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } origdst_by_tuple SEC(".maps");
 
+/* Planted fault for C16: edited without regenerating. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} planted_fault SEC(".maps");
+
 SEC("cgroup/connect4")
 int cgroup_connect4(struct bpf_sock_addr *ctx)
 {
