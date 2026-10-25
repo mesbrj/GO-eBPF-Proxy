@@ -155,7 +155,14 @@ apply() {
     write -X POST "repos/$REPO/rulesets" --input "$RULESET_FILE"
   fi
   # Read before writing, so that after the last write come check's reads only.
-  policies=$(gh api "repos/$REPO/environments/review-bot/deployment-branch-policies") || policies=unreadable
+  # GitHub answers 404 while custom branch policies are not enabled: no policy yet.
+  if ! policies=$(gh api "repos/$REPO/environments/review-bot/deployment-branch-policies" 2>&1); then
+    if [[ "$policies" == *"HTTP 404"* ]]; then
+      policies='{"branch_policies":[]}'
+    else
+      policies=unreadable
+    fi
+  fi
   write -X PUT "repos/$REPO/environments/review-bot" \
     -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
   if [[ "$policies" == unreadable ]]; then
