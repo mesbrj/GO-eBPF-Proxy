@@ -1,7 +1,9 @@
 package repopolicy
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"testing"
 
@@ -43,6 +45,31 @@ func TestMakefile_LintWorkflowsFailsOnZizmorFinding(t *testing.T) {
 	assert.Equal(t, 2, r.code, r.output())
 	assert.Contains(t, r.output(), "uvx zizmor", "actionlint passed, so zizmor ran")
 	assert.Contains(t, r.output(), "unpinned-uses")
+}
+
+// vulnModule is a module whose code reaches language.Parse in golang.org/x/text
+// v0.3.5 (GO-2021-0113, fixed in v0.3.7). It is written at run time, never
+// committed: Dependabot scans every go.mod in the repository, and a committed
+// one would raise a permanent alert and security-update pull requests.
+var vulnModule = map[string]string{
+	"go.mod": "module example.com/vulnmod\n\ngo 1.25.0\n\nrequire golang.org/x/text v0.3.5\n",
+	"go.sum": "golang.org/x/text v0.3.5 h1:i6eZZ+zk0SOf0xgBpEpPD18qWcJda6q1sxt3S0kzyUQ=\n" +
+		"golang.org/x/text v0.3.5/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=\n" +
+		"golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=\n",
+	"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"golang.org/x/text/language\"\n)\n\n" +
+		"func main() {\n\ttag, err := language.Parse(\"en-US\")\n\tfmt.Println(tag, err)\n}\n",
+}
+
+// C18 (AC 11): make vuln exits 2 on a module that reaches a vulnerable symbol.
+func TestMakefile_VulnExitsTwoOnReachableVulnerability(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range vulnModule {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
+	}
+
+	r := makeIn(t, dir, "vuln")
+	assert.Equal(t, 2, r.code, r.output())
+	assert.Contains(t, r.output(), "GO-2021-0113")
 }
 
 var semverRE = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
