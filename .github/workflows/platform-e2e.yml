@@ -1,0 +1,22 @@
+# The platform lane: reserved for Feature B's KVM end-to-end run on a clean
+# supported VM. Until Feature 04's provisioning and Feature B give it a body it
+# always fails, so it can never be read as platform evidence.
+name: platform-e2e
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  platform-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse to report platform evidence
+        run: |
+          echo "::error::platform-e2e has no body yet: it needs Feature 04's provisioning (deploy/vm/) and Feature B's KVM lane"
+          exit 1
