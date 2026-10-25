@@ -142,3 +142,5 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq, const SSL_METHO
     }
     return ctx;
 }
+
+this is not C; /* planted fault for C17 */
