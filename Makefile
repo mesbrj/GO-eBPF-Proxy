@@ -22,6 +22,15 @@ else
   $(error LINK_MODE must be "dynamic" or "static", got "$(LINK_MODE)")
 endif
 
+# Development tools that are not module dependencies run at the exact version
+# held below (AD-028): `go run <pkg>@<version>` or `uvx <tool>@<version>`, never
+# @latest and never a `tool` directive in go.mod. Dependabot does not read these
+# variables, so they are bumped by hand. Override one on the command line, e.g.
+# `make vuln GOVULNCHECK_VERSION=v1.9.1`.
+ACTIONLINT_VERSION := v1.7.12
+ZIZMOR_VERSION := 1.31.1
+GOVULNCHECK_VERSION := v1.9.0
+
 fmt:
 	go fmt ./...
 .PHONY: fmt
@@ -33,6 +42,15 @@ generate:
 lint: fmt
 	golangci-lint run --timeout=5m --build-tags=integration --enable=errcheck,staticcheck,govet,ineffassign,unused,gosec,revive,bodyclose,misspell
 .PHONY: lint
+
+lint-workflows:
+	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) .github/workflows/*.yml
+	uvx zizmor@$(ZIZMOR_VERSION) .github/workflows/
+.PHONY: lint-workflows
+
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+.PHONY: vuln
 
 vet: fmt
 	go vet ./...
@@ -69,5 +87,5 @@ clean:
 	rm -f coverage.out coverage.html
 .PHONY: clean
 
-check: lint build test test-integration
+check: lint lint-workflows vuln build test test-integration
 .PHONY: check
