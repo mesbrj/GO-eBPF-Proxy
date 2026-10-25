@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -148,34 +149,114 @@ func TestReviewWorkflow_JudgeHasReadOnlyTokenAndNoAppToken(t *testing.T) {
 // forbiddenClaudeCommands are the 6 Bash commands of AC 35.
 var forbiddenClaudeCommands = []string{"gh api", "gh pr review", "gh pr comment", "gh pr edit", "gh pr merge", "git push"}
 
+// judgeAllowedTools is door 5's closed list of judge's --allowedTools rules
+// (plan.md, Landing, door 5 amended again 2026-10-25): Edit(/findings.json),
+// then "the other rules stay".
+var judgeAllowedTools = []string{
+	"Read",
+	"Glob",
+	"Grep",
+	"Edit(/findings.json)",
+	"WebFetch",
+	"WebSearch",
+	"Bash(gh pr view:*)",
+	"Bash(gh pr diff:*)",
+	"Bash(gh pr checks:*)",
+	"Bash(python3 .claude/skills/the-judge/scripts/review_gate.py findings.json)",
+}
+
+// shellWords splits s into words at blanks outside single or double quotes,
+// removing the quotes. Any other shell syntax is kept as written, which can
+// make a rule differ from door 5's but never hides one.
+func shellWords(s string) []string {
+	var words []string
+	var cur strings.Builder
+	var quote rune
+	inWord := false
+	for _, r := range s {
+		switch {
+		case quote != 0 && r == quote:
+			quote = 0
+		case quote != 0:
+			cur.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote, inWord = r, true
+		case unicode.IsSpace(r):
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+			}
+			inWord = false
+		default:
+			cur.WriteRune(r)
+			inWord = true
+		}
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
+}
+
+// allowedToolsValues returns every value claude_args passes with
+// --allowedTools or --allowed-tools. claude-code-action (f27be6b,
+// base-action/src/parse-sdk-options.ts) takes each word after such a flag up
+// to the next word starting with -- as one of its values, every occurrence of
+// the flag adding to the list. Words after --allowedTools=<value> count too,
+// which can only add rules.
+func allowedToolsValues(args string) []string {
+	words := shellWords(args)
+	var values []string
+	for i := 0; i < len(words); i++ {
+		flag, inline, hasInline := strings.Cut(words[i], "=")
+		if flag != "--allowedTools" && flag != "--allowed-tools" {
+			continue
+		}
+		if hasInline {
+			values = append(values, inline)
+		}
+		for i+1 < len(words) && !strings.HasPrefix(words[i+1], "--") {
+			i++
+			values = append(values, words[i])
+		}
+	}
+	return values
+}
+
+// splitRules splits an --allowedTools value at each of seps outside
+// parentheses, trimming blanks and dropping empty rules.
+func splitRules(v, seps string) []string {
+	var rules []string
+	depth, cur := 0, strings.Builder{}
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			rules = append(rules, s)
+		}
+		cur.Reset()
+	}
+	for _, r := range v {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+		case strings.ContainsRune(seps, r) && depth == 0:
+			flush()
+			continue
+		}
+		cur.WriteRune(r)
+	}
+	flush()
+	return rules
+}
+
 // allowedTools collects every rule passed with --allowedTools (or
 // --allowed-tools) in claude_args. Rules are separated by commas or spaces
 // outside parentheses.
 func allowedTools(args string) []string {
-	flagRE := regexp.MustCompile(`--allowed(?:Tools|-tools)(?:=|\s+)("[^"]*"|'[^']*'|\S+)`)
 	var rules []string
-	for _, m := range flagRE.FindAllStringSubmatch(args, -1) {
-		v := strings.Trim(m[1], `"'`)
-		depth, cur := 0, strings.Builder{}
-		flush := func() {
-			if s := strings.TrimSpace(cur.String()); s != "" {
-				rules = append(rules, s)
-			}
-			cur.Reset()
-		}
-		for _, r := range v {
-			switch {
-			case r == '(':
-				depth++
-			case r == ')':
-				depth--
-			case (r == ',' || r == ' ') && depth == 0:
-				flush()
-				continue
-			}
-			cur.WriteRune(r)
-		}
-		flush()
+	for _, v := range allowedToolsValues(args) {
+		rules = append(rules, splitRules(v, ", ")...)
 	}
 	return rules
 }
@@ -254,6 +335,16 @@ func TestReviewWorkflow_ClaudeCanWriteOnlyFindingsJSON(t *testing.T) {
 		runsGate = runsGate || admits(rule, "python3 "+gate+" findings.json")
 	}
 	assert.True(t, runsGate, "no rule lets Claude run the gate on findings.json")
+
+	// Amended 2026-10-25 (fix round 2): the whole list, not a sample. Every
+	// value of every --allowedTools or --allowed-tools flag, split on commas
+	// outside parentheses, holds door 5's 10 rules, each once, and nothing else.
+	require.Len(t, judgeAllowedTools, 10)
+	var got []string
+	for _, v := range allowedToolsValues(args) {
+		got = append(got, splitRules(v, ",")...)
+	}
+	assert.ElementsMatch(t, judgeAllowedTools, got, "judge's --allowedTools rules against door 5's closed list")
 }
 
 func keys[V any](m map[string]V) []string {
