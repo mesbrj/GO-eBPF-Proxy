@@ -37,7 +37,7 @@ type Option func(*Resolver)
 
 // WithRetry sets the bounded retry count and per-attempt backoff.
 func WithRetry(retries int, backoff time.Duration) Option {
-	return func(r *Resolver) { r.retries, r.backoff = retries, backoff }
+    return func(r *Resolver) { r.retries, r.backoff = retries, backoff }
 }
 
 // WithOnMiss registers a callback invoked on each definitive miss (metric/log).
