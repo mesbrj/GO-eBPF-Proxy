@@ -1,8 +1,6 @@
 # Project harness and specs
 AGENTS.md
 .agents
-.github
-.claude
 .cursor
 .windsurf
 .mcp.json
@@ -11,6 +9,25 @@ skills-lock.json
 docs/technical-design-document.md
 docs/feasibility-study.md
 docs/prd/
+
+# .github: only CI/CD and repository policy files are tracked; anything an
+# agent harness writes there (instructions, skills, prompts) stays local
+.github/*
+!.github/workflows/
+!.github/dependabot.yml
+!.github/CODEOWNERS
+!.github/rulesets/
+
+# .claude: only the-judge is tracked, because review.yml runs it on the runner
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/the-judge/
+
+# the-judge's transient review output and its scripts' bytecode
+findings.json
+__pycache__/
+*.pyc
 
 # Generated CO-RE kernel header (regenerated via `go generate ./bpf/...`)
 bpf/vmlinux.h
