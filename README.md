@@ -300,3 +300,5 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
+
+<!-- review-post proof run of 2026-10-25: this pull request is closed unmerged. -->
