@@ -18,7 +18,8 @@ REPO="${REPO:-mesbrj/GO-eBPF-Proxy}"
 RULESET_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.github/rulesets/main.json"
 readonly REPO RULESET_FILE
 
-# The committed settings. Each is written by one call in apply and read back in check.
+# The committed settings. Each is written by one call in apply and read back in
+# check; review-bot's main deployment branch policy is created only when absent.
 readonly ALLOW_MERGE_COMMIT=false
 readonly ALLOW_REBASE_MERGE=true
 readonly ALLOW_SQUASH_MERGE=true
@@ -29,6 +30,8 @@ readonly CAN_APPROVE_PULL_REQUEST_REVIEWS=false
 readonly SHA_PINNING_REQUIRED=true
 readonly VULNERABILITY_ALERTS=enabled
 readonly AUTOMATED_SECURITY_FIXES=enabled
+# Door 11: review-bot admits deployments from the branch main only.
+readonly REVIEW_BOT_DEPLOYMENT_BRANCHES="custom branch:main"
 
 usage() {
   {
@@ -39,7 +42,10 @@ usage() {
 }
 
 # The ruleset as compared: without the fields the server assigns, keys sorted,
-# rules in type order.
+# rules in type order. main.json also states the two pull_request parameters
+# GitHub adds on its own, required_reviewers and the undocumented
+# require_extra_approval_for_unattributed_changes, so the comparison covers the
+# whole rule set GitHub enforces.
 normalize_ruleset() {
   jq -cS 'del(.id, .node_id, ._links, .created_at, .updated_at, .source, .source_type, .current_user_can_bypass)
     | .rules |= sort_by(.type)'
@@ -75,6 +81,21 @@ vulnerability_alerts() {
   fi
 }
 
+# Prints review-bot's deployment branch rule: "custom" and its sorted
+# type:name policies, "protected", "none", or "unreadable".
+review_bot_deployment_branches() {
+  local env policies
+  env=$(gh api "repos/$REPO/environments/review-bot") || { echo unreadable; return; }
+  case "$(jq -r 'if .deployment_branch_policy == null then "none" elif .deployment_branch_policy.custom_branch_policies then "custom" else "protected" end' <<<"$env")" in
+  custom)
+    policies=$(gh api "repos/$REPO/environments/review-bot/deployment-branch-policies") || { echo unreadable; return; }
+    echo "custom $(jq -r '[.branch_policies[] | "\(.type):\(.name)"] | sort | join(",")' <<<"$policies")"
+    ;;
+  protected) echo protected ;;
+  *) echo none ;;
+  esac
+}
+
 # compare <name> <want> <got>
 compare() {
   if [[ "$2" == "$3" ]]; then
@@ -104,6 +125,7 @@ check() {
   compare sha_pinning_required "$SHA_PINNING_REQUIRED" "$(jq -r .sha_pinning_required <<<"$actions")" || status=1
   compare vulnerability_alerts "$VULNERABILITY_ALERTS" "$(vulnerability_alerts)" || status=1
   compare automated_security_fixes "$AUTOMATED_SECURITY_FIXES" "$fixes" || status=1
+  compare review_bot_deployment_branches "$REVIEW_BOT_DEPLOYMENT_BRANCHES" "$(review_bot_deployment_branches)" || status=1
   return "$status"
 }
 
@@ -113,7 +135,7 @@ write() {
 }
 
 apply() {
-  local id
+  local id policies
   write -X PATCH "repos/$REPO" -F allow_merge_commit="$ALLOW_MERGE_COMMIT"
   write -X PATCH "repos/$REPO" -F allow_rebase_merge="$ALLOW_REBASE_MERGE"
   write -X PATCH "repos/$REPO" -F allow_squash_merge="$ALLOW_SQUASH_MERGE"
@@ -131,6 +153,15 @@ apply() {
     write -X PUT "repos/$REPO/rulesets/$id" --input "$RULESET_FILE"
   else
     write -X POST "repos/$REPO/rulesets" --input "$RULESET_FILE"
+  fi
+  # Read before writing, so that after the last write come check's reads only.
+  policies=$(gh api "repos/$REPO/environments/review-bot/deployment-branch-policies") || policies=unreadable
+  write -X PUT "repos/$REPO/environments/review-bot" \
+    -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
+  if [[ "$policies" == unreadable ]]; then
+    echo "repo-policy: cannot list review-bot's deployment branch policies; main not added" >&2
+  elif ! jq -e 'any(.branch_policies[]; .type == "branch" and .name == "main")' <<<"$policies" >/dev/null; then
+    write -X POST "repos/$REPO/environments/review-bot/deployment-branch-policies" -f name=main -f type=branch
   fi
   check
 }

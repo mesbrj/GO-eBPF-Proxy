@@ -13,8 +13,8 @@ import (
 
 const policyAPI = "repos/" + testRepo
 
-// policySettings are the 11 settings repo-policy.sh compares (AC 62), by the
-// name each one's output line carries.
+// policySettings are the 12 settings repo-policy.sh compares (AC 62, amended
+// 2026-10-25), by the name each one's output line carries.
 var policySettings = []string{
 	"ruleset",
 	"allow_merge_commit",
@@ -27,6 +27,7 @@ var policySettings = []string{
 	"sha_pinning_required",
 	"vulnerability_alerts",
 	"automated_security_fixes",
+	"review_bot_deployment_branches",
 }
 
 const liveRulesetID = "42"
@@ -62,14 +63,16 @@ func rulesetName(t *testing.T) string {
 func compliantRepo(t *testing.T) map[string]ghResponse {
 	t.Helper()
 	return map[string]ghResponse{
-		"GET " + policyAPI:                                                       {Stdout: `{"name":"GO-eBPF-Proxy","allow_merge_commit":false,"allow_rebase_merge":true,"allow_squash_merge":true,"pull_request_creation_policy":"collaborators_only","visibility":"public"}`},
-		"GET " + policyAPI + "/actions/permissions":                              {Stdout: `{"enabled":true,"allowed_actions":"all","sha_pinning_required":true}`},
-		"GET " + policyAPI + "/actions/permissions/workflow":                     {Stdout: `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`},
-		"GET " + policyAPI + "/actions/permissions/fork-pr-contributor-approval": {Stdout: `{"approval_policy":"all_external_contributors"}`},
-		"GET " + policyAPI + "/vulnerability-alerts":                             {},
-		"GET " + policyAPI + "/automated-security-fixes":                         {Stdout: `{"enabled":true,"paused":false}`},
-		"GET " + policyAPI + "/rulesets":                                         {Stdout: `[{"id":42,"name":"` + rulesetName(t) + `","target":"branch","source_type":"Repository","source":"` + testRepo + `","enforcement":"active"}]`},
-		"GET " + policyAPI + "/rulesets/" + liveRulesetID:                        {Stdout: liveRuleset(t, nil)},
+		"GET " + policyAPI:                                                         {Stdout: `{"name":"GO-eBPF-Proxy","allow_merge_commit":false,"allow_rebase_merge":true,"allow_squash_merge":true,"pull_request_creation_policy":"collaborators_only","visibility":"public"}`},
+		"GET " + policyAPI + "/actions/permissions":                                {Stdout: `{"enabled":true,"allowed_actions":"all","sha_pinning_required":true}`},
+		"GET " + policyAPI + "/actions/permissions/workflow":                       {Stdout: `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`},
+		"GET " + policyAPI + "/actions/permissions/fork-pr-contributor-approval":   {Stdout: `{"approval_policy":"all_external_contributors"}`},
+		"GET " + policyAPI + "/vulnerability-alerts":                               {},
+		"GET " + policyAPI + "/automated-security-fixes":                           {Stdout: `{"enabled":true,"paused":false}`},
+		"GET " + policyAPI + "/rulesets":                                           {Stdout: `[{"id":42,"name":"` + rulesetName(t) + `","target":"branch","source_type":"Repository","source":"` + testRepo + `","enforcement":"active"}]`},
+		"GET " + policyAPI + "/rulesets/" + liveRulesetID:                          {Stdout: liveRuleset(t, nil)},
+		"GET " + policyAPI + "/environments/review-bot":                            {Stdout: `{"name":"review-bot","deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}`},
+		"GET " + policyAPI + "/environments/review-bot/deployment-branch-policies": {Stdout: `{"total_count":1,"branch_policies":[{"id":1,"node_id":"MDE2","name":"main","type":"branch"}]}`},
 	}
 }
 
@@ -110,6 +113,8 @@ func driftedRepo(t *testing.T, setting string) map[string]ghResponse {
 		r["GET "+policyAPI+"/vulnerability-alerts"] = ghResponse{Stderr: "gh: Vulnerability alerts are disabled. (HTTP 404)\n", Exit: 1}
 	case "automated_security_fixes":
 		r["GET "+policyAPI+"/automated-security-fixes"] = ghResponse{Stdout: `{"enabled":false,"paused":false}`}
+	case "review_bot_deployment_branches":
+		r["GET "+policyAPI+"/environments/review-bot"] = ghResponse{Stdout: `{"name":"review-bot","deployment_branch_policy":null}`}
 	default:
 		require.Failf(t, "unknown setting", "%s", setting)
 	}
@@ -123,9 +128,9 @@ func repoPolicy(t *testing.T, gh *fakeGH, args ...string) result {
 	return run(t, cmd)
 }
 
-// C61 (AC 62): over each of the 11 settings.
+// C61 (AC 62): over each of the 12 settings.
 func TestRepoPolicy_CheckExitsOneNamingEachDifferingSetting(t *testing.T) {
-	require.Len(t, policySettings, 11)
+	require.Len(t, policySettings, 12)
 	for _, setting := range policySettings {
 		t.Run(setting, func(t *testing.T) {
 			gh := newFakeGH(t, driftedRepo(t, setting))
@@ -179,7 +184,7 @@ func writeKey(c ghCall) string {
 	return strings.TrimSpace(c.Key + " " + strings.Join(kv, " "))
 }
 
-// C63 (AC 63): one write per setting for each of the 11, then check's reads,
+// C63 (AC 63): one write per setting for each of the 12, then check's reads,
 // exiting with check's code; an existing ruleset is updated by id, never duplicated.
 func TestRepoPolicy_ApplyWritesEverySettingThenChecks(t *testing.T) {
 	wantWrites := []string{
@@ -194,6 +199,7 @@ func TestRepoPolicy_ApplyWritesEverySettingThenChecks(t *testing.T) {
 		"PUT " + policyAPI + "/vulnerability-alerts",
 		"PUT " + policyAPI + "/automated-security-fixes",
 		"PUT " + policyAPI + "/rulesets/" + liveRulesetID,
+		"PUT " + policyAPI + "/environments/review-bot deployment_branch_policy[custom_branch_policies]=true deployment_branch_policy[protected_branches]=false",
 	}
 	require.Len(t, wantWrites, len(policySettings))
 
@@ -231,6 +237,37 @@ func TestRepoPolicy_ApplyWritesEverySettingThenChecks(t *testing.T) {
 			assert.NotContains(t, callKeys(calls), "POST "+policyAPI+"/rulesets", "an existing ruleset must not be duplicated")
 			require.GreaterOrEqual(t, last, 0)
 			assert.Equal(t, checkReads, callKeys(calls[last+1:]), "after its writes apply must make check's reads")
+		})
+	}
+}
+
+// C80 (AC 71, door 11): apply creates review-bot's main deployment branch
+// policy only when it is absent, so a second apply creates nothing.
+func TestRepoPolicy_ApplyCreatesTheMainBranchPolicyOnlyWhenAbsent(t *testing.T) {
+	const create = "POST " + policyAPI + "/environments/review-bot/deployment-branch-policies"
+	for _, tc := range []struct {
+		name     string
+		policies string
+		creates  int
+	}{
+		{"absent", `{"total_count":0,"branch_policies":[]}`, 1},
+		{"present", `{"total_count":1,"branch_policies":[{"id":1,"node_id":"MDE2","name":"main","type":"branch"}]}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := compliantRepo(t)
+			state["GET "+policyAPI+"/environments/review-bot/deployment-branch-policies"] = ghResponse{Stdout: tc.policies}
+			gh := newFakeGH(t, state)
+			repoPolicy(t, gh, "apply")
+			var creates []ghCall
+			for _, c := range gh.calls() {
+				if c.Key == create {
+					creates = append(creates, c)
+				}
+			}
+			require.Len(t, creates, tc.creates)
+			for _, c := range creates {
+				assert.Equal(t, map[string]string{"name": "main", "type": "branch"}, apiFields(c.Args))
+			}
 		})
 	}
 }
