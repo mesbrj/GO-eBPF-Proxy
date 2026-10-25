@@ -247,15 +247,18 @@ func TestRepoPolicy_ApplyCreatesTheMainBranchPolicyOnlyWhenAbsent(t *testing.T) 
 	const create = "POST " + policyAPI + "/environments/review-bot/deployment-branch-policies"
 	for _, tc := range []struct {
 		name     string
-		policies string
+		policies ghResponse
 		creates  int
 	}{
-		{"absent", `{"total_count":0,"branch_policies":[]}`, 1},
-		{"present", `{"total_count":1,"branch_policies":[{"id":1,"node_id":"MDE2","name":"main","type":"branch"}]}`, 0},
+		{"absent", ghResponse{Stdout: `{"total_count":0,"branch_policies":[]}`}, 1},
+		// Before custom branch policies are enabled, GitHub answers the listing with 404.
+		{"custom policies not enabled yet", ghResponse{Stderr: "gh: Not Found (HTTP 404)\n", Exit: 1}, 1},
+		{"present", ghResponse{Stdout: `{"total_count":1,"branch_policies":[{"id":1,"node_id":"MDE2","name":"main","type":"branch"}]}`}, 0},
+		{"unreadable", ghResponse{Stderr: "gh: Server Error (HTTP 500)\n", Exit: 1}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := compliantRepo(t)
-			state["GET "+policyAPI+"/environments/review-bot/deployment-branch-policies"] = ghResponse{Stdout: tc.policies}
+			state["GET "+policyAPI+"/environments/review-bot/deployment-branch-policies"] = tc.policies
 			gh := newFakeGH(t, state)
 			repoPolicy(t, gh, "apply")
 			var creates []ghCall
