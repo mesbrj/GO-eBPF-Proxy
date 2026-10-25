@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -419,6 +420,46 @@ func TestReviewWorkflow_JudgeJobIsPinned(t *testing.T) {
 		sum := sha256.Sum256(readRepoFile(t, judgeScripts+"/"+name))
 		assert.Equal(t, want, hex.EncodeToString(sum[:]), "SHA-256 of %s/%s", judgeScripts, name)
 	}
+}
+
+// claudeProjectConfig is the Claude Code project configuration main must not
+// track: three files, and three directories, written with a trailing slash.
+var claudeProjectConfig = []string{
+	".claude/settings.json",
+	".claude/settings.local.json",
+	".mcp.json",
+	".claude/hooks/",
+	".claude/agents/",
+	".claude/commands/",
+}
+
+// C87 (door 5 scope and accepted caveat; fix round 5): claude-code-action
+// restores .claude/ and .mcp.json from the base branch, and Claude Code loads
+// its settings, hooks and MCP servers from them, so main tracks none. Python
+// imports a file beside judge's scripts ahead of the standard-library module
+// it is named after, so their directory holds exactly the three scripts.
+func TestReviewWorkflow_CheckoutCarriesNoClaudeConfig(t *testing.T) {
+	cmd := exec.Command("git", "ls-files", "-z")
+	cmd.Dir = repoRoot(t)
+	res := run(t, cmd)
+	require.Zero(t, res.code, "git ls-files: %s", res.stderr)
+	tracked := strings.Split(strings.TrimSuffix(res.stdout, "\x00"), "\x00")
+	require.Contains(t, tracked, ".github/workflows/review.yml", "git ls-files did not list this repository")
+
+	var config, scripts []string
+	for _, path := range tracked {
+		for _, c := range claudeProjectConfig {
+			if path == c || (strings.HasSuffix(c, "/") && strings.HasPrefix(path, c)) {
+				config = append(config, path)
+			}
+		}
+		if name, ok := strings.CutPrefix(path, judgeScripts+"/"); ok {
+			scripts = append(scripts, name)
+		}
+	}
+	assert.Empty(t, config, "tracked Claude Code project configuration")
+	assert.ElementsMatch(t, []string{"post_review.py", "review_gate.py", "scan_bypasses.py"}, scripts,
+		"tracked files under %s, with no subdirectory", judgeScripts)
 }
 
 func keys[V any](m map[string]V) []string {
