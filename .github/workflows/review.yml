@@ -1,3 +1,4 @@
+# SPIKE (C1, never merged): judge runs on a draft pull request; post is off.
 # One advisory review per pull request by the-judge (AD-026, AD-027).
 # judge runs Claude with a read-only GITHUB_TOKEN and hands findings.json on as
 # an artifact; post runs no Claude step and posts it as the review bot, whose
@@ -31,8 +32,7 @@ jobs:
     # dispatch path skips them in the guard step, which reads the pull request.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (!github.event.pull_request.draft &&
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      (github.event.pull_request.user.login != 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-24.04
     environment: claude-review
@@ -54,7 +54,6 @@ jobs:
           pr_json=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json number,state,isDraft,author,isCrossRepository,headRefOid)
           reason=$(jq -r '
             if .state != "OPEN" then "not open"
-            elif .isDraft then "a draft"
             elif (.author.login | test("^(app/)?dependabot(\\[bot\\])?$")) then "authored by dependabot[bot]"
             elif .isCrossRepository then "from a fork"
             else empty end' <<<"$pr_json")
@@ -145,8 +144,9 @@ jobs:
 
   post:
     needs: judge
+    # SPIKE: no App or review-bot environment exists yet; C1 needs only judge.
     if: >-
-      needs.judge.outputs.eligible == 'true' &&
+      false && needs.judge.outputs.eligible == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       (!github.event.pull_request.draft &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
