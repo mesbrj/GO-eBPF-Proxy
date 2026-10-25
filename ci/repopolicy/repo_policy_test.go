@@ -139,7 +139,7 @@ func driftedRepo(t *testing.T, setting string) map[string]ghResponse {
 
 func repoPolicy(t *testing.T, gh *fakeGH, args ...string) result {
 	t.Helper()
-	cmd := exec.Command(repoPath(t, "deploy/github/repo-policy.sh"), args...) // #nosec G204 -- the script under test with fixed arguments
+	cmd := exec.Command(repoPath(t, ".github/scripts/repo-policy.sh"), args...) // #nosec G204 -- the script under test with fixed arguments
 	cmd.Env = gh.env()
 	return run(t, cmd)
 }
