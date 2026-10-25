@@ -160,7 +160,7 @@ type heldPacket struct {
 	at   time.Time // when WritePacket received it, by the Writer's Clock
 }
 
-// Writer is an in-process pcapng (SHB/IDB/EPB) writer for the outbound leg
+// Writer is an in-process pcapng (SHB/IDB/EPB) writer for the captured traffic
 // that keeps the capture self-decrypting while it is being written: packets
 // wait out holdWindow, and each NSS keylog line handed to AddSecret is
 // written as a TLS Decryption Secrets Block ahead of every packet still held

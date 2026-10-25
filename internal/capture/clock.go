@@ -1,5 +1,6 @@
-// Package capture writes the proxy relay's outbound leg to pcap/pcapng,
-// pairs it with the NSS keylog the LD_PRELOAD interposer emits, and enforces
+// Package capture writes every frame on the capture interface (the proxy
+// relay's outbound leg and all other pod traffic) to pcap/pcapng, pairs it
+// with the NSS keylog the LD_PRELOAD interposer emits, and enforces
 // secret-grade, bounded retention on the resulting artifacts. No TLS
 // termination, no MITM: capture is a passive observer of ciphertext plus the
 // app's own key material.

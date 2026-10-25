@@ -1,7 +1,8 @@
 // Command app is the sidecar entrypoint: it loads and attaches the eBPF
 // connect4/sockops redirect, serves the pass-through relay, runs the
-// LD_PRELOAD-interposer keylog socket server, and captures the outbound leg
-// to a DSB-embedded pcapng file with bounded, ephemeral-by-default retention.
+// LD_PRELOAD-interposer keylog socket server, and captures every frame on the
+// capture interface (the relay's outbound leg and all other pod traffic) to a
+// DSB-embedded pcapng file with bounded, ephemeral-by-default retention.
 package main
 
 import (
