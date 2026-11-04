@@ -89,14 +89,21 @@ func TestDependabot_DeclaresActionsAndGomodWeeklyWithSevenDayCooldown(t *testing
 	assert.ElementsMatch(t, []string{"github-actions", "gomod"}, ecosystems)
 }
 
-// C57 (AC 47)
+// C57 (AC 47), amended by the operator on 2026-11-04: every action update is
+// still grouped, in two groups now. A claude-code-action bump needs the judge
+// golden copy edited by hand (C86), so it arrives apart from the other actions.
 func TestDependabot_GroupsEveryActionsUpdate(t *testing.T) {
+	const claudeAction = "anthropics/claude-code-action"
+
 	groups := dependabotEntry(t, "github-actions").Groups
-	require.Len(t, groups, 1)
-	for _, g := range groups {
-		assert.Equal(t, []string{"*"}, g.Patterns)
-		assert.Empty(t, g.ExcludePatterns)
-	}
+	require.Len(t, groups, 2)
+	require.Contains(t, groups, "actions")
+	require.Contains(t, groups, "claude-code-action")
+
+	assert.Equal(t, []string{"*"}, groups["actions"].Patterns)
+	assert.Equal(t, []string{claudeAction}, groups["actions"].ExcludePatterns)
+	assert.Equal(t, []string{claudeAction}, groups["claude-code-action"].Patterns)
+	assert.Empty(t, groups["claude-code-action"].ExcludePatterns)
 }
 
 // C58 (AC 48)
