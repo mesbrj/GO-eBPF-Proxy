@@ -1,5 +1,8 @@
 # Grouped weekly updates, each at least 7 days after release. github.com/cilium/ebpf
 # stays out of the gomod group: its bump needs `make generate` and arrives alone.
+# anthropics/claude-code-action has a group of its own: its bump also needs
+# ci/repopolicy/testdata/judge.golden.yml edited by hand, and must not hold up the
+# other actions.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -9,8 +12,11 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      claude-code-action:
+        patterns: [anthropics/claude-code-action]
       actions:
         patterns: ["*"]
+        exclude-patterns: [anthropics/claude-code-action]
 
   - package-ecosystem: gomod
     directory: /
