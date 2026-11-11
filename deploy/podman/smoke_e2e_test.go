@@ -263,7 +263,7 @@ func TestSmoke_RealCertRequestSucceedsAndArtifactsGrow(t *testing.T) {
 	requireRootfulPodman(t)
 	requireInternetEgress(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-it56"
+	podName := "netloupe-tap-it56"
 	podUp(t, podName, bin)
 
 	capturePath := volumeCapturePath(t, podName)
@@ -291,7 +291,7 @@ func TestSmoke_OfflineValidationDecryptsPlaintext(t *testing.T) {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-it7"
+	podName := "netloupe-tap-it7"
 	podUp(t, podName, bin)
 
 	capturePath := volumeCapturePath(t, podName)
@@ -343,12 +343,12 @@ func TestSmoke_RetainedCaptureSelfDecryptsFromEmbeddedSecrets(t *testing.T) {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-it7dsb"
+	podName := "netloupe-tap-it7dsb"
 	podUpNoCleanup(t, podName, bin, "RETAIN=1")
 	t.Cleanup(func() {
 		// RETAIN=0: the volume (a plaintext-equivalent secret once the
 		// keylog is embedded in it) goes away with the pod, overriding the
-		// go-ebpf-proxy.retain=1 label this RETAIN=1 pod carries (AD-019).
+		// netloupe-tap.retain=1 label this RETAIN=1 pod carries (AD-019).
 		down := exec.Command("./pod-down.sh")
 		down.Env = append(os.Environ(), "POD_NAME="+podName, "RETAIN=0")
 		_ = down.Run()
@@ -390,7 +390,7 @@ func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
 
-	podNameDefault := "go-ebpf-proxy-it9a"
+	podNameDefault := "netloupe-tap-it9a"
 	podUpNoCleanup(t, podNameDefault, bin)
 	capturePathDefault := volumeCapturePath(t, podNameDefault)
 	downDefault := exec.Command("./pod-down.sh")
@@ -400,7 +400,7 @@ func TestPodDown_DefaultWipesRetainPreserves(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "default teardown must wipe /var/log/sidecar")
 	assert.False(t, volumeExists(t, podNameDefault+"-keylog-sock"), "default teardown must remove the keylog socket volume")
 
-	podNameRetain := "go-ebpf-proxy-it9b"
+	podNameRetain := "netloupe-tap-it9b"
 	podUpNoCleanup(t, podNameRetain, bin, "RETAIN=1")
 	capturePathRetain := volumeCapturePath(t, podNameRetain)
 	downRetain := exec.Command("./pod-down.sh", "--retain")
@@ -427,7 +427,7 @@ func TestSmoke_KilledSidecarCaptureSelfDecrypts(t *testing.T) {
 		t.Skip("tshark not installed; cannot assert decrypted application data")
 	}
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itkill"
+	podName := "netloupe-tap-itkill"
 	podUpNoCleanup(t, podName, bin)
 	t.Cleanup(func() {
 		down := exec.Command("./pod-down.sh")
@@ -460,12 +460,12 @@ func TestSmoke_KilledSidecarCaptureSelfDecrypts(t *testing.T) {
 func TestPodDown_PlainTeardownKeepsWhatPodUpRetained(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itplain"
+	podName := "netloupe-tap-itplain"
 	podUpNoCleanup(t, podName, bin, "RETAIN=1")
 	t.Cleanup(func() {
 		_ = exec.Command("podman", "volume", "rm", "-f", podName+"-sidecar-logs").Run() // #nosec G204 -- podName is a test-generated pod name, not external input
 	})
-	assert.Equal(t, "1", podLabel(t, podName, "go-ebpf-proxy.retain"), "RETAIN=1 must be recorded on the pod")
+	assert.Equal(t, "1", podLabel(t, podName, "netloupe-tap.retain"), "RETAIN=1 must be recorded on the pod")
 	capturePath := volumeCapturePath(t, podName)
 
 	down := exec.Command("./pod-down.sh")
@@ -515,7 +515,7 @@ func TestPodDown_RetainDecisionTable(t *testing.T) {
 	require.Len(t, rows, 18)
 	for i, r := range rows {
 		t.Run(fmt.Sprintf("pod=%s/RETAIN=%q/flag=%t", r.pod, r.retain, r.flag), func(t *testing.T) {
-			podName := fmt.Sprintf("go-ebpf-proxy-ittable%02d", i)
+			podName := fmt.Sprintf("netloupe-tap-ittable%02d", i)
 			logVol, sockVol := podName+"-sidecar-logs", podName+"-keylog-sock"
 			t.Cleanup(func() {
 				_ = exec.Command("podman", "pod", "rm", "-f", podName).Run()            // #nosec G204 -- test-generated name
@@ -528,7 +528,7 @@ func TestPodDown_RetainDecisionTable(t *testing.T) {
 			create := []string{"pod", "create", "--name", podName}
 			switch r.pod {
 			case "1", "0":
-				create = append(create, "--label", "go-ebpf-proxy.retain="+r.pod)
+				create = append(create, "--label", "netloupe-tap.retain="+r.pod)
 			}
 			if r.pod != "missing" {
 				out, err := exec.Command("podman", create...).CombinedOutput() // #nosec G204 -- test-generated arguments
@@ -585,7 +585,7 @@ func TestSmoke_CaptureStopsAtMaxBytesAndPodKeepsServing(t *testing.T) {
 	requireInternetEgress(t)
 	const maxBytes = 104_857_600 // the sidecar's default --max-bytes
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itlimit"
+	podName := "netloupe-tap-itlimit"
 	keptCaptureVolume(t, podName, maxBytes-64<<10)
 	podUpNoCleanup(t, podName, bin, "RETAIN=1")
 	dir := volumeMountpoint(t, podName)
@@ -635,7 +635,7 @@ func TestPodDown_RetainedCaptureSurvivesNextRetainedPod(t *testing.T) {
 	requireRootfulPodman(t)
 	requireInternetEgress(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itkeep"
+	podName := "netloupe-tap-itkeep"
 	t.Cleanup(func() {
 		down := exec.Command("./pod-down.sh")
 		down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName, "RETAIN=0")

@@ -28,7 +28,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-POD_NAME="${POD_NAME:-go-ebpf-proxy}"
+POD_NAME="${POD_NAME:-netloupe-tap}"
 # nginx:alpine: a normal, long-lived process dynamically linked against
 # libssl -- still a convenient real target for the LD_PRELOAD interposer
 # (unrelated to uprobes/inode resolution, which no longer apply here).
@@ -49,7 +49,7 @@ KEYLOG_SOCKET="$KEYLOG_DIR/keylog.sock"
 # remove the podman VOLUME itself -- without also passing --retain here, the
 # app always deletes its capture on shutdown regardless of what pod-down.sh
 # does with the volume. The choice is also
-# recorded on the pod as the label go-ebpf-proxy.retain (AD-019), which
+# recorded on the pod as the label netloupe-tap.retain (AD-019), which
 # pod-down.sh follows by default, so RETAIN=1 here is the only switch needed.
 RETAIN="${RETAIN:-0}"
 SIDECAR_RETAIN_FLAG=()
@@ -83,13 +83,13 @@ fi
 # itself also needs o+x (search-only, not read/write) added, or UID 1337
 # can't even traverse into its own already-chowned subdir.
 chmod o+x /sys/fs/bpf
-mkdir -p /sys/fs/bpf/go-ebpf-proxy
-chown -R 1337:1337 /sys/fs/bpf/go-ebpf-proxy
+mkdir -p /sys/fs/bpf/netloupe-tap
+chown -R 1337:1337 /sys/fs/bpf/netloupe-tap
 
 podman pod create \
   --name "$POD_NAME" \
   --share net,ipc,uts \
-  --label "go-ebpf-proxy.retain=$RETAIN_LABEL" \
+  --label "netloupe-tap.retain=$RETAIN_LABEL" \
   --replace
 
 podman volume create "$LOG_VOLUME" >/dev/null 2>&1 || true

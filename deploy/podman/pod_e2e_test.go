@@ -160,7 +160,7 @@ func tupleMapEntryCount(t *testing.T, pinDir string) int {
 func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-it4"
+	podName := "netloupe-tap-it4"
 	start := time.Now().Unix()
 	out := podUp(t, podName, bin)
 	assert.NotContains(t, out, "pod-up: capture not started")
@@ -186,15 +186,18 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 	app := inspectContainer(t, podName+"-app")
 	assert.Equal(t, "running", app.State.Status, "app container must be running")
 
-	assert.Equal(t, "0", podLabel(t, podName, "go-ebpf-proxy.retain"),
-		"a pod brought up without RETAIN=1 must record go-ebpf-proxy.retain=0 for pod-down.sh (AD-019)")
+	assert.True(t, volumeExists(t, podName+"-sidecar-logs"), "pod-up.sh must create the log volume <pod>-sidecar-logs")
+	assert.True(t, volumeExists(t, podName+"-keylog-sock"), "pod-up.sh must create the keylog socket volume <pod>-keylog-sock")
+
+	assert.Equal(t, "0", podLabel(t, podName, "netloupe-tap.retain"),
+		"a pod brought up without RETAIN=1 must record netloupe-tap.retain=0 for pod-down.sh (AD-019)")
 
 	// Maps pinned (host-visible: /sys/fs/bpf is bind-mounted into the sidecar
 	// at the same path). cmd/app's compiled-in default is used since pod-up.sh
 	// does not override --pin-dir.
 	for _, pin := range []string{
-		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_cookie",
-		"/sys/fs/bpf/go-ebpf-proxy/origdst_by_tuple",
+		"/sys/fs/bpf/netloupe-tap/origdst_by_cookie",
+		"/sys/fs/bpf/netloupe-tap/origdst_by_tuple",
 	} {
 		_, err := os.Stat(pin)
 		assert.NoErrorf(t, err, "pin %s must exist once the sidecar has loaded", pin)
@@ -215,6 +218,33 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 		}
 	}
 	assert.True(t, sawLDPreload, "the app container must be launched with an LD_PRELOAD env var set")
+	assert.Contains(t, app.Config.Env, "NETLOUPE_TAP_PRELOAD_SOCKET=/run/keylog/keylog.sock",
+		"the interposer reads its socket path from NETLOUPE_TAP_PRELOAD_SOCKET only")
+}
+
+// C13 (AC 7, door 3): pod-down.sh removes the pin directory pod-up.sh created
+// for the sidecar. The sidecar's Close removes only a pin dir its own Load
+// created, and pod-up.sh creates this one before the sidecar starts, so it
+// outlives the pod unless pod-down.sh removes it.
+func TestPodDown_RemovesThePinDirectory(t *testing.T) {
+	requireRootfulPodman(t)
+	bin := buildSidecarBinary(t)
+	podName := "netloupe-tap-itpin"
+	const pinDir = "/sys/fs/bpf/netloupe-tap"
+	podUpNoCleanup(t, podName, bin)
+	t.Cleanup(func() {
+		down := exec.Command("./pod-down.sh")
+		down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName, "RETAIN=0")
+		_ = down.Run()
+	})
+	require.DirExists(t, pinDir, "precondition: pod-up.sh creates the pin directory")
+
+	down := exec.Command("./pod-down.sh")
+	down.Env = append(envWithout("RETAIN", "POD_NAME"), "POD_NAME="+podName)
+	out, err := down.CombinedOutput()
+	require.NoError(t, err, "pod-down.sh: %s", out)
+
+	assert.NoDirExists(t, pinDir, "pod-down.sh must remove the pin directory")
 }
 
 // IT-03.8: the sidecar's own egress (UID 1337) is never redirected by
@@ -224,14 +254,14 @@ func TestPodUp_BringsUpHealthyPodWithExpectedConfig(t *testing.T) {
 func TestPodUp_SidecarEgressNotRedirected(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-it8"
+	podName := "netloupe-tap-it8"
 	podUp(t, podName, bin)
 
 	out, err := exec.Command("podman", "exec", podName+"-sidecar", "id", "-u").Output()
 	require.NoError(t, err)
 	assert.Equal(t, "1337", strings.TrimSpace(string(out)), "sidecar's own processes must run as UID 1337")
 
-	pinDir := "/sys/fs/bpf/go-ebpf-proxy"
+	pinDir := "/sys/fs/bpf/netloupe-tap"
 	// TEST-NET-3 (RFC 5737): reserved, never routed; connect4 fires on the
 	// connect() syscall regardless of reachability, so no real traffic is sent.
 	const probe = "http://203.0.113.1/"
@@ -253,7 +283,7 @@ func TestPodUp_SidecarEgressNotRedirected(t *testing.T) {
 func TestPodStop_SidecarExitsZeroOnSigterm(t *testing.T) {
 	requireRootfulPodman(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itstop"
+	podName := "netloupe-tap-itstop"
 	podUp(t, podName, bin)
 	sidecar := podName + "-sidecar"
 
@@ -270,7 +300,7 @@ func TestPodStop_SidecarExitsZeroOnSigterm(t *testing.T) {
 // status 1 before it creates anything.
 func TestPodUp_MissingSidecarBinaryExitsOneWithoutPod(t *testing.T) {
 	requireRootfulPodman(t)
-	podName := "go-ebpf-proxy-itnobin"
+	podName := "netloupe-tap-itnobin"
 	up := exec.Command("./pod-up.sh")
 	up.Env = append(os.Environ(), "SIDECAR_BIN="+filepath.Join(t.TempDir(), "missing"), "POD_NAME="+podName)
 	out, err := up.CombinedOutput()
@@ -290,7 +320,7 @@ func TestPodUp_FullVolumeStartsWithoutCaptureAndStillRelays(t *testing.T) {
 	requireRootfulPodman(t)
 	requireInternetEgress(t)
 	bin := buildSidecarBinary(t)
-	podName := "go-ebpf-proxy-itfull"
+	podName := "netloupe-tap-itfull"
 	keptCaptureVolume(t, podName, 104_857_600)
 
 	stderr := podUpNoCleanup(t, podName, bin)
