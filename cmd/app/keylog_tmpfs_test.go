@@ -150,7 +150,7 @@ func TestMain_KeylogOffTmpfsExitsOneNamingDir(t *testing.T) {
 		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
 		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
 	)
-	cmd.Env = []string{} // no GOEBPF_SIDECAR_* setting leaks in from the test's environment
+	cmd.Env = []string{} // no NETLOUPE_TAP_SIDECAR_* setting or GOEBPF_SIDECAR_* variable leaks in from the test's environment
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err = cmd.Run()

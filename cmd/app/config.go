@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -21,10 +22,17 @@ import (
 )
 
 // envPrefix marks the environment variables the sidecar reads settings from.
-// It is deliberately not the bare GOEBPF_ prefix: the LD_PRELOAD interposer
-// owns GOEBPF_PRELOAD_SOCKET, which is not a sidecar setting and would
-// otherwise be rejected as an unknown key.
-const envPrefix = "GOEBPF_SIDECAR_"
+// It is deliberately not the bare NETLOUPE_TAP_ prefix: the LD_PRELOAD
+// interposer owns NETLOUPE_TAP_PRELOAD_SOCKET, which is not a sidecar setting
+// and would otherwise be rejected as an unknown key.
+const envPrefix = "NETLOUPE_TAP_SIDECAR_"
+
+// oldEnvPrefix is the prefix the sidecar read its settings from before the
+// project was renamed netloupe-tap. koanf's env provider would skip such a
+// variable silently, so a forgotten GOEBPF_SIDECAR_MAX_BYTES would lift the
+// bound on key-bearing captures and GOEBPF_SIDECAR_RETAIN=1 would let teardown
+// delete a capture the operator meant to keep; loadConfig refuses it instead.
+const oldEnvPrefix = "GOEBPF_SIDECAR_"
 
 // configFlag names the flag that points at the optional config file. It
 // selects a source rather than being a setting, so it never enters the
@@ -33,11 +41,12 @@ const configFlag = "config"
 
 // loadConfig registers the sidecar's flags on fs, parses args, and merges
 // every configuration source into a Config. Precedence, lowest first:
-// DefaultConfig(), the file named by --config, GOEBPF_SIDECAR_* variables in
-// environ, and the flags actually set in args. A setting's key is its flag
-// name in every source (GOEBPF_SIDECAR_MAX_AGE is max-age), and a key that
-// names no setting, or a value that does not parse as its setting's type, is
-// an error rather than being ignored or coerced.
+// DefaultConfig(), the file named by --config, NETLOUPE_TAP_SIDECAR_*
+// variables in environ, and the flags actually set in args. A setting's key is
+// its flag name in every source (NETLOUPE_TAP_SIDECAR_MAX_AGE is max-age), and
+// a key that names no setting, or a value that does not parse as its setting's
+// type, is an error rather than being ignored or coerced. So is any variable in
+// environ that still carries oldEnvPrefix, whatever it names.
 func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	d := DefaultConfig()
 	fs.String("cgroup-path", d.CgroupPath, "pod common-parent cgroup v2 path to attach connect4/sockops (required)")
@@ -67,6 +76,9 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 		if err := k.Load(file.Provider(*path), p); err != nil {
 			return Config{}, fmt.Errorf("config file %s: %w", *path, err)
 		}
+	}
+	if err := refuseOldEnvPrefix(environ); err != nil {
+		return Config{}, fmt.Errorf("config env: %w", err)
 	}
 	if err := k.Load(env.Provider(".", env.Opt{
 		Prefix:        envPrefix,
@@ -187,7 +199,21 @@ func parserFor(path string) (koanf.Parser, error) {
 }
 
 // envKey maps an environment variable to its setting key:
-// GOEBPF_SIDECAR_MAX_AGE becomes max-age.
+// NETLOUPE_TAP_SIDECAR_MAX_AGE becomes max-age.
 func envKey(name, value string) (string, any) {
 	return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(name, envPrefix)), "_", "-"), value
+}
+
+// refuseOldEnvPrefix returns an error naming every variable in environ that
+// carries oldEnvPrefix, each with the envPrefix variable that replaces it, or
+// nil when there is none. It names variables only, never their values.
+func refuseOldEnvPrefix(environ []string) error {
+	var errs []error
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if rest, ok := strings.CutPrefix(name, oldEnvPrefix); ok {
+			errs = append(errs, fmt.Errorf("%s is no longer read; set %s%s instead", name, envPrefix, rest))
+		}
+	}
+	return errors.Join(errs...)
 }
