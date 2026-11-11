@@ -49,6 +49,39 @@ func offTmpfsDir(t *testing.T) (string, string) {
 	return dir, fmt.Sprintf("0x%x", st.Type)
 }
 
+// runSidecar builds the sidecar binary and runs it unprivileged with
+// --keylog-path=keylogPath and every other path under a fresh temp directory,
+// then returns its exit code and stderr. env is the whole environment, so no
+// NETLOUPE_TAP_SIDECAR_* setting or GOEBPF_SIDECAR_* variable leaks in from the test's.
+func runSidecar(t *testing.T, keylogPath string, env []string) (int, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "app")
+	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, "build the sidecar binary: %s", out)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, // #nosec G204 -- bin and every path are test-generated, not external input
+		"--cgroup-path=/x",
+		"--keylog-path="+keylogPath,
+		"--pin-dir="+filepath.Join(tmp, "pin"),
+		"--relay-listen=127.0.0.1:0",
+		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
+		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
+	)
+	cmd.Env = append([]string{}, env...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "the sidecar must exit with a status; stderr: %s", stderr.String())
+	return exitErr.ExitCode(), stderr.String()
+}
+
 // C48 (AC 33, door 5): a keylog directory off tmpfs is refused, naming the
 // directory and the filesystem type statfs found -- whether the directory
 // exists or is still to be created under a disk-backed ancestor.
@@ -133,39 +166,17 @@ func TestStart_KeylogOffTmpfsFailsBeforeEBPF(t *testing.T) {
 // path off tmpfs, exits 1 after exactly one ERROR line naming the directory.
 func TestMain_KeylogOffTmpfsExitsOneNamingDir(t *testing.T) {
 	dir, _ := offTmpfsDir(t)
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "app")
-	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build the sidecar binary: %s", out)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, // #nosec G204 -- bin and every path are test-generated, not external input
-		"--cgroup-path=/x",
-		"--keylog-path="+filepath.Join(dir, "sslkeylog.log"),
-		"--pin-dir="+filepath.Join(tmp, "pin"),
-		"--relay-listen=127.0.0.1:0",
-		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
-		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
-	)
-	cmd.Env = []string{} // no NETLOUPE_TAP_SIDECAR_* setting or GOEBPF_SIDECAR_* variable leaks in from the test's environment
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err = cmd.Run()
+	code, stderr := runSidecar(t, filepath.Join(dir, "sslkeylog.log"), nil)
 
-	var exitErr *exec.ExitError
-	require.ErrorAs(t, err, &exitErr, "the sidecar must exit with a status; stderr: %s", stderr.String())
-	assert.Equal(t, 1, exitErr.ExitCode(), "stderr: %s", stderr.String())
-
+	assert.Equal(t, 1, code, "stderr: %s", stderr)
 	var errorLines []string
-	for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
 		var rec map[string]any
 		if json.Unmarshal([]byte(line), &rec) == nil && rec["level"] == "ERROR" {
 			errorLines = append(errorLines, line)
 		}
 	}
-	require.Len(t, errorLines, 1, "exactly one JSON ERROR line; stderr: %s", stderr.String())
+	require.Len(t, errorLines, 1, "exactly one JSON ERROR line; stderr: %s", stderr)
 	assert.Contains(t, errorLines[0], dir, "the ERROR line must name the keylog directory")
 }
