@@ -1,7 +1,5 @@
 # netloupe-tap
 
-Formerly named GO-eBPF-Proxy (renamed 2026-11).
-
 A sidecar that transparently redirects an unmodified application's outbound IPv4 TCP
 egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables`/NAT),
 **passively extracts the app's TLS session keys via an `LD_PRELOAD` interposer** on
@@ -14,6 +12,28 @@ complete app+sidecar pod end-to-end (see [Quick start](#quick-start)).
 real server; its certificate validation is never weakened, so certificate pinning is a
 non-issue — the sidecar only reads the ephemeral keys the app's own TLS library already
 derives.
+
+## What "tap" means
+
+In networking, a TAP (Terminal Access Point) sits on a link and copies the traffic that
+crosses it to a monitoring tool, without changing that traffic. `netloupe-tap` is a
+software TAP for a container pod's network: it runs inside the pod as a sidecar and
+records the pod's traffic, in both directions, to a pcapng that carries the TLS keys
+needed to decrypt it. The bytes the app sends and receives pass through unchanged.
+
+## Part of NetLoupe
+
+`netloupe-tap` is the capture component of NetLoupe, a network analysis system that is
+planned but not built yet. NetLoupe will:
+
+- ingest the pcapng captures, protected in transit and at rest;
+- analyse each capture in full;
+- export its flows as IPFIX, with information elements from YAF's built-in deep packet
+  inspection, using the [CERT NetSA tools](https://tools.netsa.cert.org/index.html);
+- store every analysis in Elasticsearch, behind a frontend, a backend, Kafka and workers.
+
+Today `netloupe-tap` works on its own: its captures stay on the host, and Wireshark or
+tshark decrypts them offline.
 
 ## Why
 
@@ -295,8 +315,9 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 
 ## Skills reference
 
-- [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/)
+- [The Judge](https://agent-skills.techleads.club/skills/the-judge/)
 - [tlc-spec-lean](https://agent-skills.techleads.club/skills/tlc-spec-lean/)
+- [tlc-spec-driven](https://agent-skills.techleads.club/skills/tlc-spec-driven/)
 - [technical-design-doc-creator](https://agent-skills.techleads.club/skills/technical-design-doc-creator/)
 - [skill-taskwarrior](https://github.com/mesbrj/skills#skill-taskwarrior)
 
