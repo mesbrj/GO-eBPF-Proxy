@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"flag"
 	"io"
 	"log/slog"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -413,37 +410,16 @@ func TestLoadConfig_RejectsOldEnvPrefix(t *testing.T) {
 // --keylog-path first and then fails on a --pin-dir outside bpffs with
 // "app: start failed", so neither needs any privilege to be seen.
 func TestApp_OldEnvPrefixExitsOneBeforeLoading(t *testing.T) {
-	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "app")
-	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build the sidecar binary: %s", out)
 	keylogPath := filepath.Join(shmDir(t), "sslkeylog.log")
 	require.NoError(t, os.WriteFile(keylogPath, []byte("leftover\n"), 0o600))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, // #nosec G204 -- bin and every path are test-generated, not external input
-		"--cgroup-path=/x",
-		"--keylog-path="+keylogPath,
-		"--pin-dir="+filepath.Join(tmp, "pin"),
-		"--relay-listen=127.0.0.1:0",
-		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
-		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
-	)
-	cmd.Env = []string{"GOEBPF_SIDECAR_RETAIN=1"}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err = cmd.Run()
+	code, stderr := runSidecar(t, keylogPath, []string{"GOEBPF_SIDECAR_RETAIN=1"})
 
-	var exitErr *exec.ExitError
-	require.ErrorAs(t, err, &exitErr, "the sidecar must exit with a status; stderr: %s", stderr.String())
-	assert.Equal(t, 1, exitErr.ExitCode(), "stderr: %s", stderr.String())
-	assert.Contains(t, stderr.String(), "app: config load failed")
-	assert.Contains(t, stderr.String(), "GOEBPF_SIDECAR_RETAIN", "the error must name the variable")
-	assert.Contains(t, stderr.String(), "NETLOUPE_TAP_SIDECAR_RETAIN", "the error must name its replacement")
-	assert.NotContains(t, stderr.String(), "app: start failed", "the refusal must come before Start")
+	assert.Equal(t, 1, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "app: config load failed")
+	assert.Contains(t, stderr, "GOEBPF_SIDECAR_RETAIN", "the error must name the variable")
+	assert.Contains(t, stderr, "NETLOUPE_TAP_SIDECAR_RETAIN", "the error must name its replacement")
+	assert.NotContains(t, stderr, "app: start failed", "the refusal must come before Start")
 	assert.FileExists(t, keylogPath, "Start deletes a leftover keylog before it loads eBPF, so it must not have run")
 }
 
