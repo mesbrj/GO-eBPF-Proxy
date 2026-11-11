@@ -147,7 +147,7 @@ func TestReviewPost_TakesThePullRequestFromTheHeadCommit(t *testing.T) {
 		{"one open pull request from this repository", "[" + pull(7, "open", sha, testRepo) + "]", "7"},
 		{"none", "[]", ""},
 		{"two", "[" + pull(7, "open", sha, testRepo) + "," + pull(8, "open", sha, testRepo) + "]", ""},
-		{"a fork head", "[" + pull(7, "open", sha, "someone/GO-eBPF-Proxy") + "]", ""},
+		{"a fork head", "[" + pull(7, "open", sha, "someone/netloupe-tap") + "]", ""},
 		{"a head.sha mismatch", "[" + pull(7, "open", "fedcba9876543210fedcba9876543210fedcba98", testRepo) + "]", ""},
 		{"only the merged pull request", "[" + pull(6, "closed", sha, testRepo) + "]", ""},
 	}

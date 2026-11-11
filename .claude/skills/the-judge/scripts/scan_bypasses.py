@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Modified 2026-10-25 for GO-eBPF-Proxy from the-judge v1.4.0 (tech-leads-club/agent-skills,
+# Modified 2026-10-25 for netloupe-tap from the-judge v1.4.0 (tech-leads-club/agent-skills,
 # Felipe Rodrigues, CC-BY-4.0): adds a sync-hack marker for Go's time.Sleep(, which the
 # upstream pattern (Python's lowercase time.sleep) misses. Every upstream marker is unchanged.
 # invariant: hits are Pass F candidates, never findings; always exit 0 so a detector cannot block the review.

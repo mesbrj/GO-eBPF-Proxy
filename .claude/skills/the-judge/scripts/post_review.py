@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Modified 2026-10-25 for GO-eBPF-Proxy from the-judge v1.4.0 (tech-leads-club/agent-skills,
+# Modified 2026-10-25 for netloupe-tap from the-judge v1.4.0 (tech-leads-club/agent-skills,
 # Felipe Rodrigues, CC-BY-4.0): adds a CI mode. With JUDGE_BOT_LOGIN set, the script skips
 # `gh api user`, posts as that login, submits every verdict as COMMENT and appends
 # "Intended verdict: **<verdict>**" for APPROVE and REQUEST_CHANGES, so the review bot never
