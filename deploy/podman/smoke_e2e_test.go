@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture/capturetest"
+	"github.com/mesbrj/netloupe-tap/internal/capture/capturetest"
 )
 
 // requireInternetEgress skips when example.com isn't reachable -- the smoke

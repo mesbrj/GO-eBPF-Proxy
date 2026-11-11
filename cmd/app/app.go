@@ -11,11 +11,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/keylog"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/proxy"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/capture"
+	"github.com/mesbrj/netloupe-tap/internal/ebpf"
+	"github.com/mesbrj/netloupe-tap/internal/keylog"
+	"github.com/mesbrj/netloupe-tap/internal/proxy"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // Config configures one run of the sidecar: eBPF redirect + relay, the

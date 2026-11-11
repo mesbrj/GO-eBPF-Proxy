@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unsafe"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

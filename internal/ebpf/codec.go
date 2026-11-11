@@ -7,7 +7,7 @@ import (
 	"errors"
 	"net/netip"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
 )
 
 // ErrNotIPv4 is returned when a non-IPv4 address is passed to the codec.

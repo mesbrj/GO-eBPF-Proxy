@@ -12,7 +12,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
 )
 
 // Compiled-in constants; these MUST match bpf/proxy.bpf.c.

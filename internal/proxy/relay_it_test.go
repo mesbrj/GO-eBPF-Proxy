@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	ebpfpkg "github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
+	ebpfpkg "github.com/mesbrj/netloupe-tap/internal/ebpf"
 )
 
 // startEcho starts a loopback TCP echo server and returns its address.

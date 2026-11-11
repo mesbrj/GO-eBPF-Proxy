@@ -23,12 +23,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/keylog"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/proxy"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
+	"github.com/mesbrj/netloupe-tap/internal/capture"
+	"github.com/mesbrj/netloupe-tap/internal/ebpf"
+	"github.com/mesbrj/netloupe-tap/internal/keylog"
+	"github.com/mesbrj/netloupe-tap/internal/proxy"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // syncBuffer is a bytes.Buffer safe for the relay's connection goroutines to

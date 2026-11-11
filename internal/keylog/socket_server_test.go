@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // wellFormedLine returns a valid CLIENT_RANDOM NSS line (32-byte

@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // shmDir returns a fresh directory under /dev/shm, a tmpfs on every Linux
@@ -28,7 +28,7 @@ func shmDir(t *testing.T) string {
 	var st unix.Statfs_t
 	require.NoError(t, unix.Statfs("/dev/shm", &st))
 	require.True(t, st.Type == unix.TMPFS_MAGIC, "precondition: /dev/shm must be tmpfs, statfs reports f_type 0x%x", st.Type)
-	dir, err := os.MkdirTemp("/dev/shm", "goebpf-keylog-test-")
+	dir, err := os.MkdirTemp("/dev/shm", "netloupe-tap-keylog-test-")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
