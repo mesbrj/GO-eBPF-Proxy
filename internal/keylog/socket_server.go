@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // SocketServerConfig configures a SocketServer.

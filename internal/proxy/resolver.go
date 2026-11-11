@@ -10,8 +10,8 @@ import (
 
 	ciliumebpf "github.com/cilium/ebpf"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
-	ebpfpkg "github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
+	ebpfpkg "github.com/mesbrj/netloupe-tap/internal/ebpf"
 )
 
 // ErrNotFound is returned when the original destination cannot be resolved for

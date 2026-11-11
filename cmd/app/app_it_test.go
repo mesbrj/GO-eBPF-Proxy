@@ -16,8 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/capture"
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/capture"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 // Orchestration smoke test: every wired subsystem (eBPF load+attach, relay,

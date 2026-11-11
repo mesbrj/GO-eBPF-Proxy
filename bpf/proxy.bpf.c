@@ -5,7 +5,7 @@
 #include <bpf/bpf_endian.h>
 
 /*
- * go-ebpf-proxy transparent redirect (single translation unit).
+ * netloupe-tap transparent redirect (single translation unit).
  *
  * Byte-order contract (shared with the Go codec):
  *   - IP fields are stored in NETWORK byte order.

@@ -12,7 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/mesbrj/GO-eBPF-Proxy/internal/shared/logger"
+	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
 )
 
 func main() {

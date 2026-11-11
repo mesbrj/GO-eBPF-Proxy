@@ -122,6 +122,6 @@ func TestMakefile_CheckRunsLintWorkflowsAndVuln(t *testing.T) {
 // C34 (AC 27, door 9)
 func TestGoMod_HasNoToolDirective(t *testing.T) {
 	gomod := string(readRepoFile(t, "go.mod"))
-	require.Regexp(t, `(?m)^module github\.com/mesbrj/GO-eBPF-Proxy$`, gomod)
+	require.Regexp(t, `(?m)^module github\.com/mesbrj/netloupe-tap$`, gomod)
 	assert.NotRegexp(t, `(?m)^\s*tool(?:\s|\()`, gomod)
 }

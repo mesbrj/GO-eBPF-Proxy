@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
-	ebpfpkg "github.com/mesbrj/GO-eBPF-Proxy/internal/ebpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
+	ebpfpkg "github.com/mesbrj/netloupe-tap/internal/ebpf"
 )
 
 // stubLookuper returns a scripted sequence of errors; nil means "found" and

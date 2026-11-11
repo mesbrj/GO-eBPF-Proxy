@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	bpf "github.com/mesbrj/GO-eBPF-Proxy/bpf"
+	bpf "github.com/mesbrj/netloupe-tap/bpf"
 )
 
 // loadLoaderOrSkip loads with a temp bpffs pin dir and temp cgroup v2, skipping

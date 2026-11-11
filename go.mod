@@ -1,4 +1,4 @@
-module github.com/mesbrj/GO-eBPF-Proxy
+module github.com/mesbrj/netloupe-tap
 
 go 1.26.0
 
