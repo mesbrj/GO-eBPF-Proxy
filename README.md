@@ -1,4 +1,6 @@
-# GO-eBPF-Proxy
+# netloupe-tap
+
+Formerly named GO-eBPF-Proxy (renamed 2026-11).
 
 A sidecar that transparently redirects an unmodified application's outbound IPv4 TCP
 egress to a local pass-through relay using eBPF (`cgroup/connect4`, no `iptables`/NAT),
@@ -18,7 +20,7 @@ derives.
 Inspecting an app's encrypted egress usually means one of three intrusive options:
 instrumenting the app, relying on `iptables`/NAT (often blocked by policy), or a MITM CA
 (defeated by certificate pinning, and TLS 1.3 forward secrecy makes static-key decryption
-impossible anyway). `go-ebpf-proxy` avoids all three: transparent redirection at the
+impossible anyway). `netloupe-tap` avoids all three: transparent redirection at the
 socket layer, and TLS keys read passively from the process that already holds them.
 
 ## How it works
@@ -71,11 +73,11 @@ flowchart LR
 
 ## Pod view
 
-`go-ebpf-proxy` runs as a second container in the same pod as the target app, sharing its
+`netloupe-tap` runs as a second container in the same pod as the target app, sharing its
 network, IPC and UTS namespaces plus the host's cgroup namespace (no shared PID
 namespace — the interposer needs no PID/inode resolution). **Every other container in
 the pod gets transparent redirection; one that dynamically links OpenSSL 3.x's `libssl`
-and has the interposer's `LD_PRELOAD`/`GOEBPF_PRELOAD_SOCKET` env vars set also gets TLS
+and has the interposer's `LD_PRELOAD`/`NETLOUPE_TAP_PRELOAD_SOCKET` env vars set also gets TLS
 key extraction** — no app code change, no rebuild, no trust-store edit.
 
 ```mermaid
@@ -86,7 +88,7 @@ flowchart TB
             libssl["libssl (TLS 1.2/1.3)"]
             interposer["LD_PRELOAD interposer"]
         end
-        subgraph sidecar["go-ebpf-proxy container (UID 1337)"]
+        subgraph sidecar["netloupe-tap-sidecar container (UID 1337)"]
             loader["eBPF loader"]
             relay["pass-through relay<br/>127.0.0.1:15001"]
             keylog["keylog socket server"]
@@ -141,7 +143,7 @@ make build
 make build-preload
 
 # 2. Bring up the pod: sidecar (eBPF redirect + keylog + capture) then the app,
-#    wired with LD_PRELOAD/GOEBPF_PRELOAD_SOCKET automatically. To keep the capture
+#    wired with LD_PRELOAD/NETLOUPE_TAP_PRELOAD_SOCKET automatically. To keep the capture
 #    after teardown, bring it up with: sudo RETAIN=1 deploy/podman/pod-up.sh
 sudo deploy/podman/pod-up.sh
 
@@ -153,7 +155,7 @@ sudo deploy/podman/smoke.sh
 #    Decryption Secrets Blocks while it is captured, so it decrypts with no keylog
 #    file: mid-run, after a clean stop, or after the sidecar was killed. Each run
 #    writes its own dump-<epoch>.pcapng; ls -t picks the newest, this run's
-CAPTURE="$(ls -t "$(podman volume inspect go-ebpf-proxy-sidecar-logs --format '{{.Mountpoint}}')"/dump-*.pcapng | head -n 1)"
+CAPTURE="$(ls -t "$(podman volume inspect netloupe-tap-sidecar-logs --format '{{.Mountpoint}}')"/dump-*.pcapng | head -n 1)"
 tshark -r "$CAPTURE" \
   -o "tls.keylog_file:" -o tcp.reassemble_out_of_order:TRUE \
   -Y 'http or http2' -V
@@ -161,7 +163,7 @@ tshark -r "$CAPTURE" \
 # only the keys inside the capture are used. To pair the separate keylog instead, copy
 # it off the sidecar's tmpfs while the sidecar runs (it deletes the keylog when it
 # stops) and pass its path:
-#   podman cp go-ebpf-proxy-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
+#   podman cp netloupe-tap-sidecar:/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log /tmp/sslkeylog.log
 #   ... -o "tls.keylog_file:/tmp/sslkeylog.log" ...
 # -Y 'http or http2' matches whichever protocol the session negotiated over ALPN:
 # curl picks HTTP/2, which tshark dissects with a separate "http2" dissector that
@@ -178,7 +180,7 @@ sudo deploy/podman/pod-down.sh
 Keeping the artifacts is decided once, when the pod comes up.
 `RETAIN=1` on `pod-up.sh` alone keeps the capture through teardown: the sidecar then
 keeps its capture when it stops, and the pod records the choice as the label
-`go-ebpf-proxy.retain=1`, which a plain `pod-down.sh` follows. A pod brought up again on
+`netloupe-tap.retain=1`, which a plain `pod-down.sh` follows. A pod brought up again on
 the kept volume writes its own capture beside the kept ones. If they already reach
 `--max-bytes`, `pod-up.sh` warns `pod-up: capture not started` and the pod runs without
 capture. The kept capture decrypts with no keylog file,
@@ -193,7 +195,7 @@ removes nothing, because that sidecar wipes its own capture when it stops.
 
 ## Configuration
 
-`go-ebpf-proxy` has no user interface: no TUI, no web UI and no interactive mode. Its
+`netloupe-tap` has no user interface: no TUI, no web UI and no interactive mode. Its
 configuration, read once at startup, sets everything it does. At runtime it reports only
 through its structured JSON log (including a periodic `stats` line) and through the capture
 and keylog files. To change a setting, restart the sidecar with the new configuration.
@@ -202,21 +204,22 @@ Each setting can come from four places. Later ones override earlier ones:
 
 1. its built-in default;
 2. a config file named by `--config` (`.yaml`/`.yml`, `.toml` or `.json`);
-3. an environment variable: `GOEBPF_SIDECAR_` plus the flag name in upper case with `-` turned
-   into `_`, for example `GOEBPF_SIDECAR_MAX_AGE=12h`;
+3. an environment variable: `NETLOUPE_TAP_SIDECAR_` plus the flag name in upper case with `-`
+   turned into `_`, for example `NETLOUPE_TAP_SIDECAR_MAX_AGE=12h`;
 4. its command-line flag.
 
 The config-file key is the flag name without its leading dashes (`max-age: 12h`). An unknown setting in
-the file or in a `GOEBPF_SIDECAR_*` variable stops the sidecar at startup with an error naming
+the file or in a `NETLOUPE_TAP_SIDECAR_*` variable stops the sidecar at startup with an error naming
 it, and so does a key with no value or a value of the wrong type, such as an empty `max-bytes`
-or a duration without a unit (`max-age: 3600`). A typo never falls back silently to a default. `pod-up.sh` passes the flags it needs for
-you:
+or a duration without a unit (`max-age: 3600`). A typo never falls back silently to a default. A variable
+still named with the project's former prefix also stops the sidecar, with an error naming its
+`NETLOUPE_TAP_SIDECAR_` replacement. `pod-up.sh` passes the flags it needs for you:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--cgroup-path` | none (required) | Pod common-parent cgroup v2 path the eBPF programs attach to |
 | `--relay-listen` | `127.0.0.1:15001` | Address the pass-through relay listens on. Leave it at the default: `connect4` always redirects to `127.0.0.1:15001` (compiled in), so any other address leaves redirected connections with no listener |
-| `--pin-dir` | `/sys/fs/bpf/go-ebpf-proxy` | bpffs directory for the pinned maps |
+| `--pin-dir` | `/sys/fs/bpf/netloupe-tap` | bpffs directory for the pinned maps |
 | `--keylog-socket` | `/var/run/sidecar/keylog.sock` | Unix socket the `LD_PRELOAD` interposer connects to |
 | `--keylog-path` | `/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log` | NSS keylog file; its directory must be on tmpfs, or the sidecar refuses to start. It holds one run's keys: the sidecar deletes it when it starts and when it stops |
 | `--capture-iface` | `eth0` | Interface to capture: every frame, both directions, unfiltered (the relay's outbound leg and all other pod traffic) |
@@ -288,7 +291,7 @@ deploy/podman/   rootful Podman dev environment (pod scripts)
 
 ## Project Documentation
 
-[GO-eBPF-Proxy - Public Docs](https://curious-quince-eb8.notion.site/GO-eBPF-Proxy-Public-3e08ea6a94c8801e9083e63fc0773810)
+[netloupe-tap - Public Docs](https://curious-quince-eb8.notion.site/netloupe-tap-Public-3e08ea6a94c8801e9083e63fc0773810)
 
 ## Skills reference
 
