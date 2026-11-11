@@ -5,7 +5,7 @@
 # validated (no MITM).
 set -euo pipefail
 
-POD_NAME="${POD_NAME:-go-ebpf-proxy}"
+POD_NAME="${POD_NAME:-netloupe-tap}"
 URL="${URL:-https://example.com}"
 
 status="$(podman exec "${POD_NAME}-app" curl -s -o /dev/null -w '%{http_code}' "$URL")"

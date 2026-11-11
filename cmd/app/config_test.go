@@ -78,6 +78,23 @@ func TestDefaultConfig_KeylogPathIsTheHarnessTmpfs(t *testing.T) {
 	assert.Equal(t, "/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log", DefaultConfig().KeylogPath)
 }
 
+// C9 (AC 5, door 3): the sidecar pins its maps under /sys/fs/bpf/netloupe-tap
+// unless told otherwise, and --pin-dir advertises that default.
+func TestDefaultConfig_PinDirIsNetloupeTap(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "/sys/fs/bpf/netloupe-tap", DefaultConfig().PinDir)
+
+	fs := flag.NewFlagSet("app", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg, err := loadConfig(fs, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "/sys/fs/bpf/netloupe-tap", cfg.PinDir, "a run given no --pin-dir pins there")
+	pinDir := fs.Lookup("pin-dir")
+	require.NotNil(t, pinDir, "--pin-dir must be registered")
+	assert.Equal(t, "/sys/fs/bpf/netloupe-tap", pinDir.DefValue)
+}
+
 // C65 (AC 46): --retain's help says what it keeps -- this run's capture,
 // which carries its own TLS secrets -- and that the keylog is never kept.
 func TestLoadConfig_RetainHelpSaysOnlyTheCaptureIsKept(t *testing.T) {

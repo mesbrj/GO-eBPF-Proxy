@@ -22,7 +22,7 @@ const (
 	// ProxyPort is the local relay port destinations are rewritten to.
 	ProxyPort uint16 = 15001
 	// DefaultPinDir is the bpffs directory where maps are pinned.
-	DefaultPinDir = "/sys/fs/bpf/go-ebpf-proxy"
+	DefaultPinDir = "/sys/fs/bpf/netloupe-tap"
 
 	bpffsPrefix = "/sys/fs/bpf"
 )

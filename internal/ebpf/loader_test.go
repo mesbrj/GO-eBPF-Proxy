@@ -8,11 +8,12 @@ import (
 )
 
 // UT-01.5: default config carries the compiled-in constants and a bpffs pin dir.
+// C9 (AC 5, door 3): the pin dir is exactly /sys/fs/bpf/netloupe-tap.
 func TestDefaultConfig_Constants(t *testing.T) {
 	c := DefaultConfig()
 	assert.Equal(t, uint32(1337), c.ProxyUID)
 	assert.Equal(t, uint16(15001), c.ProxyPort)
-	assert.Contains(t, c.PinDir, "/sys/fs/bpf")
+	assert.Equal(t, "/sys/fs/bpf/netloupe-tap", c.PinDir)
 }
 
 // UT-01.5: validation rejects unsafe/invalid configuration.
