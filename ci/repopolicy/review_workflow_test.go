@@ -114,7 +114,7 @@ func TestReviewWorkflow_SkipsDraftDependabotAndForkPullRequests(t *testing.T) {
 			out := filepath.Join(t.TempDir(), "github_output")
 			require.NoError(t, os.WriteFile(out, nil, 0o600))
 
-			r := runStep(t, guard.Run, gh.env("PR=7", "GITHUB_REPOSITORY=mesbrj/GO-eBPF-Proxy", "GITHUB_OUTPUT="+out))
+			r := runStep(t, guard.Run, gh.env("PR=7", "GITHUB_REPOSITORY=mesbrj/netloupe-tap", "GITHUB_OUTPUT="+out))
 			require.Equal(t, 0, r.code, r.output())
 			b, err := os.ReadFile(out) // #nosec G304 -- the temp output file this test created
 			require.NoError(t, err)
@@ -296,7 +296,7 @@ func TestReviewWorkflow_ClaudeStepAllowsNoGitHubWriteCommand(t *testing.T) {
 
 	for _, cmd := range forbiddenClaudeCommands {
 		t.Run(cmd, func(t *testing.T) {
-			for _, sample := range []string{cmd, cmd + " repos/mesbrj/GO-eBPF-Proxy/pulls/1/reviews --method POST"} {
+			for _, sample := range []string{cmd, cmd + " repos/mesbrj/netloupe-tap/pulls/1/reviews --method POST"} {
 				for _, rule := range rules {
 					assert.False(t, admits(rule, sample), "rule %q admits %q", rule, sample)
 				}
@@ -443,7 +443,7 @@ func TestReviewWorkflow_NoFindingsArtifactWhenClaudeFails(t *testing.T) {
 // pull request that judge executes: the gather step runs scan_bypasses.py
 // before Claude, and the gate command Claude may run executes review_gate.py.
 var judgeExecutedScripts = map[string]string{ // #nosec G101 -- SHA-256 digests, not credentials
-	"scan_bypasses.py": "dcef32fd8dd27cb88cfa325be50e270cf8774a7ec82d5aed2c87b91b534a6294",
+	"scan_bypasses.py": "77588d1ac6c4dd32e47585787bbf00c7a7ccae57b7c922c086b3c4001aa635b4",
 	"review_gate.py":   "279f0a119907c6a0a178d2be7cb8b3f1a5642f99a83fc4008c92bfbf3faf486d",
 }
 

@@ -11,10 +11,10 @@
 # Anything else prints this usage and exits 2.
 #
 # Needs gh, authenticated as an administrator of the repository, and jq.
-# REPO overrides the repository (default mesbrj/GO-eBPF-Proxy).
+# REPO overrides the repository (default mesbrj/netloupe-tap).
 set -uo pipefail
 
-REPO="${REPO:-mesbrj/GO-eBPF-Proxy}"
+REPO="${REPO:-mesbrj/netloupe-tap}"
 RULESET_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.github/rulesets/main.json"
 readonly REPO RULESET_FILE
 

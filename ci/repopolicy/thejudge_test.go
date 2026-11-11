@@ -83,7 +83,7 @@ func assertModificationNotice(t *testing.T, path, change string) {
 
 // --- post_review.py -------------------------------------------------------
 
-const testRepo = "mesbrj/GO-eBPF-Proxy"
+const testRepo = "mesbrj/netloupe-tap"
 
 // findings returns a findings.json that passes review_gate.py with verdict.
 func findings(t *testing.T, verdict string) []byte {
@@ -121,9 +121,9 @@ func findings(t *testing.T, verdict string) []byte {
 func reviewResponses(author string) map[string]ghResponse {
 	return map[string]ghResponse{
 		"pr view":   {Stdout: `{"number":7,"author":{"login":"` + author + `"}}`},
-		"repo view": {Stdout: `{"owner":{"login":"mesbrj"},"name":"GO-eBPF-Proxy"}`},
+		"repo view": {Stdout: `{"owner":{"login":"mesbrj"},"name":"netloupe-tap"}`},
 		"GET user":  {Stdout: `{"login":"mesbrj","type":"User"}`},
-		"POST repos/" + testRepo + "/pulls/7/reviews": {Stdout: `{"html_url":"https://github.com/mesbrj/GO-eBPF-Proxy/pull/7#pullrequestreview-1"}`},
+		"POST repos/" + testRepo + "/pulls/7/reviews": {Stdout: `{"html_url":"https://github.com/mesbrj/netloupe-tap/pull/7#pullrequestreview-1"}`},
 	}
 }
 

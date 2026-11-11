@@ -64,7 +64,7 @@ func rulesetName(t *testing.T) string {
 func compliantRepo(t *testing.T) map[string]ghResponse {
 	t.Helper()
 	return map[string]ghResponse{
-		"GET " + policyAPI:                                                         {Stdout: `{"name":"GO-eBPF-Proxy","allow_merge_commit":false,"allow_rebase_merge":true,"allow_squash_merge":true,"pull_request_creation_policy":"collaborators_only","visibility":"public"}`},
+		"GET " + policyAPI:                                                         {Stdout: `{"name":"netloupe-tap","allow_merge_commit":false,"allow_rebase_merge":true,"allow_squash_merge":true,"pull_request_creation_policy":"collaborators_only","visibility":"public"}`},
 		"GET " + policyAPI + "/actions/permissions":                                {Stdout: `{"enabled":true,"allowed_actions":"all","sha_pinning_required":true}`},
 		"GET " + policyAPI + "/actions/permissions/workflow":                       {Stdout: `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`},
 		"GET " + policyAPI + "/actions/permissions/fork-pr-contributor-approval":   {Stdout: `{"approval_policy":"all_external_contributors"}`},
