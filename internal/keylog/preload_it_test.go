@@ -149,14 +149,14 @@ func startOpenSSLServer(t *testing.T, certPath, keyPath, tlsFlag string) (addr s
 func preloadEnv(soPath, socketPath string) []string {
 	return []string{
 		"LD_PRELOAD=" + soPath,
-		"GOEBPF_PRELOAD_SOCKET=" + socketPath,
+		"NETLOUPE_TAP_PRELOAD_SOCKET=" + socketPath,
 	}
 }
 
 // runOpenSSLClient runs `openssl s_client` against addr with env appended to
 // the current process environment (used to set LD_PRELOAD/
-// GOEBPF_PRELOAD_SOCKET), feeding empty stdin so the handshake completes and
-// the client then exits on EOF.
+// NETLOUPE_TAP_PRELOAD_SOCKET), feeding empty stdin so the handshake completes
+// and the client then exits on EOF.
 func runOpenSSLClient(t *testing.T, addr, tlsFlag string, env []string) {
 	t.Helper()
 	args := []string{"s_client", "-connect", addr, "-quiet"}
@@ -244,7 +244,7 @@ func TestPreload_ClientWithoutInterposer_EmitsNoLines(t *testing.T) {
 
 	_, _, keylogPath := newTestSocketServer(t)
 
-	// No LD_PRELOAD/GOEBPF_PRELOAD_SOCKET set: real libssl, no interposer.
+	// No LD_PRELOAD/NETLOUPE_TAP_PRELOAD_SOCKET set: real libssl, no interposer.
 	runOpenSSLClient(t, addr, "-tls1_3", nil)
 
 	time.Sleep(300 * time.Millisecond)   // let any (unexpected) line arrive

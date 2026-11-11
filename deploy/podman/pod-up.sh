@@ -199,7 +199,7 @@ podman run -d \
   --volume "$PRELOAD_SO:/usr/local/lib/libkeylogpreload.so:ro,z" \
   --volume "${KEYLOG_VOLUME}:${KEYLOG_DIR}" \
   --env "LD_PRELOAD=/usr/local/lib/libkeylogpreload.so" \
-  --env "GOEBPF_PRELOAD_SOCKET=${KEYLOG_SOCKET}" \
+  --env "NETLOUPE_TAP_PRELOAD_SOCKET=${KEYLOG_SOCKET}" \
   "$APP_IMAGE"
 
 echo "pod-up: pod $POD_NAME is up (cgroup $POD_CGROUP)"

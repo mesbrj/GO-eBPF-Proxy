@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"io"
 	"log/slog"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,13 +189,56 @@ log-level = "warn"
 	}
 }
 
+// C2 (AC 2, door 2): each of the 13 settings, set only through its variable,
+// loads to everySetting's value and leaves every other setting at its
+// default. The variable is NETLOUPE_TAP_SIDECAR_ plus the flag name upper-cased
+// with - turned into _; values holds the names written out, so a name the rule
+// does not produce has no value and fails.
+func TestLoadConfig_EnvSetsEverySetting(t *testing.T) {
+	t.Parallel()
+
+	values := map[string]string{
+		"NETLOUPE_TAP_SIDECAR_CGROUP_PATH":        "/sys/fs/cgroup/machine.slice/pod",
+		"NETLOUPE_TAP_SIDECAR_RELAY_LISTEN":       "127.0.0.1:16001",
+		"NETLOUPE_TAP_SIDECAR_PIN_DIR":            "/sys/fs/bpf/other",
+		"NETLOUPE_TAP_SIDECAR_KEYLOG_SOCKET":      "/run/keylog/keylog.sock",
+		"NETLOUPE_TAP_SIDECAR_KEYLOG_PATH":        "/run/sidecar-keylog/sslkeylog.log",
+		"NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE":      "veth0",
+		"NETLOUPE_TAP_SIDECAR_CAPTURE_PATH":       "/var/log/sidecar/other.pcapng",
+		"NETLOUPE_TAP_SIDECAR_RETAIN":             "true",
+		"NETLOUPE_TAP_SIDECAR_MAX_BYTES":          "2048",
+		"NETLOUPE_TAP_SIDECAR_MAX_AGE":            "12h",
+		"NETLOUPE_TAP_SIDECAR_RETENTION_INTERVAL": "30s",
+		"NETLOUPE_TAP_SIDECAR_STATS_INTERVAL":     "10s",
+		"NETLOUPE_TAP_SIDECAR_LOG_LEVEL":          "warn",
+	}
+	settings := reflect.TypeFor[Config]()
+	require.Len(t, values, settings.NumField(), "one variable per setting")
+	for i := range settings.NumField() {
+		flagName := settings.Field(i).Tag.Get("koanf")
+		name := "NETLOUPE_TAP_SIDECAR_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			value, ok := values[name]
+			require.True(t, ok, "no value written out for %s, the variable of --%s", name, flagName)
+
+			cfg, err := load(t, nil, []string{name + "=" + value})
+
+			require.NoError(t, err)
+			want := DefaultConfig()
+			reflect.ValueOf(&want).Elem().Field(i).Set(reflect.ValueOf(everySetting).Field(i))
+			assert.Equal(t, want, cfg)
+		})
+	}
+}
+
 func TestLoadConfig_EnvOverridesFile(t *testing.T) {
 	t.Parallel()
 	path := writeConfig(t, "config.yaml", "max-age: 12h\ncapture-iface: veth0\nretain: true\n")
 
 	cfg, err := load(t, []string{"--config", path}, []string{
-		"GOEBPF_SIDECAR_MAX_AGE=6h",
-		"GOEBPF_SIDECAR_CAPTURE_IFACE=eth1",
+		"NETLOUPE_TAP_SIDECAR_MAX_AGE=6h",
+		"NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1",
 	})
 
 	require.NoError(t, err)
@@ -206,7 +253,7 @@ func TestLoadConfig_FlagOverridesEnvAndFile(t *testing.T) {
 
 	cfg, err := load(t,
 		[]string{"--config", path, "--max-age=2h", "--capture-iface=eth2"},
-		[]string{"GOEBPF_SIDECAR_MAX_AGE=6h", "GOEBPF_SIDECAR_CAPTURE_IFACE=eth1"},
+		[]string{"NETLOUPE_TAP_SIDECAR_MAX_AGE=6h", "NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1"},
 	)
 
 	require.NoError(t, err)
@@ -222,7 +269,7 @@ func TestLoadConfig_UnsetFlagKeepsFileAndEnvValues(t *testing.T) {
 	// and others (max-age, retain, capture-iface) left at their defaults.
 	cfg, err := load(t,
 		[]string{"--config", path, "--stats-interval=5s"},
-		[]string{"GOEBPF_SIDECAR_CAPTURE_IFACE=eth1"},
+		[]string{"NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1"},
 	)
 
 	require.NoError(t, err)
@@ -247,7 +294,7 @@ func TestLoadConfig_FlagEqualToDefaultStillOverrides(t *testing.T) {
 			"--capture-iface=eth0",
 			"--capture-path=" + d.CapturePath,
 		},
-		[]string{"GOEBPF_SIDECAR_CAPTURE_IFACE=eth1"},
+		[]string{"NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1"},
 	)
 
 	require.NoError(t, err)
@@ -300,7 +347,7 @@ func TestLoadConfig_RejectsUnknownFileKey(t *testing.T) {
 func TestLoadConfig_RejectsUnknownEnvKey(t *testing.T) {
 	t.Parallel()
 
-	_, err := load(t, nil, []string{"GOEBPF_SIDECAR_BOGUS=1"})
+	_, err := load(t, nil, []string{"NETLOUPE_TAP_SIDECAR_BOGUS=1"})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "bogus")
@@ -309,10 +356,78 @@ func TestLoadConfig_RejectsUnknownEnvKey(t *testing.T) {
 func TestLoadConfig_IgnoresInterposerEnvVar(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := load(t, nil, []string{"GOEBPF_PRELOAD_SOCKET=/run/keylog/keylog.sock"})
+	cfg, err := load(t, nil, []string{"NETLOUPE_TAP_PRELOAD_SOCKET=/run/keylog/keylog.sock"})
 
 	require.NoError(t, err)
 	assert.Equal(t, DefaultConfig(), cfg)
+}
+
+// C5 (AC 3, door 2): a variable with the prefix the sidecar read before the
+// rename is refused, never skipped, whether it names a setting, names none, or
+// is set beside its NETLOUPE_TAP_SIDECAR_ replacement. The error names the
+// variable and that replacement.
+func TestLoadConfig_RejectsOldEnvPrefix(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name             string
+		environ          []string
+		old, replacement string
+	}{
+		{name: "a known setting", environ: []string{"GOEBPF_SIDECAR_MAX_BYTES=1"}, old: "GOEBPF_SIDECAR_MAX_BYTES", replacement: "NETLOUPE_TAP_SIDECAR_MAX_BYTES"},
+		{name: "no setting", environ: []string{"GOEBPF_SIDECAR_BOGUS=1"}, old: "GOEBPF_SIDECAR_BOGUS", replacement: "NETLOUPE_TAP_SIDECAR_BOGUS"},
+		{name: "set beside its replacement", environ: []string{"GOEBPF_SIDECAR_RETAIN=1", "NETLOUPE_TAP_SIDECAR_RETAIN=1"}, old: "GOEBPF_SIDECAR_RETAIN", replacement: "NETLOUPE_TAP_SIDECAR_RETAIN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, nil, tc.environ)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.old, "the error must name the variable")
+			assert.Contains(t, err.Error(), tc.replacement, "the error must name its replacement")
+		})
+	}
+}
+
+// C6 (AC 3, at the boundary): the sidecar binary, started with an old-prefix
+// variable set, exits 1 on the config load, before Start runs. Without the
+// refusal it would reach Start, which deletes the leftover keylog at
+// --keylog-path first and then fails on a --pin-dir outside bpffs with
+// "app: start failed", so neither needs any privilege to be seen.
+func TestApp_OldEnvPrefixExitsOneBeforeLoading(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "app")
+	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, "build the sidecar binary: %s", out)
+	keylogPath := filepath.Join(shmDir(t), "sslkeylog.log")
+	require.NoError(t, os.WriteFile(keylogPath, []byte("leftover\n"), 0o600))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, // #nosec G204 -- bin and every path are test-generated, not external input
+		"--cgroup-path=/x",
+		"--keylog-path="+keylogPath,
+		"--pin-dir="+filepath.Join(tmp, "pin"),
+		"--relay-listen=127.0.0.1:0",
+		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
+		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
+	)
+	cmd.Env = []string{"GOEBPF_SIDECAR_RETAIN=1"}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "the sidecar must exit with a status; stderr: %s", stderr.String())
+	assert.Equal(t, 1, exitErr.ExitCode(), "stderr: %s", stderr.String())
+	assert.Contains(t, stderr.String(), "app: config load failed")
+	assert.Contains(t, stderr.String(), "GOEBPF_SIDECAR_RETAIN", "the error must name the variable")
+	assert.Contains(t, stderr.String(), "NETLOUPE_TAP_SIDECAR_RETAIN", "the error must name its replacement")
+	assert.NotContains(t, stderr.String(), "app: start failed", "the refusal must come before Start")
+	assert.FileExists(t, keylogPath, "Start deletes a leftover keylog before it loads eBPF, so it must not have run")
 }
 
 func TestLoadConfig_RejectsUnsupportedExtension(t *testing.T) {
@@ -351,7 +466,7 @@ func TestLoadConfig_RejectsInvalidDuration(t *testing.T) {
 	t.Run("env", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := load(t, nil, []string{"GOEBPF_SIDECAR_STATS_INTERVAL=soon"})
+		_, err := load(t, nil, []string{"NETLOUPE_TAP_SIDECAR_STATS_INTERVAL=soon"})
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "stats-interval")
@@ -367,12 +482,12 @@ func TestLoadConfig_RejectsValuesThatDoNotParseAsTheirType(t *testing.T) {
 		environ []string
 		key     string
 	}{
-		{name: "empty integer env var", environ: []string{"GOEBPF_SIDECAR_MAX_BYTES="}, key: "max-bytes"},
-		{name: "non-numeric integer env var", environ: []string{"GOEBPF_SIDECAR_MAX_BYTES=lots"}, key: "max-bytes"},
+		{name: "empty integer env var", environ: []string{"NETLOUPE_TAP_SIDECAR_MAX_BYTES="}, key: "max-bytes"},
+		{name: "non-numeric integer env var", environ: []string{"NETLOUPE_TAP_SIDECAR_MAX_BYTES=lots"}, key: "max-bytes"},
 		{name: "empty integer in file", file: `max-bytes: ""`, key: "max-bytes"},
 		{name: "fractional integer in file", file: "max-bytes: 1.9", key: "max-bytes"},
-		{name: "non-boolean env var", environ: []string{"GOEBPF_SIDECAR_RETAIN=maybe"}, key: "retain"},
-		{name: "empty boolean env var", environ: []string{"GOEBPF_SIDECAR_RETAIN="}, key: "retain"},
+		{name: "non-boolean env var", environ: []string{"NETLOUPE_TAP_SIDECAR_RETAIN=maybe"}, key: "retain"},
+		{name: "empty boolean env var", environ: []string{"NETLOUPE_TAP_SIDECAR_RETAIN="}, key: "retain"},
 		{name: "duration without a unit in file", file: "max-age: 3600", key: "max-age"},
 		{name: "integer beyond int64 in file", file: "max-bytes: 1e20", key: "max-bytes"},
 		{name: "integer below int64 in file", file: "max-bytes: -1e20", key: "max-bytes"},
@@ -447,7 +562,7 @@ func TestLoadConfig_HigherLayerReplacesInvalidFileValue(t *testing.T) {
 		t.Parallel()
 		path := writeConfig(t, "config.yaml", "max-age: soon\n")
 
-		cfg, err := load(t, []string{"--config", path}, []string{"GOEBPF_SIDECAR_MAX_AGE=1h"})
+		cfg, err := load(t, []string{"--config", path}, []string{"NETLOUPE_TAP_SIDECAR_MAX_AGE=1h"})
 
 		require.NoError(t, err)
 		assert.Equal(t, time.Hour, cfg.MaxAge)
@@ -486,7 +601,7 @@ func TestLoadConfig_LogLevelByName(t *testing.T) {
 		want    slog.Level
 	}{
 		{name: "file", args: []string{"--config", "FILE"}, want: slog.LevelDebug},
-		{name: "env", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL=WARN+2"}, want: slog.LevelWarn + 2},
+		{name: "env", environ: []string{"NETLOUPE_TAP_SIDECAR_LOG_LEVEL=WARN+2"}, want: slog.LevelWarn + 2},
 		{name: "flag", args: []string{"--log-level=error"}, want: slog.LevelError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -521,8 +636,8 @@ func TestLoadConfig_RejectsLogLevelThatIsNotAName(t *testing.T) {
 		file    string // YAML body; empty means no config file
 		environ []string
 	}{
-		{name: "unknown name env var", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL=loud"}},
-		{name: "empty env var", environ: []string{"GOEBPF_SIDECAR_LOG_LEVEL="}},
+		{name: "unknown name env var", environ: []string{"NETLOUPE_TAP_SIDECAR_LOG_LEVEL=loud"}},
+		{name: "empty env var", environ: []string{"NETLOUPE_TAP_SIDECAR_LOG_LEVEL="}},
 		{name: "unknown name in file", file: "log-level: loud"},
 		{name: "number in file", file: "log-level: 4"},
 		{name: "fractional number in file", file: "log-level: 1.9"},

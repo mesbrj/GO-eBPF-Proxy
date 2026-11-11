@@ -5,7 +5,7 @@
  * line, verbatim, over a Unix domain socket to the sidecar. See
  * .specs/features/02-uprobe-keylog/design.md (AD-010).
  *
- * Socket path comes from GOEBPF_PRELOAD_SOCKET (read once, cached). If
+ * Socket path comes from NETLOUPE_TAP_PRELOAD_SOCKET (read once, cached). If
  * unset, the interposer still registers the callback (SSL_CTX_new keeps
  * working normally) but never attempts a socket connection -- a true no-op.
  *
@@ -36,12 +36,12 @@ static int g_sock_fd = -1;
 static int g_socket_path_loaded = 0;
 static const char *g_socket_path = NULL; /* NULL/empty: no-op, never connect */
 
-/* load_socket_path_once reads GOEBPF_PRELOAD_SOCKET exactly once. */
+/* load_socket_path_once reads NETLOUPE_TAP_PRELOAD_SOCKET exactly once. */
 static void load_socket_path_once(void) {
     if (g_socket_path_loaded) {
         return;
     }
-    g_socket_path = getenv("GOEBPF_PRELOAD_SOCKET");
+    g_socket_path = getenv("NETLOUPE_TAP_PRELOAD_SOCKET");
     g_socket_path_loaded = 1;
 }
 
