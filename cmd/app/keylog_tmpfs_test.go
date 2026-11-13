@@ -214,3 +214,33 @@ func TestMain_UnparseableMetricsEndpointExitsOneWithoutThePassword(t *testing.T)
 	assert.Contains(t, stderr, "metrics-endpoint")
 	assert.NotContains(t, stderr, "hunter2")
 }
+
+// C61 (AC 10, AC 45, AC 46, at the process boundary): the built sidecar
+// refuses each way a secret could ride in the metrics settings, exits 1 on
+// the config load, and prints none of them.
+func TestMain_MetricsSecretsAreRefusedAndNeverPrinted(t *testing.T) {
+	for name, tc := range map[string]struct {
+		flag  string
+		env   []string
+		names string
+	}{
+		"credentials in the endpoint": {flag: "--metrics-endpoint=http://user:XSECRET@collector:4318", names: "metrics-endpoint"}, // #nosec G101 -- a made-up password the sidecar must refuse
+		"query in the endpoint":       {flag: "--metrics-endpoint=http://collector:4318/v1/metrics?api_key=XSECRET", names: "metrics-endpoint"},
+		"fragment in the endpoint":    {flag: "--metrics-endpoint=http://collector:4318#XSECRET", names: "metrics-endpoint"},
+		"malformed header variable": {
+			flag:  "--metrics-endpoint=http://collector:4318",
+			env:   []string{"OTEL_EXPORTER_OTLP_HEADERS=Authorization: Bearer XSECRET"},
+			names: "OTEL_EXPORTER_OTLP_HEADERS",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"), tc.env, tc.flag)
+
+			assert.Equal(t, 1, code, "stderr: %s", stderr)
+			assert.Contains(t, stderr, "app: config load failed")
+			assert.Contains(t, stderr, tc.names)
+			assert.NotContains(t, stderr, "XSECRET")
+			assert.NotContains(t, stderr, "app: start failed", "the refusal must come before Start")
+		})
+	}
+}

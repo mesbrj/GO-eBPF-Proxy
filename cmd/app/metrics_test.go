@@ -719,3 +719,21 @@ func TestNewRelay_LogsAreUnchangedWithMetrics(t *testing.T) {
 	require.Len(t, stats, 1)
 	assert.InDelta(t, 1, stats[0].Context["origdst_lookup_miss"], 0)
 }
+
+// C60 (AC 43): the SDK's own diagnostics go through the sidecar's log without
+// the values the SDK attaches, so a header it could not parse is reported
+// and never printed. startMetrics is called directly: loadConfig would have
+// refused this variable first (C59).
+func TestStartMetrics_SDKDiagnosticsNeverCarryTheirInput(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization: Bearer HSECRET")
+	c := newCollector(t, 0, false)
+
+	_, logs := metricsOn(t, c.url, time.Hour, 2000)
+
+	diagnostics := logRecords(t, logs, "metrics sdk error")
+	require.NotEmpty(t, diagnostics, "the SDK's parse error must arrive in the sidecar's log")
+	assert.Equal(t, "WARN", diagnostics[0].Level)
+	assert.Equal(t, "parse headers", diagnostics[0].Context["sdk_message"])
+	assert.NotContains(t, logs.String(), "HSECRET")
+	assert.NotContains(t, logs.String(), "Bearer")
+}
