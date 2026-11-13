@@ -348,3 +348,62 @@ func TestMain_SigtermExitsZeroWithUnreachableCollector(t *testing.T) {
 	assert.Contains(t, stderr.String(), "metrics shutdown failed")
 	assert.NotContains(t, stderr.String(), "app: shutdown failed")
 }
+
+// C62 (PR #30 review F2): a SIGTERM that arrives while Start is still running
+// ends in a clean shutdown and exit 0. The signal is sent as soon as the
+// sidecar has pinned its maps, the first thing Start does after its keylog
+// checks, long before it returns.
+func TestMain_SigtermDuringStartStillExitsZero(t *testing.T) {
+	cfg := itConfig(t)
+	bin := filepath.Join(t.TempDir(), "app")
+	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, "build the sidecar binary: %s", out)
+
+	stderr := &syncBuffer{}
+	cmd := exec.Command(bin, // #nosec G204 -- bin and every path are test-generated, not external input
+		"--cgroup-path="+cfg.CgroupPath,
+		"--pin-dir="+cfg.PinDir,
+		"--relay-listen="+cfg.RelayListen,
+		"--keylog-socket="+cfg.KeylogSocketPath,
+		"--keylog-path="+cfg.KeylogPath,
+		"--capture-iface="+cfg.CaptureIface,
+		"--capture-path="+cfg.CapturePath,
+	)
+	cmd.Env = []string{}
+	cmd.Stderr = stderr
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	pinned := filepath.Join(cfg.PinDir, "origdst_by_tuple")
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Lstat(pinned); err == nil {
+			break
+		}
+		select {
+		case err := <-exited:
+			if strings.Contains(stderr.String(), "operation not permitted") || strings.Contains(stderr.String(), "permission denied") {
+				t.Skipf("privileged capture/attach not permitted: %s", stderr.String())
+			}
+			t.Fatalf("the sidecar exited before it pinned its maps (%v): %s", err, stderr.String())
+		default:
+		}
+		require.True(t, time.Now().Before(deadline), "the sidecar never pinned its maps: %s", stderr.String())
+	}
+	require.NotContains(t, stderr.String(), "capture started", "precondition: Start is still running when the signal is sent")
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+
+	select {
+	case err := <-exited:
+		require.NoError(t, err, "the sidecar must exit 0; stderr: %s", stderr.String())
+	case <-time.After(20 * time.Second):
+		t.Fatalf("the sidecar did not exit: %s", stderr.String())
+	}
+	assert.Equal(t, 0, cmd.ProcessState.ExitCode())
+	assert.Contains(t, stderr.String(), "capture started", "Start ran to its end before the signal was acted on")
+	assert.NotContains(t, stderr.String(), "app: shutdown failed")
+}
