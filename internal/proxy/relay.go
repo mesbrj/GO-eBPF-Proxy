@@ -18,7 +18,6 @@ type Relay struct {
 	dialTimeout time.Duration
 	onDialErr   func(dst netip.AddrPort, err error)
 	onRelayed   func(dst netip.AddrPort)
-	mp          metric.MeterProvider
 	metrics     *relayMetrics
 }
 
@@ -48,7 +47,11 @@ func WithOnRelayed(fn func(dst netip.AddrPort)) RelayOption {
 // mp. Without it, or with a nil mp, the relay records nothing and copies
 // between the two TCP connections directly.
 func WithMeterProvider(mp metric.MeterProvider) RelayOption {
-	return func(r *Relay) { r.mp = mp }
+	return func(r *Relay) {
+		if mp != nil {
+			r.metrics = newRelayMetrics(mp, r.resolver)
+		}
+	}
 }
 
 // NewRelay builds a Relay backed by the given resolver.
@@ -56,9 +59,6 @@ func NewRelay(r *Resolver, opts ...RelayOption) *Relay {
 	rl := &Relay{resolver: r, dialTimeout: 5 * time.Second}
 	for _, o := range opts {
 		o(rl)
-	}
-	if rl.mp != nil {
-		rl.metrics = newRelayMetrics(rl.mp, r)
 	}
 	return rl
 }
