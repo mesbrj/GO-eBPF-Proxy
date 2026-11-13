@@ -54,6 +54,7 @@ func buildSidecarBinary(t *testing.T) string {
 
 // podmanInspect is the subset of `podman inspect <container>` this suite reads.
 type podmanInspect struct {
+	Args   []string `json:"Args"`
 	Config struct {
 		User string   `json:"User"`
 		Env  []string `json:"Env"`
@@ -78,12 +79,13 @@ func inspectContainer(t *testing.T, name string) podmanInspect {
 }
 
 // podUp brings up the pod, tears it down at cleanup, and returns what
-// pod-up.sh printed.
-func podUp(t *testing.T, podName, sidecarBin string) string {
+// pod-up.sh printed. extraEnv is added to the script's environment.
+func podUp(t *testing.T, podName, sidecarBin string, extraEnv ...string) string {
 	t.Helper()
-	// A RETAIN exported by the caller's shell must not leak into a test that
-	// asserts what pod-up.sh does without one (AD-019).
-	env := append(envWithout("RETAIN"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
+	// A RETAIN or METRICS_ENDPOINT exported by the caller's shell must not
+	// leak into a test that asserts what pod-up.sh does without one (AD-019).
+	env := append(envWithout("RETAIN", "METRICS_ENDPOINT"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
+	env = append(env, extraEnv...)
 	up := exec.Command("./pod-up.sh")
 	up.Env = env
 	out, err := up.CombinedOutput()
@@ -348,4 +350,33 @@ func TestPodUp_FullVolumeStartsWithoutCaptureAndStillRelays(t *testing.T) {
 	stats := logLines(logs, "stats")
 	require.NotEmpty(t, stats, "Close must log the final stats line")
 	assert.Contains(t, stats[len(stats)-1], `"capture_state":"not_started_max_bytes"`)
+}
+
+// C42 (AC 37): METRICS_ENDPOINT, when set and not empty, reaches the sidecar
+// as --metrics-endpoint; unset or empty, the flag is not passed at all.
+func TestPodUp_MetricsEndpointReachesTheSidecar(t *testing.T) {
+	requireRootfulPodman(t)
+	bin := buildSidecarBinary(t)
+	metricsArgs := func(t *testing.T, podName string, extraEnv ...string) []string {
+		t.Helper()
+		podUp(t, podName, bin, extraEnv...)
+		var got []string
+		for _, arg := range inspectContainer(t, podName+"-sidecar").Args {
+			if strings.HasPrefix(arg, "--metrics-endpoint") {
+				got = append(got, arg)
+			}
+		}
+		return got
+	}
+
+	t.Run("set", func(t *testing.T) {
+		got := metricsArgs(t, "netloupe-tap-itmetrics", "METRICS_ENDPOINT=http://192.0.2.1:4318")
+		assert.Equal(t, []string{"--metrics-endpoint=http://192.0.2.1:4318"}, got)
+	})
+	t.Run("unset", func(t *testing.T) {
+		assert.Empty(t, metricsArgs(t, "netloupe-tap-itnometrics"))
+	})
+	t.Run("empty", func(t *testing.T) {
+		assert.Empty(t, metricsArgs(t, "netloupe-tap-itemptymetrics", "METRICS_ENDPOINT="))
+	})
 }
