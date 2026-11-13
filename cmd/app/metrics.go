@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -43,6 +44,17 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 	if err != nil {
 		return nil, err
 	}
+	// The SDK reports a failed push to one process-wide handler, and its own
+	// diagnostics to one process-wide logger, which by default prints to
+	// stderr with every value it was given, a header it could not parse
+	// included. Both go in before the exporter is built: it parses the header
+	// variables as it is constructed.
+	exportLog := log.Limited(exportLogInterval, exportLogBurst)
+	otel.SetLogger(logr.New(sdkLogSink{log: exportLog}))
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		exportLog.Warn("metrics export failed", slog.String("error", err.Error()))
+	}))
+
 	ctx := context.Background()
 	exporter, err := otlpmetrichttp.New(ctx,
 		otlpmetrichttp.WithEndpointURL(u.String()),
@@ -62,12 +74,6 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 		return nil, fmt.Errorf("metrics resource: %w", err)
 	}
 
-	// The SDK reports a failed push to one process-wide handler.
-	exportLog := log.Limited(exportLogInterval, exportLogBurst)
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		exportLog.Warn("metrics export failed", slog.String("error", err.Error()))
-	}))
-
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
 		// The export timeout is the interval: the SDK default of 30 s would
@@ -79,10 +85,29 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 		sdkmetric.WithCardinalityLimit(int(cfg.MetricsCardinalityLimit)),
 	)
 	log.Info("metrics export started",
-		slog.String("endpoint", u.String()), // metricsURL refused any credentials
+		slog.String("endpoint", u.String()), // scheme, host and path: metricsURL refused the rest
 		slog.String("interval", cfg.MetricsInterval.String()),
 	)
 	return mp, nil
+}
+
+// sdkLogSink carries the OpenTelemetry SDK's own error diagnostics into the
+// sidecar's log as WARN lines, with the SDK's message and error only. It
+// drops the key/value pairs, where the SDK puts the input it was handling,
+// and every informational message.
+type sdkLogSink struct{ log *logger.Logger }
+
+func (sdkLogSink) Init(logr.RuntimeInfo)            {}
+func (sdkLogSink) Enabled(int) bool                 { return false }
+func (sdkLogSink) Info(int, string, ...any)         {}
+func (s sdkLogSink) WithValues(...any) logr.LogSink { return s }
+func (s sdkLogSink) WithName(string) logr.LogSink   { return s }
+func (s sdkLogSink) Error(err error, msg string, _ ...any) {
+	attrs := []slog.Attr{slog.String("sdk_message", msg)}
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+	s.log.Warn("metrics sdk error", attrs...)
 }
 
 // metricsTemporality exports what only grows as deltas, so each push carries

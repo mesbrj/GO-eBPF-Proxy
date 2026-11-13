@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -138,7 +139,57 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	if err := validateMetrics(cfg); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
+	if cfg.MetricsEndpoint != "" {
+		if err := validateOTLPHeaders(environ); err != nil {
+			return Config{}, fmt.Errorf("config env: %w", err)
+		}
+	}
 	return cfg, nil
+}
+
+// otlpHeaderVars are the variables the OTLP/HTTP metrics exporter reads
+// request headers from, which is how a collector credential is set (AD-033).
+var otlpHeaderVars = []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_HEADERS"}
+
+// validateOTLPHeaders refuses a header variable the exporter could not parse
+// in full. The exporter would skip the bad header, so a credential would be
+// silently dropped, and it would log the header it skipped, value included.
+// The errors name the variable and the header's position, never its text: a
+// header written "Authorization: Bearer x" has the secret in its name.
+func validateOTLPHeaders(environ []string) error {
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		if !slices.Contains(otlpHeaderVars, name) || value == "" {
+			continue
+		}
+		for i, header := range strings.Split(value, ",") {
+			key, val, found := strings.Cut(header, "=")
+			switch _, err := url.PathUnescape(val); {
+			case !found:
+				return fmt.Errorf("%s: header %d has no '=' (write name=value)", name, i+1)
+			case !isHeaderName(strings.TrimSpace(key)):
+				return fmt.Errorf("%s: header %d has an invalid name", name, i+1)
+			case err != nil:
+				return fmt.Errorf("%s: the value of header %d has an invalid percent escape", name, i+1)
+			}
+		}
+	}
+	return nil
+}
+
+// isHeaderName reports whether s is an HTTP header name: a non-empty token
+// (RFC 9110), the rule the exporter applies.
+func isHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		letterOrDigit := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if !letterOrDigit && !strings.ContainsRune("!#$%&'*+-.^_`|~", c) {
+			return false
+		}
+	}
+	return true
 }
 
 // validateMetrics refuses metrics settings the exporter would otherwise
@@ -161,10 +212,11 @@ func validateMetrics(cfg Config) error {
 }
 
 // metricsURL parses a metrics-endpoint value into the URL metrics are pushed
-// to: an http or https URL with a host and no credentials, whose empty path
-// becomes the OTLP default /v1/metrics. Credentials are refused because the
-// exporter drops a URL's user and password without sending them. Its errors
-// never repeat the value, which may carry a password.
+// to: an http or https URL with a host, whose empty path becomes the OTLP
+// default /v1/metrics. Credentials, a query and a fragment are refused: the
+// exporter sends only the scheme, host and path, so a secret in any of them
+// would be dropped, and logged with the endpoint. Its errors never repeat the
+// value.
 func metricsURL(endpoint string) (*url.URL, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -178,6 +230,9 @@ func metricsURL(endpoint string) (*url.URL, error) {
 	}
 	if u.User != nil {
 		return nil, errors.New("metrics-endpoint must not carry credentials; set them in OTEL_EXPORTER_OTLP_HEADERS")
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, errors.New("metrics-endpoint must not carry a query or fragment, which the exporter does not send; set a credential in OTEL_EXPORTER_OTLP_HEADERS")
 	}
 	if u.Path == "" {
 		u.Path = "/v1/metrics"

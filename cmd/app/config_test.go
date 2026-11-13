@@ -797,3 +797,71 @@ func TestLoadConfig_MetricsEndpointMustNotCarryCredentials(t *testing.T) {
 		})
 	}
 }
+
+// C58 (AC 45): a query or a fragment in the endpoint is refused, because the
+// exporter never sends them and the start line would log them. The error
+// never repeats the value.
+func TestLoadConfig_MetricsEndpointMustNotCarryQueryOrFragment(t *testing.T) {
+	t.Parallel()
+
+	for _, endpoint := range []string{
+		"http://collector:4318/v1/metrics?api_key=QSECRET",
+		"http://collector:4318#FSECRET",
+		"http://collector:4318/v1/metrics?",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, []string{"--metrics-endpoint=" + endpoint}, nil)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "metrics-endpoint")
+			assert.NotContains(t, err.Error(), "QSECRET")
+			assert.NotContains(t, err.Error(), "FSECRET")
+		})
+	}
+}
+
+// C59 (AC 46): a header variable the exporter could not parse in full is
+// refused when metrics are on, naming the variable and never its text; with
+// metrics off it is not read at all.
+func TestLoadConfig_MalformedHeadersVariableIsRefusedWithoutItsText(t *testing.T) {
+	t.Parallel()
+
+	malformed := map[string]string{
+		"no equals sign":      "Authorization: Bearer HSECRET",
+		"bad percent escape":  "Authorization=Bearer%20HSECRET%zz",
+		"invalid header name": "Author ization=HSECRET",
+		"second header bad":   "X-Scope=tap,Authorization: Bearer HSECRET",
+		"trailing comma":      "Authorization=Bearer%20HSECRET,",
+	}
+	for _, name := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_HEADERS"} {
+		for kind, value := range malformed {
+			t.Run(name+", "+kind, func(t *testing.T) {
+				t.Parallel()
+				env := []string{name + "=" + value}
+
+				_, err := load(t, []string{"--metrics-endpoint=http://collector:4318"}, env)
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), name)
+				assert.NotContains(t, err.Error(), "HSECRET")
+				assert.NotContains(t, err.Error(), "Bearer")
+
+				_, err = load(t, nil, env)
+				assert.NoError(t, err, "with metrics off the variable is never read")
+			})
+		}
+	}
+
+	t.Run("well-formed values are accepted", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := load(t, []string{"--metrics-endpoint=http://collector:4318"}, []string{
+			"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20dXNlcjpwYXNz,signoz-ingestion-key=k",
+			"OTEL_EXPORTER_OTLP_METRICS_HEADERS=",
+		})
+
+		assert.NoError(t, err)
+	})
+}
