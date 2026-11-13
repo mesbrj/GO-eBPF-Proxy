@@ -602,7 +602,18 @@ func TestApp_CloseSendsOneFinalExport(t *testing.T) {
 	c := newCollector(t, 0, false)
 	mp, logs := metricsOn(t, c.url, time.Hour, 2000)
 	addr, _ := meteredRelay(t, resolveInTurn(t, echoAddr(t)), mp)
-	echoRoundTrip(t, addr, 1000)
+	// Half-close and read to EOF: the relay ends each direction only after it
+	// has counted every byte of it, so the counts are final before Close.
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = conn.Write(make([]byte, 1000))
+	require.NoError(t, err)
+	require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+	echoed, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Len(t, echoed, 1000)
 	require.Empty(t, c.requests(), "precondition: nothing is pushed before Close")
 
 	a := &App{log: logger.New(logs), metrics: mp}
