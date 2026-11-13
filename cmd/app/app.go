@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+
 	"github.com/mesbrj/netloupe-tap/internal/capture"
 	"github.com/mesbrj/netloupe-tap/internal/ebpf"
 	"github.com/mesbrj/netloupe-tap/internal/keylog"
@@ -36,6 +38,10 @@ type Config struct {
 	RetentionTick    time.Duration `koanf:"retention-interval"`
 	StatsInterval    time.Duration `koanf:"stats-interval"`
 	LogLevel         slog.Level    `koanf:"log-level"`
+
+	MetricsEndpoint         string        `koanf:"metrics-endpoint"`
+	MetricsInterval         time.Duration `koanf:"metrics-interval"`
+	MetricsCardinalityLimit int64         `koanf:"metrics-cardinality-limit"`
 }
 
 // DefaultConfig returns a Config populated with the sidecar's compiled-in
@@ -53,18 +59,23 @@ func DefaultConfig() Config {
 		RetentionTick:    5 * time.Minute,
 		StatsInterval:    time.Minute,
 		LogLevel:         slog.LevelInfo,
+
+		MetricsInterval:         5 * time.Second,
+		MetricsCardinalityLimit: 2000,
 	}
 }
 
 // App is one running instance of every wired subsystem: the eBPF loader,
-// the pass-through relay, the keylog socket server, and the live interface
-// capture into its DSB-embedded pcapng writer.
+// the pass-through relay, the keylog socket server, the live interface
+// capture into its DSB-embedded pcapng writer, and, when --metrics-endpoint
+// is set, the metrics push.
 type App struct {
 	cfg       Config
 	log       *logger.Logger
 	loader    *ebpf.Loader
 	ln        net.Listener
 	resolver  *proxy.Resolver
+	metrics   *sdkmetric.MeterProvider
 	keylogSrv *keylog.SocketServer
 	capW      *capture.Writer
 	live      *capture.Live
@@ -114,7 +125,14 @@ func Start(cfg Config, log *logger.Logger) (*App, error) {
 	}
 	a.ln = ln
 	a.resolver = newResolver(loader.OrigDstByTuple(), log)
-	relay := newRelay(a.resolver, log)
+	// Before the relay, which records into it. Starting it opens no
+	// connection: an unreachable collector never fails Start (AD-033).
+	a.metrics, err = startMetrics(cfg, log)
+	if err != nil {
+		_ = a.Close()
+		return nil, fmt.Errorf("app: start metrics: %w", err)
+	}
+	relay := newRelay(a.resolver, log, a.metrics)
 	go func() { _ = relay.Serve(ln) }()
 
 	// The capture writer exists before the keylog socket server, so the
@@ -332,6 +350,9 @@ func (a *App) Close() error {
 	if a.ln != nil {
 		errs = append(errs, a.ln.Close())
 	}
+	// After the listener: no new connection records into a provider that is
+	// shutting down. A failed final push is logged, never returned (AD-033).
+	stopMetrics(a.metrics, a.log)
 	if a.loader != nil {
 		errs = append(errs, a.loader.Close())
 	}
@@ -378,14 +399,21 @@ func newResolver(m proxy.Lookuper, log *logger.Logger) *proxy.Resolver {
 // newRelay builds the relay over resolver, logging each resolved connection
 // once with its original destination: at INFO once the upstream dial
 // succeeds, or at WARN with the error when it fails -- the relay closes the
-// client then, so the log is the only trace of the failure.
-func newRelay(resolver *proxy.Resolver, log *logger.Logger) *proxy.Relay {
-	return proxy.NewRelay(resolver,
+// client then, so the log is the only trace of the failure. With a non-nil
+// mp the relay also records its metrics into it.
+func newRelay(resolver *proxy.Resolver, log *logger.Logger, mp *sdkmetric.MeterProvider) *proxy.Relay {
+	opts := []proxy.RelayOption{
 		proxy.WithOnRelayed(func(dst netip.AddrPort) {
 			log.Info("connection relayed", slog.String("orig_dst", dst.String()))
 		}),
 		proxy.WithOnDialErr(func(dst netip.AddrPort, err error) {
 			log.Warn("upstream dial failed", slog.String("orig_dst", dst.String()), slog.String("error", err.Error()))
 		}),
-	)
+	}
+	// A nil *sdkmetric.MeterProvider in the option's interface would not be a
+	// nil interface, and the relay would wrap every connection for nothing.
+	if mp != nil {
+		opts = append(opts, proxy.WithMeterProvider(mp))
+	}
+	return proxy.NewRelay(resolver, opts...)
 }

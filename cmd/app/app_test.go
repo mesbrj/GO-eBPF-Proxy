@@ -69,7 +69,7 @@ func serveRelay(t *testing.T, m lookupFunc) (string, *syncBuffer) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })
-	go func() { _ = newRelay(newResolver(m, log), log).Serve(ln) }()
+	go func() { _ = newRelay(newResolver(m, log), log, nil).Serve(ln) }()
 	return ln.Addr().String(), logs
 }
 
