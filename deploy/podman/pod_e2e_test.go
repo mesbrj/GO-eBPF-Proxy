@@ -399,13 +399,32 @@ func TestPodUp_HeadersVariableReachesTheSidecarEnvironmentOnly(t *testing.T) {
 	}
 
 	t.Run("set", func(t *testing.T) {
+		// A podman stand-in ahead of the real one on PATH records every
+		// command line pod-up.sh gives podman, then runs it.
+		realPodman, err := exec.LookPath("podman")
+		require.NoError(t, err)
+		shimDir := t.TempDir()
+		argvLog := filepath.Join(shimDir, "argv.log")
+		shim := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + argvLog + "\nexec " + realPodman + " \"$@\"\n"
+		require.NoError(t, os.WriteFile(filepath.Join(shimDir, "podman"), []byte(shim), 0o700)) // #nosec G306 -- a test-only executable stand-in
+
 		podUp(t, "netloupe-tap-itheaders", bin,
-			"METRICS_ENDPOINT=http://192.0.2.1:4318", "OTEL_EXPORTER_OTLP_HEADERS="+header)
+			"METRICS_ENDPOINT=http://192.0.2.1:4318", "OTEL_EXPORTER_OTLP_HEADERS="+header,
+			"PATH="+shimDir+":"+os.Getenv("PATH"))
 		insp := inspectContainer(t, "netloupe-tap-itheaders-sidecar")
 		assert.Equal(t, []string{"OTEL_EXPORTER_OTLP_HEADERS=" + header}, headersEnv(insp))
 		for _, arg := range insp.Args {
 			assert.NotContains(t, arg, "s3cr3t-token")
 		}
+		argv, err := os.ReadFile(argvLog) // #nosec G304 -- test-controlled temp path
+		require.NoError(t, err)
+		assert.Contains(t, string(argv), "OTEL_EXPORTER_OTLP_HEADERS", "precondition: the stand-in saw the variable passed by name")
+		assert.NotContains(t, string(argv), "s3cr3t-token", "the value must never be on a podman command line")
+	})
+	t.Run("empty", func(t *testing.T) {
+		podUp(t, "netloupe-tap-itemptyheaders", bin,
+			"METRICS_ENDPOINT=http://192.0.2.1:4318", "OTEL_EXPORTER_OTLP_HEADERS=")
+		assert.Empty(t, headersEnv(inspectContainer(t, "netloupe-tap-itemptyheaders-sidecar")))
 	})
 	t.Run("unset", func(t *testing.T) {
 		podUp(t, "netloupe-tap-itnoheaders", bin, "METRICS_ENDPOINT=http://192.0.2.1:4318")
