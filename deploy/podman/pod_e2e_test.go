@@ -84,7 +84,7 @@ func podUp(t *testing.T, podName, sidecarBin string, extraEnv ...string) string 
 	t.Helper()
 	// A RETAIN or METRICS_ENDPOINT exported by the caller's shell must not
 	// leak into a test that asserts what pod-up.sh does without one (AD-019).
-	env := append(envWithout("RETAIN", "METRICS_ENDPOINT"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
+	env := append(envWithout("RETAIN", "METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"), "SIDECAR_BIN="+sidecarBin, "POD_NAME="+podName)
 	env = append(env, extraEnv...)
 	up := exec.Command("./pod-up.sh")
 	up.Env = env
@@ -378,5 +378,37 @@ func TestPodUp_MetricsEndpointReachesTheSidecar(t *testing.T) {
 	})
 	t.Run("empty", func(t *testing.T) {
 		assert.Empty(t, metricsArgs(t, "netloupe-tap-itemptymetrics", "METRICS_ENDPOINT="))
+	})
+}
+
+// C57 (AC 44): OTEL_EXPORTER_OTLP_HEADERS, when set, is in the sidecar
+// container's environment with its value and in none of its arguments; unset,
+// it is not in the environment at all.
+func TestPodUp_HeadersVariableReachesTheSidecarEnvironmentOnly(t *testing.T) {
+	requireRootfulPodman(t)
+	bin := buildSidecarBinary(t)
+	const header = "Authorization=Bearer%20s3cr3t-token"
+	headersEnv := func(insp podmanInspect) []string {
+		var got []string
+		for _, kv := range insp.Config.Env {
+			if strings.HasPrefix(kv, "OTEL_EXPORTER_OTLP_HEADERS=") {
+				got = append(got, kv)
+			}
+		}
+		return got
+	}
+
+	t.Run("set", func(t *testing.T) {
+		podUp(t, "netloupe-tap-itheaders", bin,
+			"METRICS_ENDPOINT=http://192.0.2.1:4318", "OTEL_EXPORTER_OTLP_HEADERS="+header)
+		insp := inspectContainer(t, "netloupe-tap-itheaders-sidecar")
+		assert.Equal(t, []string{"OTEL_EXPORTER_OTLP_HEADERS=" + header}, headersEnv(insp))
+		for _, arg := range insp.Args {
+			assert.NotContains(t, arg, "s3cr3t-token")
+		}
+	})
+	t.Run("unset", func(t *testing.T) {
+		podUp(t, "netloupe-tap-itnoheaders", bin, "METRICS_ENDPOINT=http://192.0.2.1:4318")
+		assert.Empty(t, headersEnv(inspectContainer(t, "netloupe-tap-itnoheaders-sidecar")))
 	})
 }

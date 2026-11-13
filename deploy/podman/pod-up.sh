@@ -68,6 +68,14 @@ SIDECAR_METRICS_FLAG=()
 if [[ -n "${METRICS_ENDPOINT:-}" ]]; then
   SIDECAR_METRICS_FLAG=(--metrics-endpoint="$METRICS_ENDPOINT")
 fi
+# A collector that needs a credential gets it through the exporter's standard
+# OTEL_EXPORTER_OTLP_HEADERS, never through the endpoint URL. It is passed to
+# the sidecar by name only, so podman reads the value from this script's
+# environment and it never appears on a command line.
+SIDECAR_METRICS_ENV=()
+if [[ -n "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]]; then
+  SIDECAR_METRICS_ENV=(--env OTEL_EXPORTER_OTLP_HEADERS)
+fi
 
 if [[ ! -x "$SIDECAR_BIN" ]]; then
   echo "pod-up: sidecar binary not found at $SIDECAR_BIN (run: make build LINK_MODE=static)" >&2
@@ -159,6 +167,7 @@ podman run -d \
   --volume "${LOG_VOLUME}:/var/log/sidecar" \
   --volume "${KEYLOG_VOLUME}:${KEYLOG_DIR}" \
   --tmpfs /var/log/sidecar-keylog-tmpfs \
+  "${SIDECAR_METRICS_ENV[@]}" \
   "$SIDECAR_IMAGE" \
   /usr/local/bin/app \
     --cgroup-path="$POD_CGROUP" \
