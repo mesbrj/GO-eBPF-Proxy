@@ -180,6 +180,23 @@ func noAttrs() attribute.Distinct {
 	return set.Equivalent()
 }
 
+// ioBytes takes collections until the io deltas for port add up to wantTx
+// transmitted and wantRx received bytes. The relay counts a write just after
+// it returns, so the peer's answer can reach the client first: the two
+// directions may arrive in different collections.
+func ioBytes(t *testing.T, collect func() map[string]metricdata.Metrics, port int, wantTx, wantRx int64) {
+	t.Helper()
+	var tx, rx int64
+	assert.Eventually(t, func() bool {
+		io := sumPoints(t, collect()[metricIO])
+		tx += io[dstKey(port, direction("transmit"))]
+		rx += io[dstKey(port, direction("receive"))]
+		return tx == wantTx && rx == wantRx
+	}, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, wantTx, tx, "bytes written to the upstream")
+	assert.Equal(t, wantRx, rx, "bytes read from the upstream")
+}
+
 func direction(d string) attribute.KeyValue { return attribute.String("network.io.direction", d) }
 
 // openConnections reads connection.count, which is 0 when it has no point.
@@ -235,13 +252,7 @@ func TestRelay_CountsBytesPerDirection(t *testing.T) {
 	roundTrip(t, c, 1000)
 	require.NoError(t, c.Close())
 
-	var io map[attribute.Distinct]int64
-	require.Eventually(t, func() bool {
-		io = sumPoints(t, collect()[metricIO])
-		return len(io) == 2
-	}, 5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, int64(1000), io[dstKey(port, direction("transmit"))])
-	assert.Equal(t, int64(1000), io[dstKey(port, direction("receive"))])
+	ioBytes(t, collect, port, 1000, 1000)
 }
 
 // C16 (AC 13): the bytes are counted as they pass, not when the connection
@@ -253,9 +264,7 @@ func TestRelay_BytesAreCountedWhileTheConnectionIsOpen(t *testing.T) {
 	c := dial(t, addr)
 	roundTrip(t, c, 1000) // the echo came back, so both directions have passed the relay
 
-	io := sumPoints(t, collect()[metricIO])
-	assert.Equal(t, int64(1000), io[dstKey(port, direction("transmit"))])
-	assert.Equal(t, int64(1000), io[dstKey(port, direction("receive"))])
+	ioBytes(t, collect, port, 1000, 1000)
 	open, _ := openConnections(t, collect())
 	assert.Equal(t, int64(1), open, "precondition: the connection is still open")
 }
@@ -459,7 +468,14 @@ func TestRelay_FailedDialRecordsNothingElse(t *testing.T) {
 // miss connects to the relay and waits for its fail-closed reset.
 func miss(t *testing.T, addr string) {
 	t.Helper()
-	c := dial(t, addr)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		// The relay resets a miss at once; on a fast loopback the RST can land
+		// before connect returns. The miss was counted before the reset.
+		require.ErrorIs(t, err, syscall.ECONNRESET)
+		return
+	}
+	defer func() { _ = c.Close() }()
 	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
 	_, _ = io.Copy(io.Discard, c) // a RST or EOF: either way the relay is done with it
 }
@@ -578,7 +594,5 @@ func TestRelay_DirectionsAreNotInterchangeable(t *testing.T) {
 	_, err = io.ReadFull(c, make([]byte, 300))
 	require.NoError(t, err)
 
-	io := sumPoints(t, collect()[metricIO])
-	assert.Equal(t, int64(1000), io[dstKey(port, direction("transmit"))], "bytes written to the upstream")
-	assert.Equal(t, int64(300), io[dstKey(port, direction("receive"))], "bytes read from the upstream")
+	ioBytes(t, collect, port, 1000, 300)
 }
