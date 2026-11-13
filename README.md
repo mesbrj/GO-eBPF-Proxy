@@ -216,9 +216,10 @@ removes nothing, because that sidecar wipes its own capture when it stops.
 ## Configuration
 
 `netloupe-tap` has no user interface: no TUI, no web UI and no interactive mode. Its
-configuration, read once at startup, sets everything it does. At runtime it reports only
-through its structured JSON log (including a periodic `stats` line) and through the capture
-and keylog files. To change a setting, restart the sidecar with the new configuration.
+configuration, read once at startup, sets everything it does. At runtime it reports
+through its structured JSON log (including a periodic `stats` line), through the capture
+and keylog files, and, when `--metrics-endpoint` names a collector, through the
+[metrics](#metrics) it pushes there. To change a setting, restart the sidecar with the new configuration.
 
 Each setting can come from four places. Later ones override earlier ones:
 
@@ -250,6 +251,9 @@ still named with the project's former prefix also stops the sidecar, with an err
 | `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
 | `--stats-interval` | `1m` | How often the `stats` line is logged, plus once at shutdown; `0` disables it |
 | `--log-level` | `info` | Lowest level logged: `debug`, `info`, `warn` or `error`, optionally offset like `warn+2`; `warn` drops the per-connection `connection relayed` lines |
+| `--metrics-endpoint` | empty | OTLP/HTTP URL of the collector the relay's metrics are pushed to, such as `http://collector:4318`; an empty path means `/v1/metrics`. Empty turns metrics off |
+| `--metrics-interval` | `5s` | How often metrics are pushed; must be above `0` |
+| `--metrics-cardinality-limit` | `2000` | Most series one metric carries per push; the rest are summed into one `otel.metric.overflow=true` series. `0` disables the limit |
 
 ```yaml
 # sidecar.yaml, used with --config=sidecar.yaml
@@ -259,6 +263,37 @@ retain: false
 ```
 
 Configuration is loaded with [koanf](https://github.com/knadh/koanf).
+
+### Metrics
+
+With `--metrics-endpoint` set, the sidecar pushes OpenTelemetry metrics about the relay to that
+collector over OTLP/HTTP (gzip protobuf), every `--metrics-interval`. With `pod-up.sh`, set
+`METRICS_ENDPOINT`, for example `METRICS_ENDPOINT=http://192.0.2.10:4318`. The resource is
+`service.name=netloupe-tap`, and the destination attributes are the connection's original
+destination.
+
+| Metric | Instrument | Unit | Attributes | What it measures |
+| --- | --- | --- | --- | --- |
+| `netloupe.tap.relay.io` | Counter | `By` | `server.address`, `server.port`, `network.io.direction` (`transmit`, `receive`) | Bytes the relay wrote to and read from the original destination, counted as they pass |
+| `netloupe.tap.relay.connection.duration` | Histogram | `s` | `server.address`, `server.port` | Lifetime of a relayed connection, from accept to close |
+| `netloupe.tap.relay.connection.count` | UpDownCounter | `{connection}` | none | Connections the relay is piping right now |
+| `netloupe.tap.relay.dial.duration` | Histogram | `s` | `server.address`, `server.port` | Time a successful dial to the original destination took |
+| `netloupe.tap.relay.dial.errors` | Counter | `{error}` | `server.address`, `server.port`, `error.type` (`timeout`, `refused`, `unreachable`, `_OTHER`) | Failed dials to the original destination |
+| `netloupe.tap.relay.resolve.misses` | Counter | `{miss}` | none | Connections reset because their original destination was not found (fail-closed) |
+
+- Counters and histograms are exported as deltas, one push per interval; the connection count is
+  a running total.
+- The push is best effort. A collector that is down never affects the relay or the exit code: each
+  failed push is a WARN `metrics export failed` line (at most 10 a minute), and the final push at
+  shutdown is abandoned after 5 seconds.
+- The sidecar's own export requests are captured, and count toward `--max-bytes`, when the collector is reached over `--capture-iface`. A collector reached over loopback is not captured.
+- With metrics on, the relay copies bytes through user space to count them, instead of the
+  kernel's `splice(2)` path it uses otherwise.
+- The exporter also reads the standard `OTEL_EXPORTER_OTLP_*` variables, for example
+  `OTEL_EXPORTER_OTLP_HEADERS` for a collector that needs a credential, and
+  `OTEL_RESOURCE_ATTRIBUTES` for extra resource attributes. They never turn metrics on by
+  themselves.
+- No metric carries key material, a timestamp or an error message.
 
 ## Build & test
 
