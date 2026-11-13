@@ -299,8 +299,8 @@ destination.
 A collector that needs authentication gets its credential through the exporter's standard
 `OTEL_EXPORTER_OTLP_HEADERS` variable, set in the sidecar's environment. The sidecar has no flag
 or config-file key for it, so the credential never appears on a command line. A
-`--metrics-endpoint` with `user:password@` in it is refused at startup: the exporter would drop
-those credentials without sending them.
+`--metrics-endpoint` with `user:password@` in it is refused at startup: the exporter sends only
+the URL's scheme, host and path, so it would drop those credentials.
 
 The value is a comma-separated list of `name=value` HTTP headers, sent with every push. Write a
 space inside a value as `%20`:
@@ -316,14 +316,18 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' 'user:pas
 export OTEL_EXPORTER_OTLP_HEADERS='signoz-ingestion-key=<key>'
 ```
 
-With `pod-up.sh`, export the variable before running it. The script passes it to the sidecar
-container by name only:
+With `pod-up.sh`, export both variables and let `sudo` keep them. The token then stays out of
+every command line: the script passes it to the sidecar container by name only.
 
 ```sh
-sudo METRICS_ENDPOINT=https://collector.example:4318 \
-     OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20<token>' \
-     deploy/podman/pod-up.sh
+export METRICS_ENDPOINT=https://collector.example:4318
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20<token>'
+sudo --preserve-env=METRICS_ENDPOINT,OTEL_EXPORTER_OTLP_HEADERS deploy/podman/pod-up.sh
 ```
+
+The sidecar refuses to start, without printing the value, when the endpoint carries a
+`user:password@`, a query (`?api_key=…`) or a fragment, or when a header in the variable is not
+a well-formed `name=value`.
 
 The header value is a secret:
 
