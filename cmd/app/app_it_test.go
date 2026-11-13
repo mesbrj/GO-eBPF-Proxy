@@ -335,12 +335,8 @@ func TestMain_SigtermExitsZeroWithUnreachableCollector(t *testing.T) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	// Start returns after "metrics export started"; give main time to install
-	// its signal handler.
-	require.Eventually(t, func() bool { return strings.Contains(stderr.String(), "capture started") },
-		10*time.Second, 20*time.Millisecond, "stderr: %s", stderr.String())
-	time.Sleep(500 * time.Millisecond)
-
+	// main installs its signal handler before Start, so the signal is safe to
+	// send as soon as the sidecar logs anything from inside Start.
 	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
 	select {
 	case err := <-exited:

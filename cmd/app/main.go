@@ -30,13 +30,15 @@ func main() {
 		fatal(log, "app: --cgroup-path is required", nil)
 	}
 
+	// Before Start, so a signal that arrives while it runs is held in the
+	// channel and still ends in a clean Close instead of killing the process.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
 	a, err := Start(cfg, log)
 	if err != nil {
 		fatal(log, "app: start failed", err)
 	}
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
 	if err := a.Close(); err != nil {
