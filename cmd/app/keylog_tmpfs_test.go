@@ -202,3 +202,15 @@ func TestMain_BadMetricsSettingExitsOneAtConfigLoad(t *testing.T) {
 		})
 	}
 }
+
+// C51 (AC 7, at the process boundary): the built sidecar refuses an endpoint
+// that does not parse, and its log line never carries the password in it.
+func TestMain_UnparseableMetricsEndpointExitsOneWithoutThePassword(t *testing.T) {
+	code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"), nil,
+		"--metrics-endpoint=http://user:hunter2@[::1")
+
+	assert.Equal(t, 1, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "app: config load failed")
+	assert.Contains(t, stderr, "metrics-endpoint")
+	assert.NotContains(t, stderr, "hunter2")
+}
