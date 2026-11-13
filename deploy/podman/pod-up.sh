@@ -59,6 +59,16 @@ if [[ "$RETAIN" == "1" ]]; then
   RETAIN_LABEL=1
 fi
 
+# METRICS_ENDPOINT turns the sidecar's OpenTelemetry metrics push on (AD-033):
+# the OTLP/HTTP URL of a collector, e.g. http://192.0.2.10:4318. Unset or
+# empty, the flag is not passed and the sidecar pushes nothing. The pushes
+# leave on CAPTURE_IFACE, so they are in the capture and count toward
+# --max-bytes.
+SIDECAR_METRICS_FLAG=()
+if [[ -n "${METRICS_ENDPOINT:-}" ]]; then
+  SIDECAR_METRICS_FLAG=(--metrics-endpoint="$METRICS_ENDPOINT")
+fi
+
 if [[ ! -x "$SIDECAR_BIN" ]]; then
   echo "pod-up: sidecar binary not found at $SIDECAR_BIN (run: make build LINK_MODE=static)" >&2
   exit 1
@@ -156,7 +166,8 @@ podman run -d \
     --keylog-socket="$KEYLOG_SOCKET" \
     --keylog-path=/var/log/sidecar-keylog-tmpfs/keylog/sslkeylog.log \
     --capture-path=/var/log/sidecar/dump.pcapng \
-    "${SIDECAR_RETAIN_FLAG[@]}"
+    "${SIDECAR_RETAIN_FLAG[@]}" \
+    "${SIDECAR_METRICS_FLAG[@]}"
 
 # Wait for the sidecar to actually bind the keylog socket before starting the
 # app container -- the volume's host-visible mountpoint lets us poll for the
