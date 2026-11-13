@@ -251,7 +251,7 @@ still named with the project's former prefix also stops the sidecar, with an err
 | `--retention-interval` | `5m` | How often retention is enforced; `0` disables it |
 | `--stats-interval` | `1m` | How often the `stats` line is logged, plus once at shutdown; `0` disables it |
 | `--log-level` | `info` | Lowest level logged: `debug`, `info`, `warn` or `error`, optionally offset like `warn+2`; `warn` drops the per-connection `connection relayed` lines |
-| `--metrics-endpoint` | empty | OTLP/HTTP URL of the collector the relay's metrics are pushed to, such as `http://collector:4318`; an empty path means `/v1/metrics`. Empty turns metrics off |
+| `--metrics-endpoint` | empty | OTLP/HTTP URL of the collector the relay's metrics are pushed to, such as `http://collector:4318`; an empty path means `/v1/metrics`. It must not carry credentials (see [Collector credentials](#collector-credentials)). Empty turns metrics off |
 | `--metrics-interval` | `5s` | How often metrics are pushed; must be above `0` |
 | `--metrics-cardinality-limit` | `2000` | Most series one metric carries per push; the rest are summed into one `otel.metric.overflow=true` series. `0` disables the limit |
 
@@ -289,11 +289,49 @@ destination.
 - The sidecar's own export requests are captured, and count toward `--max-bytes`, when the collector is reached over `--capture-iface`. A collector reached over loopback is not captured.
 - With metrics on, the relay copies bytes through user space to count them, instead of the
   kernel's `splice(2)` path it uses otherwise.
-- The exporter also reads the standard `OTEL_EXPORTER_OTLP_*` variables, for example
-  `OTEL_EXPORTER_OTLP_HEADERS` for a collector that needs a credential, and
-  `OTEL_RESOURCE_ATTRIBUTES` for extra resource attributes. They never turn metrics on by
+- The exporter also reads the standard `OTEL_EXPORTER_OTLP_*` variables and
+  `OTEL_RESOURCE_ATTRIBUTES`, which adds resource attributes. They never turn metrics on by
   themselves.
 - No metric carries key material, a timestamp or an error message.
+
+#### Collector credentials
+
+A collector that needs authentication gets its credential through the exporter's standard
+`OTEL_EXPORTER_OTLP_HEADERS` variable, set in the sidecar's environment. The sidecar has no flag
+or config-file key for it, so the credential never appears on a command line. A
+`--metrics-endpoint` with `user:password@` in it is refused at startup: the exporter would drop
+those credentials without sending them.
+
+The value is a comma-separated list of `name=value` HTTP headers, sent with every push. Write a
+space inside a value as `%20`:
+
+```sh
+# Bearer token (OAuth access token, API key)
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20<token>'
+
+# Basic auth: base64 of user:password
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20$(printf '%s' 'user:password' | base64 -w0)"
+
+# A vendor header, here SigNoz Cloud's ingestion key
+export OTEL_EXPORTER_OTLP_HEADERS='signoz-ingestion-key=<key>'
+```
+
+With `pod-up.sh`, export the variable before running it. The script passes it to the sidecar
+container by name only:
+
+```sh
+sudo METRICS_ENDPOINT=https://collector.example:4318 \
+     OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20<token>' \
+     deploy/podman/pod-up.sh
+```
+
+The header value is a secret:
+
+- Use an `https://` endpoint. Over `http://` the header crosses the network in clear text, and
+  when the collector is reached over `--capture-iface` it is in the capture too.
+- The sidecar never logs it. It is still readable in the container's environment, for example
+  with `podman inspect`, so in Kubernetes take it from a Secret (`secretKeyRef`).
+- It is read once at startup. A token that expires needs the sidecar restarted with the new one.
 
 ## Build & test
 
