@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -61,6 +62,9 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.Duration("max-age", d.MaxAge, "age past which finished captures are deleted, never the live one (0 disables)")
 	fs.Duration("retention-interval", d.RetentionTick, "how often to enforce retention while running (0 disables)")
 	fs.Duration("stats-interval", d.StatsInterval, "how often to log the cumulative counters as a \"stats\" line, plus once at shutdown (0 disables)")
+	fs.String("metrics-endpoint", d.MetricsEndpoint, "OTLP/HTTP URL to push the relay's metrics to, such as http://collector:4318 (an empty path means /v1/metrics); empty disables metrics")
+	fs.Duration("metrics-interval", d.MetricsInterval, "how often metrics are pushed to --metrics-endpoint")
+	fs.Int64("metrics-cardinality-limit", d.MetricsCardinalityLimit, "most series one metric carries per push; the rest are summed into one overflow series (0 disables the limit)")
 	fs.TextVar(new(slog.Level), "log-level", d.LogLevel, "minimum level logged: debug, info, warn or error, optionally offset like warn+2")
 	path := fs.String(configFlag, "", "optional config file (.yaml, .yml, .toml or .json); "+envPrefix+"* env vars and flags override it")
 	if err := fs.Parse(args); err != nil {
@@ -131,7 +135,50 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
+	if err := validateMetrics(cfg); err != nil {
+		return Config{}, fmt.Errorf("config: %w", err)
+	}
 	return cfg, nil
+}
+
+// validateMetrics refuses metrics settings the exporter would otherwise
+// replace with its own defaults or run with silently: an endpoint that is not
+// an http(s) URL with a host, a push interval that is not positive, and a
+// negative cardinality limit.
+func validateMetrics(cfg Config) error {
+	if cfg.MetricsEndpoint != "" {
+		if _, err := metricsURL(cfg.MetricsEndpoint); err != nil {
+			return err
+		}
+	}
+	if cfg.MetricsInterval <= 0 {
+		return fmt.Errorf("metrics-interval %s must be above 0", cfg.MetricsInterval)
+	}
+	if cfg.MetricsCardinalityLimit < 0 {
+		return fmt.Errorf("metrics-cardinality-limit %d must not be negative (0 disables the limit)", cfg.MetricsCardinalityLimit)
+	}
+	return nil
+}
+
+// metricsURL parses a metrics-endpoint value into the URL metrics are pushed
+// to: an http or https URL with a host, whose empty path becomes the OTLP
+// default /v1/metrics. Its errors never repeat the value, which may carry a
+// password.
+func metricsURL(endpoint string) (*url.URL, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, errors.New("metrics-endpoint is not a URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, errors.New("metrics-endpoint must be an http:// or https:// URL")
+	}
+	if u.Hostname() == "" {
+		return nil, errors.New("metrics-endpoint names no host")
+	}
+	if u.Path == "" {
+		u.Path = "/v1/metrics"
+	}
+	return u, nil
 }
 
 var durationType = reflect.TypeFor[time.Duration]()

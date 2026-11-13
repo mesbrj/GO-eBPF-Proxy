@@ -53,7 +53,8 @@ func offTmpfsDir(t *testing.T) (string, string) {
 // --keylog-path=keylogPath and every other path under a fresh temp directory,
 // then returns its exit code and stderr. env is the whole environment, so no
 // NETLOUPE_TAP_SIDECAR_* setting or GOEBPF_SIDECAR_* variable leaks in from the test's.
-func runSidecar(t *testing.T, keylogPath string, env []string) (int, string) {
+// extraArgs are appended to the command line.
+func runSidecar(t *testing.T, keylogPath string, env []string, extraArgs ...string) (int, string) {
 	t.Helper()
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "app")
@@ -64,14 +65,15 @@ func runSidecar(t *testing.T, keylogPath string, env []string) (int, string) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, // #nosec G204 -- bin and every path are test-generated, not external input
+	args := append([]string{
 		"--cgroup-path=/x",
-		"--keylog-path="+keylogPath,
-		"--pin-dir="+filepath.Join(tmp, "pin"),
+		"--keylog-path=" + keylogPath,
+		"--pin-dir=" + filepath.Join(tmp, "pin"),
 		"--relay-listen=127.0.0.1:0",
-		"--keylog-socket="+filepath.Join(tmp, "sock", "keylog.sock"),
-		"--capture-path="+filepath.Join(tmp, "sidecar", "dump.pcapng"),
-	)
+		"--keylog-socket=" + filepath.Join(tmp, "sock", "keylog.sock"),
+		"--capture-path=" + filepath.Join(tmp, "sidecar", "dump.pcapng"),
+	}, extraArgs...)
+	cmd := exec.CommandContext(ctx, bin, args...) // #nosec G204 -- bin and every path are test-generated, not external input
 	cmd.Env = append([]string{}, env...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -179,4 +181,24 @@ func TestMain_KeylogOffTmpfsExitsOneNamingDir(t *testing.T) {
 	}
 	require.Len(t, errorLines, 1, "exactly one JSON ERROR line; stderr: %s", stderr)
 	assert.Contains(t, errorLines[0], dir, "the ERROR line must name the keylog directory")
+}
+
+// C11 (AC 7, AC 8, AC 9, the sidecar process's exit 1): the real binary,
+// given a metrics setting it refuses, exits 1 on the config load, before
+// Start runs and so before anything is loaded.
+func TestMain_BadMetricsSettingExitsOneAtConfigLoad(t *testing.T) {
+	for setting, flag := range map[string]string{
+		"metrics-endpoint":          "--metrics-endpoint=collector:4318",
+		"metrics-interval":          "--metrics-interval=0",
+		"metrics-cardinality-limit": "--metrics-cardinality-limit=-1",
+	} {
+		t.Run(setting, func(t *testing.T) {
+			code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"), nil, flag)
+
+			assert.Equal(t, 1, code, "stderr: %s", stderr)
+			assert.Contains(t, stderr, "app: config load failed")
+			assert.Contains(t, stderr, setting, "the error must name the setting")
+			assert.NotContains(t, stderr, "app: start failed", "the refusal must come before Start")
+		})
+	}
 }

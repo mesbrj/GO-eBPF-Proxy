@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Relay is the pass-through L4 relay: it resolves each accepted connection's
@@ -16,6 +18,8 @@ type Relay struct {
 	dialTimeout time.Duration
 	onDialErr   func(dst netip.AddrPort, err error)
 	onRelayed   func(dst netip.AddrPort)
+	mp          metric.MeterProvider
+	metrics     *relayMetrics
 }
 
 // RelayOption configures a Relay.
@@ -40,11 +44,21 @@ func WithOnRelayed(fn func(dst netip.AddrPort)) RelayOption {
 	return func(r *Relay) { r.onRelayed = fn }
 }
 
+// WithMeterProvider makes the relay record its metrics (see metrics.go) into
+// mp. Without it, or with a nil mp, the relay records nothing and copies
+// between the two TCP connections directly.
+func WithMeterProvider(mp metric.MeterProvider) RelayOption {
+	return func(r *Relay) { r.mp = mp }
+}
+
 // NewRelay builds a Relay backed by the given resolver.
 func NewRelay(r *Resolver, opts ...RelayOption) *Relay {
 	rl := &Relay{resolver: r, dialTimeout: 5 * time.Second}
 	for _, o := range opts {
 		o(rl)
+	}
+	if rl.mp != nil {
+		rl.metrics = newRelayMetrics(rl.mp, r)
 	}
 	return rl
 }
@@ -61,6 +75,7 @@ func (rl *Relay) Serve(ln net.Listener) error {
 }
 
 func (rl *Relay) handle(client net.Conn) {
+	accepted := time.Now()
 	ra, ok := client.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		_ = client.Close()
@@ -81,8 +96,10 @@ func (rl *Relay) handle(client net.Conn) {
 		rl.reset(client) // fail-closed: never forward to a default
 		return
 	}
+	dialStart := time.Now()
 	upstream, err := net.DialTimeout("tcp", dst.String(), rl.dialTimeout)
 	if err != nil {
+		rl.metrics.dialFailed(dst, err)
 		if rl.onDialErr != nil {
 			rl.onDialErr(dst, err)
 		}
@@ -92,7 +109,9 @@ func (rl *Relay) handle(client net.Conn) {
 	if rl.onRelayed != nil {
 		rl.onRelayed(dst)
 	}
-	splice(client, upstream)
+	conn := rl.metrics.connOpened(dst, time.Since(dialStart))
+	splice(client, conn.count(upstream))
+	conn.closed(time.Since(accepted))
 }
 
 // reset closes the connection with a RST rather than a graceful FIN.
@@ -112,7 +131,7 @@ func splice(a, b net.Conn) {
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
 		_, _ = io.Copy(dst, src)
-		if c, ok := dst.(*net.TCPConn); ok {
+		if c, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = c.CloseWrite()
 		}
 	}

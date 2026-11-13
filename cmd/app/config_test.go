@@ -34,7 +34,7 @@ func writeConfig(t *testing.T, name, body string) string {
 	return path
 }
 
-// everySetting has a non-default value for all 13 settings, so a source
+// everySetting has a non-default value for all 16 settings, so a source
 // that drops or mistypes any one of them fails the comparison.
 var everySetting = Config{
 	CgroupPath:       "/sys/fs/cgroup/machine.slice/pod",
@@ -50,6 +50,10 @@ var everySetting = Config{
 	RetentionTick:    30 * time.Second,
 	StatsInterval:    10 * time.Second,
 	LogLevel:         slog.LevelWarn,
+
+	MetricsEndpoint:         "http://collector:4318",
+	MetricsInterval:         15 * time.Second,
+	MetricsCardinalityLimit: 500,
 }
 
 // C54: everySetting is only a useful fixture while each of its fields
@@ -150,6 +154,9 @@ max-age: 12h
 retention-interval: 30s
 stats-interval: 10s
 log-level: warn
+metrics-endpoint: http://collector:4318
+metrics-interval: 15s
+metrics-cardinality-limit: 500
 `
 	for _, tc := range []struct {
 		name string
@@ -172,6 +179,9 @@ max-age = "12h"
 retention-interval = "30s"
 stats-interval = "10s"
 log-level = "warn"
+metrics-endpoint = "http://collector:4318"
+metrics-interval = "15s"
+metrics-cardinality-limit = 500
 `},
 		{name: "config.json", body: `{
   "cgroup-path": "/sys/fs/cgroup/machine.slice/pod",
@@ -186,7 +196,10 @@ log-level = "warn"
   "max-age": "12h",
   "retention-interval": "30s",
   "stats-interval": "10s",
-  "log-level": "warn"
+  "log-level": "warn",
+  "metrics-endpoint": "http://collector:4318",
+  "metrics-interval": "15s",
+  "metrics-cardinality-limit": 500
 }`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,7 +216,7 @@ log-level = "warn"
 	}
 }
 
-// C2 (AC 2, door 2): each of the 13 settings, set only through its variable,
+// C2 (AC 2, door 2): each of the 16 settings, set only through its variable,
 // loads to everySetting's value and leaves every other setting at its
 // default. The variable is NETLOUPE_TAP_SIDECAR_ plus the flag name upper-cased
 // with - turned into _; values holds the names written out, so a name the rule
@@ -225,6 +238,10 @@ func TestLoadConfig_EnvSetsEverySetting(t *testing.T) {
 		"NETLOUPE_TAP_SIDECAR_RETENTION_INTERVAL": "30s",
 		"NETLOUPE_TAP_SIDECAR_STATS_INTERVAL":     "10s",
 		"NETLOUPE_TAP_SIDECAR_LOG_LEVEL":          "warn",
+
+		"NETLOUPE_TAP_SIDECAR_METRICS_ENDPOINT":          "http://collector:4318",
+		"NETLOUPE_TAP_SIDECAR_METRICS_INTERVAL":          "15s",
+		"NETLOUPE_TAP_SIDECAR_METRICS_CARDINALITY_LIMIT": "500",
 	}
 	settings := reflect.TypeFor[Config]()
 	require.Len(t, values, settings.NumField(), "one variable per setting")
@@ -263,16 +280,28 @@ func TestLoadConfig_EnvOverridesFile(t *testing.T) {
 
 func TestLoadConfig_FlagOverridesEnvAndFile(t *testing.T) {
 	t.Parallel()
-	path := writeConfig(t, "config.yaml", "max-age: 12h\ncapture-iface: veth0\n")
+	path := writeConfig(t, "config.yaml", "max-age: 12h\ncapture-iface: veth0\n"+
+		"metrics-endpoint: http://file:4318\nmetrics-interval: 1m\nmetrics-cardinality-limit: 10\n")
 
 	cfg, err := load(t,
-		[]string{"--config", path, "--max-age=2h", "--capture-iface=eth2"},
-		[]string{"NETLOUPE_TAP_SIDECAR_MAX_AGE=6h", "NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1"},
+		[]string{
+			"--config", path, "--max-age=2h", "--capture-iface=eth2",
+			"--metrics-endpoint=http://flag:4318", "--metrics-interval=15s", "--metrics-cardinality-limit=500",
+		},
+		[]string{
+			"NETLOUPE_TAP_SIDECAR_MAX_AGE=6h", "NETLOUPE_TAP_SIDECAR_CAPTURE_IFACE=eth1",
+			"NETLOUPE_TAP_SIDECAR_METRICS_ENDPOINT=http://env:4318",
+			"NETLOUPE_TAP_SIDECAR_METRICS_INTERVAL=30s",
+			"NETLOUPE_TAP_SIDECAR_METRICS_CARDINALITY_LIMIT=100",
+		},
 	)
 
 	require.NoError(t, err)
 	assert.Equal(t, 2*time.Hour, cfg.MaxAge)
 	assert.Equal(t, "eth2", cfg.CaptureIface)
+	assert.Equal(t, "http://flag:4318", cfg.MetricsEndpoint)
+	assert.Equal(t, 15*time.Second, cfg.MetricsInterval)
+	assert.Equal(t, int64(500), cfg.MetricsCardinalityLimit)
 }
 
 func TestLoadConfig_UnsetFlagKeepsFileAndEnvValues(t *testing.T) {
@@ -338,6 +367,9 @@ func TestLoadConfig_AcceptsExistingFlagNamesInBothForms(t *testing.T) {
 				dash + "retention-interval=30s",
 				dash + "stats-interval=10s",
 				dash + "log-level=warn",
+				dash + "metrics-endpoint=http://collector:4318",
+				dash + "metrics-interval=15s",
+				dash + "metrics-cardinality-limit=500",
 			}
 
 			cfg, err := load(t, args, nil)
@@ -648,4 +680,84 @@ func TestLoadConfig_RejectsLogLevelThatIsNotAName(t *testing.T) {
 			assert.ErrorContains(t, err, "log-level")
 		})
 	}
+}
+
+// C7 (AC 6, door 2): metrics are off by default, and when turned on push
+// every 5 s under a 2000-series limit.
+func TestDefaultConfig_MetricsDefaults(t *testing.T) {
+	t.Parallel()
+
+	d := DefaultConfig()
+	assert.Empty(t, d.MetricsEndpoint)
+	assert.Equal(t, 5*time.Second, d.MetricsInterval)
+	assert.Equal(t, int64(2000), d.MetricsCardinalityLimit)
+}
+
+// C8 (AC 7): metrics-endpoint must be an http(s) URL with a host. The error
+// names the setting and never repeats the value, which may carry a password.
+func TestLoadConfig_MetricsEndpointMustBeAnHTTPURL(t *testing.T) {
+	t.Parallel()
+
+	for _, endpoint := range []string{
+		"collector:4318",
+		"ftp://collector:4318",
+		"http://",
+		"/v1/metrics",
+		"http://user:hunter2@",
+	} {
+		t.Run("refuses "+endpoint, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, []string{"--metrics-endpoint=" + endpoint}, nil)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "metrics-endpoint")
+			assert.NotContains(t, err.Error(), "hunter2")
+		})
+	}
+	for _, endpoint := range []string{"http://collector:4318", "https://collector:4318/v1/metrics"} {
+		t.Run("accepts "+endpoint, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := load(t, []string{"--metrics-endpoint=" + endpoint}, nil)
+
+			require.NoError(t, err)
+			assert.Equal(t, endpoint, cfg.MetricsEndpoint)
+		})
+	}
+}
+
+// C9 (AC 8): a push interval that is not above zero is refused, with or
+// without an endpoint.
+func TestLoadConfig_MetricsIntervalMustBePositive(t *testing.T) {
+	t.Parallel()
+
+	for _, interval := range []string{"0", "-1s"} {
+		for name, extra := range map[string][]string{
+			"metrics off": nil,
+			"metrics on":  {"--metrics-endpoint=http://collector:4318"},
+		} {
+			t.Run(interval+", "+name, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := load(t, append([]string{"--metrics-interval=" + interval}, extra...), nil)
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "metrics-interval")
+			})
+		}
+	}
+}
+
+// C10 (AC 9): a negative cardinality limit is refused; 0 means no limit.
+func TestLoadConfig_MetricsCardinalityLimitMustNotBeNegative(t *testing.T) {
+	t.Parallel()
+
+	_, err := load(t, []string{"--metrics-cardinality-limit=-1"}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "metrics-cardinality-limit")
+
+	cfg, err := load(t, []string{"--metrics-cardinality-limit=0"}, nil)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.MetricsCardinalityLimit)
 }

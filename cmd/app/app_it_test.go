@@ -263,3 +263,29 @@ func TestApp_RetainKeepsOnlyThisRunsCapture(t *testing.T) {
 	_, err = os.Lstat(cfg.KeylogPath)
 	assert.ErrorIs(t, err, fs.ErrNotExist, "--retain must never keep the keylog")
 }
+
+// C14 (AC 1, Flow hops 2 and 3): the provider Start builds is the one the
+// relay it starts records into. resolve.misses is observed at every
+// collection, so it is in the final push even with no traffic.
+func TestApp_StartWiresRelayMetricsToTheCollector(t *testing.T) {
+	c := newCollector(t, 0, false)
+	cfg := itConfig(t)
+	cfg.MetricsEndpoint = c.url
+	cfg.MetricsInterval = time.Hour
+
+	a := startIT(t, cfg)
+	require.NoError(t, a.Close())
+
+	assert.NotEmpty(t, c.metrics()["netloupe.tap.relay.resolve.misses"],
+		"the relay Start built must record into the provider Start built")
+}
+
+// C35 (AC 31, AC 36): a collector that is down fails neither Start nor Close.
+func TestApp_StartsAndStopsWithUnreachableCollector(t *testing.T) {
+	cfg := itConfig(t)
+	cfg.MetricsEndpoint = "http://" + closedAddr(t).String()
+
+	a := startIT(t, cfg)
+
+	require.NoError(t, a.Close())
+}
