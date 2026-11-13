@@ -774,3 +774,26 @@ func TestLoadConfig_UnparseableMetricsEndpointNeverEchoesTheValue(t *testing.T) 
 	assert.NotContains(t, err.Error(), "hunter2")
 	assert.NotContains(t, err.Error(), "[::1")
 }
+
+// C54 (AC 10, as amended): an endpoint that carries credentials is refused,
+// because the exporter would drop them without sending them. The error names
+// the variable that carries them instead, and never the password.
+func TestLoadConfig_MetricsEndpointMustNotCarryCredentials(t *testing.T) {
+	t.Parallel()
+
+	for _, endpoint := range []string{
+		"http://user:hunter2@collector:4318",
+		"https://user@collector:4318/v1/metrics",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, []string{"--metrics-endpoint=" + endpoint}, nil)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "metrics-endpoint")
+			assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS")
+			assert.NotContains(t, err.Error(), "hunter2")
+		})
+	}
+}
