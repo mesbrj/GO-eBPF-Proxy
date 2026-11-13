@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +34,7 @@ type exportRequest struct {
 	method, path    string
 	contentType     string
 	contentEncoding string
+	header          http.Header
 	body            *colmetricpb.ExportMetricsServiceRequest
 	decodeErr       error
 }
@@ -75,6 +75,7 @@ func (c *collector) serve(w http.ResponseWriter, r *http.Request) {
 		path:            r.URL.Path,
 		contentType:     r.Header.Get("Content-Type"),
 		contentEncoding: r.Header.Get("Content-Encoding"),
+		header:          r.Header.Clone(),
 	}
 	var body io.Reader = r.Body
 	if req.contentEncoding == "gzip" {
@@ -370,20 +371,50 @@ func TestStartMetrics_EmptyEndpointBuildsNothing(t *testing.T) {
 	assert.Empty(t, logs.String())
 }
 
-// C12 (AC 10): the start line carries the endpoint without its password, and
-// the interval.
-func TestStartMetrics_LogsStartWithRedactedEndpoint(t *testing.T) {
+// C12 (AC 10, as amended): the start line carries the endpoint the sidecar
+// pushes to, and the interval.
+func TestStartMetrics_LogsStartWithEndpointAndInterval(t *testing.T) {
 	c := newCollector(t, 0, false)
-	endpoint := strings.Replace(c.url, "http://", "http://user:hunter2@", 1)
 
-	_, logs := metricsOn(t, endpoint, 5*time.Second, 2000)
+	_, logs := metricsOn(t, c.url, 5*time.Second, 2000)
 
 	records := logRecords(t, logs, "metrics export started")
 	require.Len(t, records, 1)
 	assert.Equal(t, "INFO", records[0].Level)
-	assert.Contains(t, records[0].Context["endpoint"], "user:xxxxx@")
+	assert.Equal(t, c.url+"/v1/metrics", records[0].Context["endpoint"])
 	assert.Equal(t, "5s", records[0].Context["interval"])
-	assert.NotContains(t, logs.String(), "hunter2")
+}
+
+// C55 (AC 43): OTEL_EXPORTER_OTLP_HEADERS is how a credential reaches the
+// collector, in the percent-encoded form the README gives, and it reaches
+// nothing else: not the log.
+func TestMetrics_HeadersVariableReachesTheCollectorNotTheLog(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer%20s3cr3t-token,X-Scope=tap")
+	c := newCollector(t, 0, false)
+	mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+	meteredRelay(t, missEverything, mp)
+
+	require.Eventually(t, func() bool { return len(c.requests()) >= 1 }, 2*time.Second, 10*time.Millisecond)
+	req := c.requests()[0]
+	assert.Equal(t, "Bearer s3cr3t-token", req.header.Get("Authorization"))
+	assert.Equal(t, "tap", req.header.Get("X-Scope"))
+	assert.NotContains(t, logs.String(), "s3cr3t-token")
+}
+
+// C54 (AC 10, as amended): the start refuses an endpoint with credentials on
+// its own too, not only through loadConfig.
+func TestStartMetrics_RefusesEndpointWithCredentials(t *testing.T) {
+	logs := &syncBuffer{}
+	cfg := DefaultConfig()
+	cfg.MetricsEndpoint = "http://user:hunter2@collector:4318"
+
+	mp, err := startMetrics(cfg, logger.New(logs))
+
+	require.Error(t, err)
+	assert.Nil(t, mp)
+	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS")
+	assert.NotContains(t, err.Error(), "hunter2")
+	assert.Empty(t, logs.String())
 }
 
 // C28 (AC 25): past the limit, attribute sets fold into one overflow series

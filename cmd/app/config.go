@@ -62,7 +62,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 	fs.Duration("max-age", d.MaxAge, "age past which finished captures are deleted, never the live one (0 disables)")
 	fs.Duration("retention-interval", d.RetentionTick, "how often to enforce retention while running (0 disables)")
 	fs.Duration("stats-interval", d.StatsInterval, "how often to log the cumulative counters as a \"stats\" line, plus once at shutdown (0 disables)")
-	fs.String("metrics-endpoint", d.MetricsEndpoint, "OTLP/HTTP URL to push the relay's metrics to, such as http://collector:4318 (an empty path means /v1/metrics); empty disables metrics")
+	fs.String("metrics-endpoint", d.MetricsEndpoint, "OTLP/HTTP URL to push the relay's metrics to, such as http://collector:4318 (an empty path means /v1/metrics), without credentials: those go in OTEL_EXPORTER_OTLP_HEADERS; empty disables metrics")
 	fs.Duration("metrics-interval", d.MetricsInterval, "how often metrics are pushed to --metrics-endpoint")
 	fs.Int64("metrics-cardinality-limit", d.MetricsCardinalityLimit, "most series one metric carries per push; the rest are summed into one overflow series (0 disables the limit)")
 	fs.TextVar(new(slog.Level), "log-level", d.LogLevel, "minimum level logged: debug, info, warn or error, optionally offset like warn+2")
@@ -161,9 +161,10 @@ func validateMetrics(cfg Config) error {
 }
 
 // metricsURL parses a metrics-endpoint value into the URL metrics are pushed
-// to: an http or https URL with a host, whose empty path becomes the OTLP
-// default /v1/metrics. Its errors never repeat the value, which may carry a
-// password.
+// to: an http or https URL with a host and no credentials, whose empty path
+// becomes the OTLP default /v1/metrics. Credentials are refused because the
+// exporter drops a URL's user and password without sending them. Its errors
+// never repeat the value, which may carry a password.
 func metricsURL(endpoint string) (*url.URL, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -174,6 +175,9 @@ func metricsURL(endpoint string) (*url.URL, error) {
 	}
 	if u.Hostname() == "" {
 		return nil, errors.New("metrics-endpoint names no host")
+	}
+	if u.User != nil {
+		return nil, errors.New("metrics-endpoint must not carry credentials; set them in OTEL_EXPORTER_OTLP_HEADERS")
 	}
 	if u.Path == "" {
 		u.Path = "/v1/metrics"

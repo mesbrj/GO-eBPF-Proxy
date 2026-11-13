@@ -79,7 +79,7 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 		sdkmetric.WithCardinalityLimit(int(cfg.MetricsCardinalityLimit)),
 	)
 	log.Info("metrics export started",
-		slog.String("endpoint", u.Redacted()),
+		slog.String("endpoint", u.String()), // metricsURL refused any credentials
 		slog.String("interval", cfg.MetricsInterval.String()),
 	)
 	return mp, nil
