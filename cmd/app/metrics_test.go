@@ -628,7 +628,7 @@ func TestApp_CloseAbandonsAHungFinalExportAfterFiveSeconds(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, took, 4900*time.Millisecond)
-	assert.LessOrEqual(t, took, 7*time.Second)
+	assert.Less(t, took, 5900*time.Millisecond, "C53: the bound is 5 s, not 6")
 	failed := logRecords(t, logs, "metrics shutdown failed")
 	require.Len(t, failed, 1)
 	assert.Equal(t, "WARN", failed[0].Level)

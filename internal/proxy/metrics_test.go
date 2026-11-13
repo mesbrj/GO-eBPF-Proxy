@@ -550,3 +550,35 @@ func TestRelay_DialErrorAttributesCarryNoErrorText(t *testing.T) {
 		assert.NotContains(t, value, "connect:", "%s", kv.Key)
 	}
 }
+
+// C49 (AC 11, AC 12): the two directions are told apart. The upstream answers
+// a 1,000-byte request with 300 bytes, so swapped labels cannot pass.
+func TestRelay_DirectionsAreNotInterchangeable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		if _, err := io.ReadFull(c, make([]byte, 1000)); err != nil {
+			return
+		}
+		_, _ = c.Write(make([]byte, 300))
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	addr, collect := meteredRelay(t, foundLookuper{val: origDst(t, "127.0.0.1", uint16(port))}) // #nosec G115 -- TCPAddr.Port is always 0-65535
+
+	c := dial(t, addr)
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = c.Write(make([]byte, 1000))
+	require.NoError(t, err)
+	_, err = io.ReadFull(c, make([]byte, 300))
+	require.NoError(t, err)
+
+	io := sumPoints(t, collect()[metricIO])
+	assert.Equal(t, int64(1000), io[dstKey(port, direction("transmit"))], "bytes written to the upstream")
+	assert.Equal(t, int64(300), io[dstKey(port, direction("receive"))], "bytes read from the upstream")
+}

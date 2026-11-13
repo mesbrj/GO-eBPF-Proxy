@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -288,4 +290,65 @@ func TestApp_StartsAndStopsWithUnreachableCollector(t *testing.T) {
 	a := startIT(t, cfg)
 
 	require.NoError(t, a.Close())
+}
+
+// C52 (AC 36, the sidecar process's exit 0): the built sidecar, started with
+// every subsystem and a collector that is down, exits 0 on SIGTERM, and says
+// in its log that the final push failed rather than that shutdown did.
+func TestMain_SigtermExitsZeroWithUnreachableCollector(t *testing.T) {
+	cfg := itConfig(t)
+	bin := filepath.Join(t.TempDir(), "app")
+	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, "build the sidecar binary: %s", out)
+
+	stderr := &syncBuffer{}
+	cmd := exec.Command(bin, // #nosec G204 -- bin and every path are test-generated, not external input
+		"--cgroup-path="+cfg.CgroupPath,
+		"--pin-dir="+cfg.PinDir,
+		"--relay-listen="+cfg.RelayListen,
+		"--keylog-socket="+cfg.KeylogSocketPath,
+		"--keylog-path="+cfg.KeylogPath,
+		"--capture-iface="+cfg.CaptureIface,
+		"--capture-path="+cfg.CapturePath,
+		"--metrics-endpoint=http://"+closedAddr(t).String(),
+	)
+	cmd.Env = []string{}
+	cmd.Stderr = stderr
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	started := func() bool { return strings.Contains(stderr.String(), "metrics export started") }
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	deadline := time.After(20 * time.Second)
+	for !started() {
+		select {
+		case err := <-exited:
+			if strings.Contains(stderr.String(), "operation not permitted") || strings.Contains(stderr.String(), "permission denied") {
+				t.Skipf("privileged capture/attach not permitted: %s", stderr.String())
+			}
+			t.Fatalf("the sidecar exited before it started (%v): %s", err, stderr.String())
+		case <-deadline:
+			t.Fatalf("the sidecar did not start: %s", stderr.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	// Start returns after "metrics export started"; give main time to install
+	// its signal handler.
+	require.Eventually(t, func() bool { return strings.Contains(stderr.String(), "capture started") },
+		10*time.Second, 20*time.Millisecond, "stderr: %s", stderr.String())
+	time.Sleep(500 * time.Millisecond)
+
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	select {
+	case err := <-exited:
+		require.NoError(t, err, "the sidecar must exit 0; stderr: %s", stderr.String())
+	case <-time.After(20 * time.Second):
+		t.Fatalf("the sidecar did not exit: %s", stderr.String())
+	}
+	assert.Equal(t, 0, cmd.ProcessState.ExitCode())
+	assert.Contains(t, stderr.String(), "metrics shutdown failed")
+	assert.NotContains(t, stderr.String(), "app: shutdown failed")
 }

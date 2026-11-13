@@ -761,3 +761,16 @@ func TestLoadConfig_MetricsCardinalityLimitMustNotBeNegative(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, cfg.MetricsCardinalityLimit)
 }
+
+// C50 (AC 7): an endpoint url.Parse itself rejects is refused too, and the
+// error still never repeats the value: url.Parse errors quote their input.
+func TestLoadConfig_UnparseableMetricsEndpointNeverEchoesTheValue(t *testing.T) {
+	t.Parallel()
+
+	_, err := load(t, []string{"--metrics-endpoint=http://user:hunter2@[::1"}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "metrics-endpoint")
+	assert.NotContains(t, err.Error(), "hunter2")
+	assert.NotContains(t, err.Error(), "[::1")
+}
