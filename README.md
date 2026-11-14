@@ -287,12 +287,12 @@ destination.
   failed push is a WARN `metrics export failed` line (at most 10 a minute), and the final push at
   shutdown is abandoned after 5 seconds. The error text of those lines includes what the
   collector answered, so it is cut to 1 KiB.
-- A problem the OpenTelemetry SDK reports with its own settings, such as an `OTEL_EXPORTER_OTLP_*`
-  variable it cannot parse, is a WARN `metrics sdk error` line. It carries the SDK's message
-  only, for example `parse url`, and never the value the SDK was reading.
+- A problem the OpenTelemetry SDK's own logger reports, such as an `OTEL_EXPORTER_OTLP_*`
+  variable it cannot parse, is a WARN `metrics sdk error` line with the SDK's message only, for
+  example `parse url`.
 - What Go's own libraries would print straight to stderr, such as the HTTP client's report of
   bytes a server sent without being asked, is a WARN `go library log` line of the same JSON log,
-  cut to 1 KiB.
+  cut to 1 KiB, at most 10 a minute.
 - The sidecar's own export requests are captured, and count toward `--max-bytes`, when the collector is reached over `--capture-iface`. A collector reached over loopback is not captured.
 - With metrics on, the relay copies bytes through user space to count them, instead of the
   kernel's `splice(2)` path it uses otherwise.
@@ -345,11 +345,14 @@ The header value is a secret:
   when the collector is reached over `--capture-iface` it is in the capture too.
 - The sidecar keeps it out of its log. In every log line, each occurrence of a header value, or
   of a space-separated part of one such as the token of `Bearer <token>`, is written as
-  `***REDACTED***`, whether it appears as sent or percent-encoded. That holds when the collector
-  sends the value back: in the body of an error, in a redirect, or in bytes it was not asked for.
-- The masking has limits. A value or part shorter than 8 characters is not masked. A token put in
-  the endpoint's path is logged with the endpoint, so keep secrets in headers. The credentials of
-  a proxy (`HTTPS_PROXY`) are not masked if the proxy sends them back.
+  `***REDACTED***`. It is recognised as the collector receives it, percent-encoded, and escaped
+  the way Go quotes a text in an error. That covers a collector that sends the value back: in
+  the body of an error, in a redirect, or in bytes it was not asked for.
+- The masking has limits. A value or part shorter than 8 bytes is not masked. Neither is a
+  fragment of a value, or another spelling of it such as the decoded `user:password` of a Basic
+  header. A token put in the endpoint's path is logged with the endpoint, so keep secrets in
+  headers. The credentials of a proxy (`HTTPS_PROXY`) are not masked if the proxy sends them
+  back.
 - A redirect from the collector is followed. Go drops `Authorization` when the redirect leaves
   the collector's host, but any other header, such as a vendor's key header, goes to the new
   host too. Point the endpoint at the collector's final URL.
