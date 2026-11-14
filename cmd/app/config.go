@@ -159,7 +159,8 @@ var otlpHeaderVars = []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_
 func validateOTLPHeaders(environ []string) error {
 	for _, kv := range environ {
 		name, value, _ := strings.Cut(kv, "=")
-		if !slices.Contains(otlpHeaderVars, name) || value == "" {
+		// The exporter trims the variable and reads a blank one as unset.
+		if !slices.Contains(otlpHeaderVars, name) || strings.TrimSpace(value) == "" {
 			continue
 		}
 		for i, header := range strings.Split(value, ",") {

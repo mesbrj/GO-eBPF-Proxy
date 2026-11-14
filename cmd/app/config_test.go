@@ -865,3 +865,16 @@ func TestLoadConfig_MalformedHeadersVariableIsRefusedWithoutItsText(t *testing.T
 		assert.NoError(t, err)
 	})
 }
+
+// C64 (PR #31 review F1): a header variable that is only whitespace is unset
+// to the exporter, so the sidecar accepts it too.
+func TestLoadConfig_BlankHeadersVariableIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"", " ", "\t "} {
+		_, err := load(t, []string{"--metrics-endpoint=http://collector:4318"},
+			[]string{"OTEL_EXPORTER_OTLP_HEADERS=" + value})
+
+		assert.NoError(t, err, "value %q", value)
+	}
+}
