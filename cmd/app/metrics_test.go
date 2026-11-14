@@ -932,6 +932,41 @@ func TestMetrics_FailedPushErrorTextIsCut(t *testing.T) {
 	}
 }
 
+// C70 (AC 50), through a real failed push: a collector's answer that puts the
+// header value across byte 1,024 of the error text leaves no head of it in
+// the line. The line is written by the rate-limited logger, which must mask
+// before the cut like the logger it derives from.
+func TestMetrics_HeaderAcrossTheCutLeavesNoHead(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", echoHeaderVar)
+	// The error text opens with about 110 bytes before the body (the two
+	// prefixes, the URL and the status), so 901 bytes of padding start the
+	// 27-byte header value some 13 bytes before the cut.
+	c := newAnsweringCollector(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, strings.Repeat("x", 901)+r.Header.Get("Authorization")+strings.Repeat("y", 200), http.StatusBadRequest)
+	})
+	mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+	meteredRelay(t, missEverything, mp)
+
+	var failed []logRecord
+	require.Eventually(t, func() bool {
+		failed = logRecords(t, logs, "metrics export failed")
+		return len(failed) > 0
+	}, 5*time.Second, 10*time.Millisecond)
+
+	text, ok := failed[0].Context["error"].(string)
+	require.True(t, ok)
+	kept, _, found := strings.Cut(text, "… (")
+	require.True(t, found, "precondition: the text was cut")
+	body := strings.Index(kept, strings.Repeat("x", 901))
+	require.Positive(t, body, "precondition: the padding is in the kept text")
+	require.Greater(t, body+901, 1024-len(echoBearer), "precondition: the value starts close enough to the cut to cross it")
+	require.Less(t, body+901, 1024, "precondition: the value starts before the cut")
+	masked := kept[:body+901] + "***REDACTED***" + strings.Repeat("y", 200)
+	assert.Equal(t, masked[:1024], kept, "the padding, then the mask in place of the value, cut at 1,024 bytes")
+	assert.NotContains(t, logs.String(), "Bearer t", "no head of the value")
+	assert.NotContains(t, logs.String(), "tok-0", "no head of the token")
+}
+
 // C70 (AC 50): the text is masked before it is cut, so a masked value that
 // straddles the cut leaves no head behind, and the cut never splits a
 // character.
