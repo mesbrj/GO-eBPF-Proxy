@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"errors"
 	"io"
+	stdlog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -42,12 +48,13 @@ type exportRequest struct {
 }
 
 // collector is a local OTLP/HTTP metrics collector: it records each request,
-// decodes its body, and answers with status (200 unless set). With hang set
-// it never answers until the test ends.
+// decodes its body, and answers with status (200 unless set), or as answer
+// says when it is set. With hang set it never answers until the test ends.
 type collector struct {
 	url    string
 	status int
 	hang   chan struct{}
+	answer http.HandlerFunc
 
 	mu   sync.Mutex
 	reqs []exportRequest
@@ -59,6 +66,19 @@ func newCollector(t *testing.T, status int, hang bool) *collector {
 	if hang {
 		c.hang = make(chan struct{})
 	}
+	return c.start(t)
+}
+
+// newAnsweringCollector is a collector that records each request and then
+// lets answer write the response.
+func newAnsweringCollector(t *testing.T, answer http.HandlerFunc) *collector {
+	t.Helper()
+	return (&collector{answer: answer}).start(t)
+}
+
+// start serves c on a loopback port until the test ends.
+func (c *collector) start(t *testing.T) *collector {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(c.serve))
 	t.Cleanup(func() {
 		if c.hang != nil {
@@ -107,6 +127,10 @@ func (c *collector) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if c.answer != nil {
+		c.answer(w, r)
+		return
+	}
 	if c.status != 0 {
 		w.WriteHeader(c.status)
 	}
@@ -144,7 +168,7 @@ func metricsOn(t *testing.T, endpoint string, interval time.Duration, limit int6
 	cfg.MetricsEndpoint = endpoint
 	cfg.MetricsInterval = interval
 	cfg.MetricsCardinalityLimit = limit
-	mp, err := startMetrics(cfg, logger.New(logs))
+	mp, err := startMetrics(cfg, sidecarLogger(logs))
 	require.NoError(t, err)
 	require.NotNil(t, mp)
 	t.Cleanup(func() {
@@ -153,6 +177,12 @@ func metricsOn(t *testing.T, endpoint string, interval time.Duration, limit int6
 		_ = mp.Shutdown(ctx)
 	})
 	return mp, logs
+}
+
+// sidecarLogger returns a logger writing into logs, built as main builds the
+// sidecar's from the process environment, header masking included.
+func sidecarLogger(logs *syncBuffer) *logger.Logger {
+	return newLogger(logs, slog.LevelInfo, os.Environ())
 }
 
 // closedAddr returns a loopback address nothing listens on.
@@ -741,7 +771,7 @@ func TestStartMetrics_SDKDiagnosticsNeverCarryTheirInput(t *testing.T) {
 	assert.NotContains(t, logs.String(), "Bearer")
 }
 
-// C63 (AC 46): the SDK's diagnostics reach the log as the SDK's message
+// C63 (AC 47): the SDK's diagnostics reach the log as the SDK's message
 // alone. An endpoint variable that does not parse is quoted whole in the
 // SDK's error, password included, so the error text must not be logged
 // either. The flag's endpoint still wins: the push goes to the collector.
@@ -764,7 +794,7 @@ func TestStartMetrics_SDKDiagnosticsNeverCarryTheirErrorText(t *testing.T) {
 	}
 }
 
-// C63 (AC 46), at the sink itself: whatever the SDK hands over, only its
+// C63 (AC 47), at the sink itself: whatever the SDK hands over, only its
 // message is logged; informational messages are not logged at all.
 func TestSDKLogSink_LogsTheMessageAlone(t *testing.T) {
 	logs := &syncBuffer{}
@@ -784,7 +814,7 @@ func TestSDKLogSink_LogsTheMessageAlone(t *testing.T) {
 	assert.NotContains(t, logs.String(), "SECRET")
 }
 
-// C65 (AC 46): a resource variable that does not parse fails the start
+// C65 (AC 48): a resource variable that does not parse fails the start
 // without repeating the entry.
 func TestStartMetrics_MalformedResourceAttributesAreNotEchoed(t *testing.T) {
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "RSECRET-with-no-equals")
@@ -799,4 +829,220 @@ func TestStartMetrics_MalformedResourceAttributesAreNotEchoed(t *testing.T) {
 	assert.Contains(t, err.Error(), "OTEL_RESOURCE_ATTRIBUTES")
 	assert.NotContains(t, err.Error(), "RSECRET")
 	assert.NotContains(t, logs.String(), "RSECRET")
+}
+
+// The collector credential the masking tests configure: an Authorization
+// header and a vendor key header, as OTEL_EXPORTER_OTLP_HEADERS spells them.
+const (
+	echoBearer    = "Bearer tok-0123456789abcdef"
+	echoToken     = "tok-0123456789abcdef"
+	echoAPIKey    = "key-fedcba9876543210"
+	echoHeaderVar = "Authorization=Bearer%20tok-0123456789abcdef,X-Api-Key=key-fedcba9876543210"
+)
+
+// requireNoHeaderValue fails when text holds a configured header value in
+// any of the forms it can come back in.
+func requireNoHeaderValue(t *testing.T, text string) {
+	t.Helper()
+	for _, form := range []string{
+		echoBearer, echoToken, echoAPIKey,
+		url.QueryEscape(echoBearer), url.PathEscape(echoBearer),
+	} {
+		require.NotContains(t, text, form)
+	}
+}
+
+// C69 (AC 43): a collector that sends the header value back, in the body of
+// its answer or in the URL of a redirect, has it logged with the failed push.
+// Both failure lines carry the answer with the value masked, however it is
+// spelled, and nothing else in the log holds it.
+func TestMetrics_HeaderSentBackByTheCollectorIsMasked(t *testing.T) {
+	moved := "http://" + closedAddr(t).String() + "/moved"
+	for name, answer := range map[string]http.HandlerFunc{
+		"the header in a 401 body": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key"), http.StatusUnauthorized)
+		},
+		"the token alone in a 403 body": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "token "+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")+" is not allowed here", http.StatusForbidden)
+		},
+		"the header percent-encoded in a 400 body": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "bad header "+url.PathEscape(r.Header.Get("Authorization")), http.StatusBadRequest)
+		},
+		"the header percent-encoded in a redirect": func(w http.ResponseWriter, r *http.Request) {
+			target := moved + "?auth=" + url.QueryEscape(r.Header.Get("Authorization")) + "&key=" + r.Header.Get("X-Api-Key")
+			http.Redirect(w, r, target, http.StatusTemporaryRedirect) // #nosec G710 -- a test collector that redirects with the header on purpose
+		},
+		"the header as written in a redirect": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", moved+"?auth="+r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", echoHeaderVar)
+			c := newAnsweringCollector(t, answer)
+			mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+			meteredRelay(t, missEverything, mp)
+
+			var failed []logRecord
+			require.Eventually(t, func() bool {
+				failed = logRecords(t, logs, "metrics export failed")
+				return len(failed) > 0
+			}, 5*time.Second, 10*time.Millisecond)
+			require.NotEmpty(t, c.requests())
+			require.Equal(t, echoBearer, c.requests()[0].header.Get("Authorization"), "precondition: the collector was sent the header")
+			stopMetrics(mp, sidecarLogger(logs))
+			stopped := logRecords(t, logs, "metrics shutdown failed")
+			require.Len(t, stopped, 1)
+
+			for _, rec := range append(logRecords(t, logs, "metrics export failed"), stopped...) {
+				assert.Contains(t, rec.Context["error"], "***REDACTED***", "the line shows where the collector's answer held the value")
+			}
+			requireNoHeaderValue(t, logs.String())
+		})
+	}
+}
+
+// C70 (AC 50): the collector does not size the log line. Whatever it answers,
+// the error text of the failed push is cut to 1,024 bytes, followed by the
+// number of bytes left out.
+func TestMetrics_FailedPushErrorTextIsCut(t *testing.T) {
+	c := newAnsweringCollector(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, strings.Repeat("x", 100_000), http.StatusBadRequest)
+	})
+	mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+	meteredRelay(t, missEverything, mp)
+
+	var failed []logRecord
+	require.Eventually(t, func() bool {
+		failed = logRecords(t, logs, "metrics export failed")
+		return len(failed) > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	stopMetrics(mp, sidecarLogger(logs))
+	stopped := logRecords(t, logs, "metrics shutdown failed")
+	require.Len(t, stopped, 1)
+
+	for _, rec := range append(failed[:1], stopped...) {
+		text, ok := rec.Context["error"].(string)
+		require.True(t, ok)
+		kept, left, found := strings.Cut(text, "… (")
+		require.True(t, found, "the text must say it was cut: %q", text[len(text)-40:])
+		assert.Len(t, kept, 1024)
+		assert.Regexp(t, `^\d+ more bytes\)$`, left)
+		assert.Contains(t, kept, "400 Bad Request", "the start of the error survives the cut")
+	}
+}
+
+// C70 (AC 50): the text is masked before it is cut, so a masked value that
+// straddles the cut leaves no head behind, and the cut never splits a
+// character.
+func TestPeerText_MasksThenCutsAtACharacterBoundary(t *testing.T) {
+	secret := strings.Repeat("S3cr3t!", 10)
+	log := logger.New(io.Discard, logger.WithMasked(secret))
+
+	t.Run("short text is logged whole", func(t *testing.T) {
+		assert.Equal(t, "refused", peerText(log, "refused"))
+		assert.Equal(t, strings.Repeat("x", 1024), peerText(log, strings.Repeat("x", 1024)))
+	})
+	t.Run("a masked value across the cut", func(t *testing.T) {
+		// The value starts 24 bytes before the cut and ends 46 bytes after it.
+		text := peerText(log, strings.Repeat("x", 1000)+secret+strings.Repeat("y", 100))
+
+		kept, left, found := strings.Cut(text, "… (")
+		require.True(t, found)
+		assert.Equal(t, strings.Repeat("x", 1000)+"***REDACTED***"+strings.Repeat("y", 10), kept)
+		assert.Equal(t, "90 more bytes)", left)
+		assert.NotContains(t, text, "S3cr3t")
+	})
+	t.Run("a character across the cut", func(t *testing.T) {
+		// "a" then two-byte characters: byte 1024 is the second half of one.
+		text := peerText(log, "a"+strings.Repeat("é", 600))
+
+		kept, left, found := strings.Cut(text, "… (")
+		require.True(t, found)
+		assert.Equal(t, "a"+strings.Repeat("é", 511), kept)
+		assert.Equal(t, "178 more bytes)", left)
+	})
+}
+
+// unsolicitedCollector is a collector that answers a push with a complete
+// 200 and then, on the same connection, with a second answer nobody asked
+// for that repeats the Authorization header. Go's HTTP client reports such
+// bytes through the standard logger, quoting them. It returns its URL.
+func unsolicitedCollector(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, req.Body)
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"+
+					"HTTP/1.1 400 Bad Request\r\nX-Echo: "+req.Header.Get("Authorization")+"\r\n\r\n")
+			}(conn)
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// restoreStdLog puts Go's standard logger back as it was when the test ends.
+func restoreStdLog(t *testing.T) {
+	t.Helper()
+	out, flags := stdlog.Writer(), stdlog.Flags()
+	t.Cleanup(func() {
+		stdlog.SetOutput(out)
+		stdlog.SetFlags(flags)
+	})
+}
+
+// C75 (AC 52): what Go's standard logger is given comes out as a WARN record
+// of the sidecar's log, masked and cut like the error of a failed push.
+func TestCaptureStdLog_WritesThroughTheSidecarLogger(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", echoHeaderVar)
+	restoreStdLog(t)
+	logs := &syncBuffer{}
+	captureStdLog(sidecarLogger(logs))
+
+	stdlog.Printf("Unsolicited response received on idle HTTP channel starting with %q; err=%v", "X-Echo: "+echoBearer, nil)
+	stdlog.Print(strings.Repeat("x", 5000))
+
+	records := logRecords(t, logs, "go library log")
+	require.Len(t, records, 2)
+	assert.Equal(t, "WARN", records[0].Level)
+	assert.Equal(t, `Unsolicited response received on idle HTTP channel starting with "X-Echo: ***REDACTED***"; err=<nil>`, records[0].Context["text"])
+	kept, left, found := strings.Cut(records[1].Context["text"].(string), "… (")
+	require.True(t, found, "a long message must say it was cut")
+	assert.Equal(t, strings.Repeat("x", 1024), kept)
+	assert.Equal(t, "3976 more bytes)", left)
+	requireNoHeaderValue(t, logs.String())
+}
+
+// C75 (AC 52): a collector that sends the header back in bytes nobody asked
+// for has them reported by Go's HTTP client. With the standard logger
+// captured, the report is a record of the sidecar's log with the header
+// masked.
+func TestMetrics_UnsolicitedAnswerWithTheHeaderIsMasked(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", echoHeaderVar)
+	restoreStdLog(t)
+	stdLogs := &syncBuffer{}
+	captureStdLog(sidecarLogger(stdLogs))
+	mp, logs := metricsOn(t, unsolicitedCollector(t), 50*time.Millisecond, 2000)
+	meteredRelay(t, missEverything, mp)
+
+	require.Eventually(t, func() bool { return strings.Contains(stdLogs.String(), "go library log") },
+		5*time.Second, 10*time.Millisecond, "Go's HTTP client must report the unsolicited bytes")
+	report := logRecords(t, stdLogs, "go library log")[0]
+	assert.Contains(t, report.Context["text"], "Unsolicited response received")
+	assert.Contains(t, report.Context["text"], "X-Echo: ***REDACTED***")
+	requireNoHeaderValue(t, stdLogs.String())
+	requireNoHeaderValue(t, logs.String())
 }

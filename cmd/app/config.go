@@ -140,7 +140,7 @@ func loadConfig(fs *flag.FlagSet, args, environ []string) (Config, error) {
 		return Config{}, fmt.Errorf("config: %w", err)
 	}
 	if cfg.MetricsEndpoint != "" {
-		if err := validateOTLPHeaders(environ); err != nil {
+		if err := errors.Join(validateOTLPHeaders(environ), refuseHeaderDump(environ)); err != nil {
 			return Config{}, fmt.Errorf("config env: %w", err)
 		}
 	}
@@ -164,16 +164,95 @@ func validateOTLPHeaders(environ []string) error {
 			continue
 		}
 		for i, header := range strings.Split(value, ",") {
-			key, val, found := strings.Cut(header, "=")
-			switch _, err := url.PathUnescape(val); {
-			case !found:
-				return fmt.Errorf("%s: header %d has no '=' (write name=value)", name, i+1)
-			case !isHeaderName(strings.TrimSpace(key)):
-				return fmt.Errorf("%s: header %d has an invalid name", name, i+1)
-			case err != nil:
-				return fmt.Errorf("%s: the value of header %d has an invalid percent escape", name, i+1)
+			if _, problem := parseOTLPHeader(header); problem != "" {
+				return fmt.Errorf("%s: header %d %s", name, i+1, problem)
 			}
 		}
+	}
+	return nil
+}
+
+// parseOTLPHeader parses one name=value element of a header variable as the
+// exporter does and returns the value it would send. problem is empty for a
+// header the exporter sends; otherwise it says, without quoting the element,
+// why the exporter would skip it.
+func parseOTLPHeader(header string) (value, problem string) {
+	name, raw, found := strings.Cut(header, "=")
+	value, err := url.PathUnescape(raw)
+	switch {
+	case !found:
+		return "", "has no '=' (write name=value)"
+	case !isHeaderName(strings.TrimSpace(name)):
+		return "", "has an invalid name"
+	case err != nil:
+		return "", "has a value with an invalid percent escape"
+	}
+	return strings.TrimSpace(value), ""
+}
+
+// minMaskedLen is the shortest header value, or part of one, that the log
+// masks. A shorter string is left alone: masking it would blank ordinary
+// words and numbers out of every line.
+const minMaskedLen = 8
+
+// otlpHeaderSecrets returns what the log masks of the request headers the
+// exporter is given through otlpHeaderVars: each header's value and each
+// whitespace-separated part of it, so the token of "Bearer <token>" is
+// covered on its own, both as sent and percent-encoded, as a redirect would
+// carry it in a URL. Strings shorter than minMaskedLen are left out. So is a
+// header the exporter would skip: it is never sent, so no one can send it
+// back.
+func otlpHeaderSecrets(environ []string) []string {
+	var secrets []string
+	add := func(part string) {
+		if len(part) < minMaskedLen {
+			return
+		}
+		for _, form := range []string{part, url.QueryEscape(part), url.PathEscape(part)} {
+			if !slices.Contains(secrets, form) {
+				secrets = append(secrets, form)
+			}
+		}
+	}
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		if !slices.Contains(otlpHeaderVars, name) {
+			continue
+		}
+		for _, header := range strings.Split(value, ",") {
+			sent, problem := parseOTLPHeader(header)
+			if problem != "" {
+				continue
+			}
+			add(sent)
+			for _, part := range strings.Fields(sent) {
+				add(part)
+			}
+		}
+	}
+	return secrets
+}
+
+// refuseHeaderDump refuses to run with Go's HTTP/2 debugging on while a
+// header variable is set. GODEBUG=http2debug=1 or =2 makes net/http print
+// every request header with its value on each push, straight to stderr, past
+// the sidecar's logger and its masking. The error names the two variables,
+// never a value.
+func refuseHeaderDump(environ []string) error {
+	var debug bool
+	var headerVar string
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		switch {
+		case name == "GODEBUG":
+			// The test net/http applies to GODEBUG, verbatim.
+			debug = debug || strings.Contains(value, "http2debug=1") || strings.Contains(value, "http2debug=2")
+		case slices.Contains(otlpHeaderVars, name) && strings.TrimSpace(value) != "":
+			headerVar = name
+		}
+	}
+	if debug && headerVar != "" {
+		return fmt.Errorf("GODEBUG sets http2debug, which prints every request header with its value: unset it, or unset %s", headerVar)
 	}
 	return nil
 }

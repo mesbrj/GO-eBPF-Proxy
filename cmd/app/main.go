@@ -7,9 +7,12 @@ package main
 
 import (
 	"flag"
+	"io"
+	stdlog "log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/mesbrj/netloupe-tap/internal/shared/logger"
@@ -19,7 +22,8 @@ func main() {
 	// The level is known only once the configuration loads; until then the
 	// zero LevelVar keeps INFO, so a config error is still logged.
 	var level slog.LevelVar
-	log := logger.New(os.Stderr, logger.WithLevel(&level))
+	log := newLogger(os.Stderr, &level, os.Environ())
+	captureStdLog(log)
 
 	cfg, err := loadConfig(flag.CommandLine, os.Args[1:], os.Environ())
 	if err != nil {
@@ -44,6 +48,35 @@ func main() {
 	if err := a.Close(); err != nil {
 		fatal(log, "app: shutdown failed", err)
 	}
+}
+
+// newLogger builds the sidecar's logger: JSON records to w at level, with
+// the collector's request headers, as environ gives them to the metrics
+// exporter, masked wherever their text occurs (AD-033). The values are in
+// the environment before any setting is loaded, so even the first line
+// logged is covered.
+func newLogger(w io.Writer, level slog.Leveler, environ []string) *logger.Logger {
+	return logger.New(w, logger.WithLevel(level), logger.WithMasked(otlpHeaderSecrets(environ)...))
+}
+
+// captureStdLog sends what Go's standard logger is given through log, as
+// WARN records, instead of straight to stderr. Go's own libraries write
+// there: net/http does when a server sends bytes nobody asked for, and it
+// quotes them, so a peer chooses the text. It is masked and cut like the
+// error of a failed push, and rate-limited like any event a peer can
+// trigger at will.
+func captureStdLog(log *logger.Logger) {
+	stdlog.SetFlags(0)
+	stdlog.SetOutput(stdLogWriter{log.Limited(exportLogInterval, exportLogBurst)})
+}
+
+// stdLogWriter writes each message of Go's standard logger as one record.
+type stdLogWriter struct{ log *logger.Logger }
+
+func (w stdLogWriter) Write(p []byte) (int, error) {
+	text := strings.TrimRight(string(p), "\n")
+	w.log.Warn("go library log", slog.String("text", peerText(w.log, text)))
+	return len(p), nil
 }
 
 // fatal logs msg (and err, if any) at ERROR and exits 1. It goes through the
