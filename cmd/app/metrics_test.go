@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -412,6 +414,7 @@ func TestStartMetrics_RefusesEndpointWithCredentials(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, mp)
+	assert.Contains(t, err.Error(), "metrics-endpoint")
 	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS")
 	assert.NotContains(t, err.Error(), "hunter2")
 	assert.Empty(t, logs.String())
@@ -736,4 +739,64 @@ func TestStartMetrics_SDKDiagnosticsNeverCarryTheirInput(t *testing.T) {
 	assert.Equal(t, "parse headers", diagnostics[0].Context["sdk_message"])
 	assert.NotContains(t, logs.String(), "HSECRET")
 	assert.NotContains(t, logs.String(), "Bearer")
+}
+
+// C63 (AC 46): the SDK's diagnostics reach the log as the SDK's message
+// alone. An endpoint variable that does not parse is quoted whole in the
+// SDK's error, password included, so the error text must not be logged
+// either. The flag's endpoint still wins: the push goes to the collector.
+func TestStartMetrics_SDKDiagnosticsNeverCarryTheirErrorText(t *testing.T) {
+	for _, name := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "http://user:ESECRET@[::1")
+			c := newCollector(t, 0, false)
+
+			mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+			meteredRelay(t, missEverything, mp)
+
+			diagnostics := logRecords(t, logs, "metrics sdk error")
+			require.NotEmpty(t, diagnostics, "the SDK's parse error must arrive in the sidecar's log")
+			assert.Equal(t, map[string]any{"sdk_message": "parse url"}, diagnostics[0].Context)
+			require.Eventually(t, func() bool { return len(c.requests()) >= 1 }, 2*time.Second, 10*time.Millisecond)
+			assert.NotContains(t, logs.String(), "ESECRET")
+			assert.NotContains(t, logs.String(), "[::1")
+		})
+	}
+}
+
+// C63 (AC 46), at the sink itself: whatever the SDK hands over, only its
+// message is logged; informational messages are not logged at all.
+func TestSDKLogSink_LogsTheMessageAlone(t *testing.T) {
+	logs := &syncBuffer{}
+	sink := sdkLogSink{log: logger.New(logs)}
+	sdk := logr.New(sink)
+
+	sdk.Error(errors.New("parse \"http://user:ESECRET@host\": bad"), "parse url", "input", "http://user:KSECRET@host")
+	sdk.WithValues("token", "VSECRET").WithName("NSECRET").Error(nil, "second")
+	sdk.Info("an informational ISECRET")
+	sdk.V(8).Info("a debug ISECRET")
+	sink.Info(0, "handed straight to the sink ISECRET", "token", "VSECRET") // past logr's own level gate
+
+	records := logRecords(t, logs, "metrics sdk error")
+	require.Len(t, records, 2)
+	assert.Equal(t, map[string]any{"sdk_message": "parse url"}, records[0].Context)
+	assert.Equal(t, map[string]any{"sdk_message": "second"}, records[1].Context)
+	assert.NotContains(t, logs.String(), "SECRET")
+}
+
+// C65 (AC 46): a resource variable that does not parse fails the start
+// without repeating the entry.
+func TestStartMetrics_MalformedResourceAttributesAreNotEchoed(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "RSECRET-with-no-equals")
+	logs := &syncBuffer{}
+	cfg := DefaultConfig()
+	cfg.MetricsEndpoint = "http://collector:4318"
+
+	mp, err := startMetrics(cfg, logger.New(logs))
+
+	require.Error(t, err)
+	assert.Nil(t, mp)
+	assert.Contains(t, err.Error(), "OTEL_RESOURCE_ATTRIBUTES")
+	assert.NotContains(t, err.Error(), "RSECRET")
+	assert.NotContains(t, logs.String(), "RSECRET")
 }

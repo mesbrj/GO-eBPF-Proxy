@@ -405,3 +405,23 @@ func TestMain_SigtermDuringStartStillExitsZero(t *testing.T) {
 	assert.True(t, run.logged("capture started"), "Start must run to its end before the signal is acted on; stderr: %s", run.stderr.String())
 	assert.False(t, run.logged("app: shutdown failed"), "stderr: %s", run.stderr.String())
 }
+
+// C66 (AC 46, at the process boundary): the built sidecar, started with
+// every subsystem and an endpoint variable that does not parse and carries a
+// password, reports the SDK's diagnostic by its message and never prints the
+// password, anywhere on stderr, before or during shutdown.
+func TestMain_UnparseableEndpointVariableNeverPrintsItsPassword(t *testing.T) {
+	for _, name := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"} {
+		t.Run(name, func(t *testing.T) {
+			run := startSidecar(t, itConfig(t), []string{name + "=http://user:ESECRET@[::1"},
+				"--metrics-endpoint=http://"+closedAddr(t).String())
+			run.waitUntil(t, "started capture", 20*time.Millisecond, func() bool { return run.logged("capture started") })
+
+			code := run.sigterm(t)
+
+			assert.Equal(t, 0, code, "stderr: %s", run.stderr.String())
+			assert.True(t, run.logged(`"sdk_message":"parse url"`), "precondition: the SDK reported the variable; stderr: %s", run.stderr.String())
+			assert.False(t, run.logged("ESECRET"), "stderr: %s", run.stderr.String())
+		})
+	}
+}
