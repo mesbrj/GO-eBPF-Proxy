@@ -442,13 +442,14 @@ func TestMain_UnparseableEndpointVariableNeverPrintsItsPassword(t *testing.T) {
 	}
 }
 
-// C73 (AC 43, at the process boundary): the built sidecar, pushing to a
-// collector that answers 401 with the Authorization header in its body,
-// logs the failed pushes with the header masked. The logger main builds is
-// the one that masks: nothing on stderr holds the value.
+// C73 (AC 43, AC 50, at the process boundary): the built sidecar, pushing to
+// a collector that answers 401 with the Authorization header and then
+// 100,000 more bytes in its body, logs the failed pushes with the header
+// masked and the text cut. The logger main builds is the one that masks:
+// nothing on stderr holds the value, and no line is the collector's to size.
 func TestMain_HeaderSentBackByTheCollectorIsMaskedOnStderr(t *testing.T) {
 	c := newAnsweringCollector(t, func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key"), http.StatusUnauthorized)
+		http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key")+strings.Repeat(" x", 50_000), http.StatusUnauthorized)
 	})
 	run := startSidecar(t, itConfig(t), []string{"OTEL_EXPORTER_OTLP_HEADERS=" + echoHeaderVar},
 		"--metrics-endpoint="+c.url, "--metrics-interval=100ms")
@@ -462,6 +463,10 @@ func TestMain_HeaderSentBackByTheCollectorIsMaskedOnStderr(t *testing.T) {
 	require.Equal(t, echoBearer, c.requests()[0].header.Get("Authorization"), "precondition: the collector was sent the header")
 	assert.Contains(t, stderr, "invalid credentials: ***REDACTED*** / ***REDACTED***")
 	assert.Contains(t, stderr, "metrics shutdown failed")
+	assert.Contains(t, stderr, " more bytes)", "the collector's 100,000 bytes are cut")
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		assert.Less(t, len(line), 2048, "a log line the collector sized: %.200q", line)
+	}
 	requireNoHeaderValue(t, stderr)
 }
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -198,17 +199,20 @@ const minMaskedLen = 8
 // otlpHeaderSecrets returns what the log masks of the request headers the
 // exporter is given through otlpHeaderVars: each header's value and each
 // whitespace-separated part of it, so the token of "Bearer <token>" is
-// covered on its own, both as sent and percent-encoded, as a redirect would
-// carry it in a URL. Strings shorter than minMaskedLen are left out. So is a
-// header the exporter would skip: it is never sent, so no one can send it
-// back.
+// covered on its own. Each is given in the spellings a peer's answer reaches
+// the log in: as sent; percent-encoded, as a redirect carries it in a URL;
+// and escaped as Go's %q quotes it, which is how net/url and net/http print
+// a URL or a server's bytes in an error. Strings shorter than minMaskedLen
+// are left out. So is a header the exporter would skip: it is never sent, so
+// no one can send it back.
 func otlpHeaderSecrets(environ []string) []string {
 	var secrets []string
 	add := func(part string) {
 		if len(part) < minMaskedLen {
 			return
 		}
-		for _, form := range []string{part, url.QueryEscape(part), url.PathEscape(part)} {
+		quoted := strconv.Quote(part)
+		for _, form := range []string{part, url.QueryEscape(part), url.PathEscape(part), quoted[1 : len(quoted)-1]} {
 			if !slices.Contains(secrets, form) {
 				secrets = append(secrets, form)
 			}

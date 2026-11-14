@@ -260,10 +260,11 @@ func TestMain_MetricsSecretsAreRefusedAndNeverPrinted(t *testing.T) {
 
 // C72 (AC 51, at the process boundary): the built sidecar, started with
 // GODEBUG=http2debug and a header variable while metrics are on, exits 1 on
-// the config load, naming both variables.
+// the config load, naming both variables. The header's value is under 8
+// bytes, so the log's masking plays no part in its absence.
 func TestMain_HTTP2DebugWithAHeaderVariableExitsOne(t *testing.T) {
 	code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"),
-		[]string{"GODEBUG=http2debug=2", "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20XSECRETXSECRET"},
+		[]string{"GODEBUG=http2debug=2", "OTEL_EXPORTER_OTLP_HEADERS=X-Api-Key=XSECRET"},
 		"--metrics-endpoint=https://collector:4318")
 
 	assert.Equal(t, 1, code, "stderr: %s", stderr)
@@ -272,4 +273,17 @@ func TestMain_HTTP2DebugWithAHeaderVariableExitsOne(t *testing.T) {
 	assert.Contains(t, stderr, "OTEL_EXPORTER_OTLP_HEADERS")
 	assert.NotContains(t, stderr, "XSECRET")
 	assert.NotContains(t, stderr, "app: start failed", "the refusal must come before Start")
+}
+
+// C77 (Surface: the sidecar process's exit 2): a flag the flag package cannot
+// parse ends the built sidecar with exit 2 and the flag package's own usage
+// text, before any setting is loaded. It predates the metrics settings, which
+// joined it.
+func TestMain_FlagThatDoesNotParseExitsTwo(t *testing.T) {
+	code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"), nil, "--metrics-interval=soon")
+
+	assert.Equal(t, 2, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "-metrics-interval")
+	assert.Contains(t, stderr, "Usage of")
+	assert.NotContains(t, stderr, "app: config load failed", "the flag package ends the process itself")
 }
