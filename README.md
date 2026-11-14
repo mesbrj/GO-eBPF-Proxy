@@ -344,17 +344,17 @@ The header value is a secret:
 - Use an `https://` endpoint. Over `http://` the header crosses the network in clear text, and
   when the collector is reached over `--capture-iface` it is in the capture too.
 - The sidecar keeps it out of its log. In every log line, each occurrence of a header value, or
-  of a space-separated part of one such as the token of `Bearer <token>`, is written as
-  `***REDACTED***`. It is recognised as the collector receives it, percent-encoded, and escaped
-  the way Go quotes a text in an error. That covers a collector that sends the value back: in
-  the body of an error, in a redirect, or in bytes it was not asked for.
+  of a part of one that white space sets apart, such as the token of `Bearer <token>`, is
+  written as `***REDACTED***`. It is recognised as the collector receives it, percent-encoded,
+  and escaped the way Go quotes a text in an error. That covers a collector that sends the
+  value back: in the body of an error, in a redirect, or in bytes it was not asked for.
 - The masking has limits. A value or part shorter than 8 bytes is not masked. Neither is a
   fragment of a value, or another spelling of it such as the decoded `user:password` of a Basic
   header. A token put in the endpoint's path is logged with the endpoint, so keep secrets in
   headers. The credentials of a proxy (`HTTPS_PROXY`) are not masked if the proxy sends them
   back.
 - A redirect from the collector is followed. Go drops `Authorization` when the redirect leaves
-  the collector's host, but any other header, such as a vendor's key header, goes to the new
+  the collector's domain, but any other header, such as a vendor's key header, goes to the new
   host too. Point the endpoint at the collector's final URL.
 - The value is still readable in the container's environment, for example with
   `podman inspect`, so in Kubernetes take it from a Secret (`secretKeyRef`).
