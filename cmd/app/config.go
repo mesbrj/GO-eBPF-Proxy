@@ -200,11 +200,12 @@ const minMaskedLen = 8
 // exporter is given through otlpHeaderVars: each header's value and each
 // whitespace-separated part of it, so the token of "Bearer <token>" is
 // covered on its own. Each is given in the spellings a peer's answer reaches
-// the log in: as sent; percent-encoded, as a redirect carries it in a URL;
-// and escaped as Go's %q quotes it, which is how net/url and net/http print
-// a URL or a server's bytes in an error. Strings shorter than minMaskedLen
-// are left out. So is a header the exporter would skip: it is never sent, so
-// no one can send it back.
+// the log in: as sent; percent-encoded, by the peer or by Go when it writes
+// out a redirect's URL, whose path, fragment and userinfo it escapes each in
+// its own way; and escaped as Go's %q quotes it, which is how net/url and
+// net/http print a URL or a server's bytes in an error. Strings shorter than
+// minMaskedLen are left out. So is a header the exporter would skip: it is
+// never sent, so no one can send it back.
 func otlpHeaderSecrets(environ []string) []string {
 	var secrets []string
 	add := func(part string) {
@@ -212,7 +213,15 @@ func otlpHeaderSecrets(environ []string) []string {
 			return
 		}
 		quoted := strconv.Quote(part)
-		for _, form := range []string{part, url.QueryEscape(part), url.PathEscape(part), quoted[1 : len(quoted)-1]} {
+		for _, form := range []string{
+			part,
+			quoted[1 : len(quoted)-1],
+			url.QueryEscape(part),
+			url.PathEscape(part),
+			(&url.URL{Path: part}).EscapedPath(),
+			(&url.URL{Fragment: part}).EscapedFragment(),
+			url.User(part).String(),
+		} {
 			if !slices.Contains(secrets, form) {
 				secrets = append(secrets, form)
 			}

@@ -880,36 +880,145 @@ func TestLoadConfig_BlankHeadersVariableIsAccepted(t *testing.T) {
 	}
 }
 
-// C68 (AC 43): what the log masks of the header variables: each value the
-// exporter sends and each whitespace-separated part of it, from both
-// variables, as sent, percent-encoded and as Go's %q quotes it, and nothing
-// shorter than 8 bytes.
+// C68 (AC 43): what the log masks of one header: its value and each part of
+// it that white space separates, when 8 bytes or more, in every spelling a
+// peer's answer can reach the log in. Those are: as sent; as Go's %q quotes
+// it; as url.QueryEscape and url.PathEscape write it; and as Go escapes it
+// when it writes out the path, the fragment or the userinfo of a URL. The
+// lists are written out by hand from those rules.
 func TestOTLPHeaderSecrets(t *testing.T) {
 	t.Parallel()
 
-	got := otlpHeaderSecrets([]string{
-		"PATH=/usr/bin",
-		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20tok-0123456789abcdef, X-Scope = tap ,X-Seven=1234567,X-Eight=abcdefgh," +
-			`X-Dom=dom\svc-0123456789,X-Tab=Token%09tabbed-0123456789,X-Wide=Token%20%20%20spaced-0123456789`,
-		"OTEL_EXPORTER_OTLP_METRICS_HEADERS=signoz-ingestion-key=key/with+odd=chars&more",
-		"OTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=Bearer%20traces-only-token",
+	for name, tc := range map[string]struct {
+		header string
+		want   []string
+	}{
+		"a scheme and a token": {
+			"Authorization=Bearer%20tok-0123456789abcdef",
+			[]string{
+				// the value: a space is "+" in a query and "%20" everywhere else
+				"Bearer tok-0123456789abcdef", "Bearer+tok-0123456789abcdef", "Bearer%20tok-0123456789abcdef",
+				// the token alone; "Bearer" is under 8 bytes
+				"tok-0123456789abcdef",
+			},
+		},
+		"under 8 bytes, with spaces around":  {" X-Scope = tap ", nil},
+		"7 bytes":                            {"X-Seven=1234567", nil},
+		"8 bytes, the shortest value masked": {"X-Eight=abcdefgh", []string{"abcdefgh"}},
+		"a backslash": {
+			`X-Dom=dom\svc-0123456789`,
+			// %q doubles it; every URL escaping writes %5C
+			[]string{`dom\svc-0123456789`, `dom\\svc-0123456789`, "dom%5Csvc-0123456789"},
+		},
+		"parts separated by a tab": {
+			"X-Tab=Token%09tabbed-0123456789",
+			[]string{"Token\ttabbed-0123456789", `Token\ttabbed-0123456789`, "Token%09tabbed-0123456789", "tabbed-0123456789"},
+		},
+		"parts separated by a run of spaces": {
+			"X-Wide=Token%20%20%20spaced-0123456789",
+			[]string{"Token   spaced-0123456789", "Token+++spaced-0123456789", "Token%20%20%20spaced-0123456789", "spaced-0123456789"},
+		},
+		"parts separated by a no-break space": {
+			"X-Nbsp=Token%C2%A0nbsp-0123456789",
+			// %q writes a no-break space as its \u escape
+			[]string{"Token\u00a0nbsp-0123456789", `Token\u00a0nbsp-0123456789`, "Token%C2%A0nbsp-0123456789", "nbsp-0123456789"},
+		},
+		"characters each URL escaping treats differently": {
+			"signoz-ingestion-key=key/with+odd=chars&more",
+			[]string{
+				// as sent, which is also how a URL's path and fragment keep it
+				"key/with+odd=chars&more",
+				// url.QueryEscape
+				"key%2Fwith%2Bodd%3Dchars%26more",
+				// url.PathEscape and a URL's userinfo: only the slash
+				"key%2Fwith+odd=chars&more",
+			},
+		},
+		"a slash and a double quote": {
+			`X-Path=abc/def"0123456789`,
+			[]string{
+				`abc/def"0123456789`,
+				// %q
+				`abc/def\"0123456789`,
+				// url.QueryEscape, url.PathEscape and a URL's userinfo escape both
+				"abc%2Fdef%220123456789",
+				// a URL's path and fragment keep the slash
+				"abc/def%220123456789",
+			},
+		},
+		"what only a URL's path escapes this way": {
+			`X-Path=p/a!t"h-0123456789`,
+			[]string{
+				`p/a!t"h-0123456789`,
+				// %q
+				`p/a!t\"h-0123456789`,
+				// url.QueryEscape, url.PathEscape and the userinfo escape the slash too
+				"p%2Fa%21t%22h-0123456789",
+				// the path keeps the slash and escapes the exclamation mark
+				"p/a%21t%22h-0123456789",
+				// the fragment keeps both
+				"p/a!t%22h-0123456789",
+			},
+		},
+		"what only url.PathEscape writes this way": {
+			"X-Seg=a%2Cb+c-0123456789",
+			[]string{
+				// as sent, which is also how a path, a fragment and the userinfo keep it
+				"a,b+c-0123456789",
+				// url.QueryEscape escapes the plus sign too
+				"a%2Cb%2Bc-0123456789",
+				// url.PathEscape escapes the comma only
+				"a%2Cb+c-0123456789",
+			},
+		},
+		"what only a URL's fragment escapes this way": {
+			`X-Frag=f!r"ag-0123456789`,
+			[]string{
+				`f!r"ag-0123456789`,
+				// %q
+				`f!r\"ag-0123456789`,
+				// every other URL escaping escapes the exclamation mark too
+				"f%21r%22ag-0123456789",
+				// the fragment keeps it
+				"f!r%22ag-0123456789",
+			},
+		},
+		"what only a URL's userinfo escapes this way": {
+			"X-User=us@e%2Cr-0123456789",
+			[]string{
+				// as sent, which is also how a path and a fragment keep it
+				"us@e,r-0123456789",
+				// url.QueryEscape
+				"us%40e%2Cr-0123456789",
+				// url.PathEscape keeps the at sign
+				"us@e%2Cr-0123456789",
+				// the userinfo escapes the at sign and keeps the comma
+				"us%40e,r-0123456789",
+			},
+		},
+		"a letter outside ASCII and a double quote": {
+			`X-Pass=p%C3%A4"ss-0123456789`,
+			// %q keeps the printable letter and escapes the quote
+			[]string{`pä"ss-0123456789`, `pä\"ss-0123456789`, "p%C3%A4%22ss-0123456789"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.ElementsMatch(t, tc.want, otlpHeaderSecrets([]string{"OTEL_EXPORTER_OTLP_HEADERS=" + tc.header}))
+		})
+	}
+
+	t.Run("both header variables, and no other", func(t *testing.T) {
+		t.Parallel()
+
+		assert.ElementsMatch(t, []string{"general-0123", "metrics-0123"}, otlpHeaderSecrets([]string{
+			"PATH=/usr/bin",
+			"OTEL_EXPORTER_OTLP_HEADERS=X-A=general-0123,X-B=short",
+			"OTEL_EXPORTER_OTLP_METRICS_HEADERS=X-C=metrics-0123",
+			"OTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=traces-only-token",
+		}))
 	})
-
-	assert.ElementsMatch(t, []string{
-		// the Authorization value, whole and its token alone
-		"Bearer tok-0123456789abcdef", "Bearer+tok-0123456789abcdef", "Bearer%20tok-0123456789abcdef",
-		"tok-0123456789abcdef",
-		// eight bytes is the shortest value masked; "1234567", "tap" and "Bearer" are not
-		"abcdefgh",
-		// a backslash: Go's %q doubles it, a URL escapes it
-		`dom\svc-0123456789`, `dom\\svc-0123456789`, "dom%5Csvc-0123456789",
-		// parts are separated by any whitespace, a tab here, and by runs of it
-		"Token\ttabbed-0123456789", `Token\ttabbed-0123456789`, "Token%09tabbed-0123456789", "tabbed-0123456789",
-		"Token   spaced-0123456789", "Token+++spaced-0123456789", "Token%20%20%20spaced-0123456789", "spaced-0123456789",
-		// the ingestion key, with its characters that a URL escapes
-		"key/with+odd=chars&more", "key%2Fwith%2Bodd%3Dchars%26more", "key%2Fwith+odd=chars&more",
-	}, got)
-
 	t.Run("a header the exporter would skip adds nothing", func(t *testing.T) {
 		t.Parallel()
 
