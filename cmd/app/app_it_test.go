@@ -3,9 +3,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -339,9 +341,7 @@ func (r *sidecarRun) waitUntil(t *testing.T, what string, poll time.Duration, re
 	for !ready() {
 		select {
 		case err := <-r.exited:
-			if r.logged("operation not permitted") || r.logged("permission denied") {
-				t.Skipf("privileged capture/attach not permitted: %s", r.stderr.String())
-			}
+			r.skipIfUnprivileged(t)
 			t.Fatalf("the sidecar exited before it %s (%v): %s", what, err, r.stderr.String())
 		default:
 		}
@@ -350,11 +350,27 @@ func (r *sidecarRun) waitUntil(t *testing.T, what string, poll time.Duration, re
 	}
 }
 
+// skipIfUnprivileged skips the test when the sidecar's log says the kernel
+// refused the privileged capture or attach.
+func (r *sidecarRun) skipIfUnprivileged(t *testing.T) {
+	t.Helper()
+	if r.logged("operation not permitted") || r.logged("permission denied") {
+		t.Skipf("privileged capture/attach not permitted: %s", r.stderr.String())
+	}
+}
+
 // sigterm sends the sidecar SIGTERM, waits for it to exit and returns its
 // exit code, which is -1 when the signal itself killed the process.
 func (r *sidecarRun) sigterm(t *testing.T) int {
 	t.Helper()
 	require.NoError(t, r.cmd.Process.Signal(syscall.SIGTERM))
+	return r.exit(t)
+}
+
+// exit waits for the sidecar to exit and returns its exit code, which is -1
+// when a signal killed the process.
+func (r *sidecarRun) exit(t *testing.T) int {
+	t.Helper()
 	select {
 	case err := <-r.exited:
 		// A sidecar that exits non-zero, or dies of the signal, is reported
@@ -406,7 +422,7 @@ func TestMain_SigtermDuringStartStillExitsZero(t *testing.T) {
 	assert.False(t, run.logged("app: shutdown failed"), "stderr: %s", run.stderr.String())
 }
 
-// C66 (AC 46, at the process boundary): the built sidecar, started with
+// C66 (AC 47, at the process boundary): the built sidecar, started with
 // every subsystem and an endpoint variable that does not parse and carries a
 // password, reports the SDK's diagnostic by its message and never prints the
 // password, anywhere on stderr, before or during shutdown.
@@ -423,5 +439,66 @@ func TestMain_UnparseableEndpointVariableNeverPrintsItsPassword(t *testing.T) {
 			assert.True(t, run.logged(`"sdk_message":"parse url"`), "precondition: the SDK reported the variable; stderr: %s", run.stderr.String())
 			assert.False(t, run.logged("ESECRET"), "stderr: %s", run.stderr.String())
 		})
+	}
+}
+
+// C73 (AC 43, at the process boundary): the built sidecar, pushing to a
+// collector that answers 401 with the Authorization header in its body,
+// logs the failed pushes with the header masked. The logger main builds is
+// the one that masks: nothing on stderr holds the value.
+func TestMain_HeaderSentBackByTheCollectorIsMaskedOnStderr(t *testing.T) {
+	c := newAnsweringCollector(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key"), http.StatusUnauthorized)
+	})
+	run := startSidecar(t, itConfig(t), []string{"OTEL_EXPORTER_OTLP_HEADERS=" + echoHeaderVar},
+		"--metrics-endpoint="+c.url, "--metrics-interval=100ms")
+	run.waitUntil(t, "logged a failed push", 20*time.Millisecond, func() bool { return run.logged("metrics export failed") })
+
+	code := run.sigterm(t)
+
+	stderr := run.stderr.String()
+	assert.Equal(t, 0, code, "stderr: %s", stderr)
+	require.NotEmpty(t, c.requests())
+	require.Equal(t, echoBearer, c.requests()[0].header.Get("Authorization"), "precondition: the collector was sent the header")
+	assert.Contains(t, stderr, "invalid credentials: ***REDACTED*** / ***REDACTED***")
+	assert.Contains(t, stderr, "metrics shutdown failed")
+	requireNoHeaderValue(t, stderr)
+}
+
+// C74 (AC 48, at the process boundary): the built sidecar, started with a
+// resource variable that does not parse, exits 1 from Start with an error
+// that names the variable and never the entry.
+func TestMain_MalformedResourceAttributesFailTheStartWithoutTheEntry(t *testing.T) {
+	run := startSidecar(t, itConfig(t), []string{"OTEL_RESOURCE_ATTRIBUTES=RSECRET-with-no-equals"},
+		"--metrics-endpoint=http://"+closedAddr(t).String())
+
+	code := run.exit(t)
+
+	run.skipIfUnprivileged(t)
+	stderr := run.stderr.String()
+	assert.Equal(t, 1, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "app: start failed")
+	assert.Contains(t, stderr, "OTEL_RESOURCE_ATTRIBUTES")
+	assert.NotContains(t, stderr, "RSECRET")
+}
+
+// C76 (AC 52, at the process boundary): the built sidecar, pushing to a
+// collector that repeats the Authorization header in bytes nobody asked for,
+// reports them as a record of its own log with the header masked. Nothing
+// reaches stderr past the logger: every line there is a JSON record.
+func TestMain_UnsolicitedAnswerIsLoggedMaskedNotPrintedRaw(t *testing.T) {
+	run := startSidecar(t, itConfig(t), []string{"OTEL_EXPORTER_OTLP_HEADERS=" + echoHeaderVar},
+		"--metrics-endpoint="+unsolicitedCollector(t), "--metrics-interval=100ms")
+	run.waitUntil(t, "reported the unsolicited bytes", 20*time.Millisecond, func() bool { return run.logged("go library log") })
+
+	code := run.sigterm(t)
+
+	stderr := run.stderr.String()
+	assert.Equal(t, 0, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "Unsolicited response received")
+	assert.Contains(t, stderr, "X-Echo: ***REDACTED***")
+	requireNoHeaderValue(t, stderr)
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		assert.True(t, json.Valid([]byte(line)), "a line outside the JSON log: %q", line)
 	}
 }

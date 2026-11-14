@@ -257,3 +257,19 @@ func TestMain_MetricsSecretsAreRefusedAndNeverPrinted(t *testing.T) {
 		})
 	}
 }
+
+// C72 (AC 51, at the process boundary): the built sidecar, started with
+// GODEBUG=http2debug and a header variable while metrics are on, exits 1 on
+// the config load, naming both variables.
+func TestMain_HTTP2DebugWithAHeaderVariableExitsOne(t *testing.T) {
+	code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"),
+		[]string{"GODEBUG=http2debug=2", "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20XSECRETXSECRET"},
+		"--metrics-endpoint=https://collector:4318")
+
+	assert.Equal(t, 1, code, "stderr: %s", stderr)
+	assert.Contains(t, stderr, "app: config load failed")
+	assert.Contains(t, stderr, "GODEBUG")
+	assert.Contains(t, stderr, "OTEL_EXPORTER_OTLP_HEADERS")
+	assert.NotContains(t, stderr, "XSECRET")
+	assert.NotContains(t, stderr, "app: start failed", "the refusal must come before Start")
+}

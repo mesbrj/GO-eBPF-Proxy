@@ -871,10 +871,87 @@ func TestLoadConfig_MalformedHeadersVariableIsRefusedWithoutItsText(t *testing.T
 func TestLoadConfig_BlankHeadersVariableIsAccepted(t *testing.T) {
 	t.Parallel()
 
-	for _, value := range []string{"", " ", "\t "} {
-		_, err := load(t, []string{"--metrics-endpoint=http://collector:4318"},
-			[]string{"OTEL_EXPORTER_OTLP_HEADERS=" + value})
+	for _, name := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_HEADERS"} {
+		for _, value := range []string{"", " ", "\t "} {
+			_, err := load(t, []string{"--metrics-endpoint=http://collector:4318"}, []string{name + "=" + value})
 
-		assert.NoError(t, err, "value %q", value)
+			assert.NoError(t, err, "%s=%q", name, value)
+		}
+	}
+}
+
+// C68 (AC 43): what the log masks of the header variables: each value the
+// exporter sends and each whitespace-separated part of it, as sent and
+// percent-encoded, from both variables, and nothing shorter than 8 bytes.
+func TestOTLPHeaderSecrets(t *testing.T) {
+	t.Parallel()
+
+	got := otlpHeaderSecrets([]string{
+		"PATH=/usr/bin",
+		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20tok-0123456789abcdef, X-Scope = tap ,X-Seven=1234567,X-Eight=abcdefgh",
+		"OTEL_EXPORTER_OTLP_METRICS_HEADERS=signoz-ingestion-key=key/with+odd=chars&more",
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=Bearer%20traces-only-token",
+	})
+
+	assert.ElementsMatch(t, []string{
+		// the Authorization value, whole and its token alone
+		"Bearer tok-0123456789abcdef", "Bearer+tok-0123456789abcdef", "Bearer%20tok-0123456789abcdef",
+		"tok-0123456789abcdef",
+		// eight bytes is the shortest value masked; "1234567", "tap" and "Bearer" are not
+		"abcdefgh",
+		// the ingestion key, with its characters that a URL escapes
+		"key/with+odd=chars&more", "key%2Fwith%2Bodd%3Dchars%26more", "key%2Fwith+odd=chars&more",
+	}, got)
+
+	t.Run("a header the exporter would skip adds nothing", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, otlpHeaderSecrets([]string{
+			"OTEL_EXPORTER_OTLP_HEADERS=Authorization: Bearer tok-0123456789abcdef,Bad Name=tok-0123456789abcdef,X=tok-0123456789abcdef%zz",
+		}))
+	})
+	t.Run("no header variable", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Empty(t, otlpHeaderSecrets([]string{"PATH=/usr/bin", "OTEL_EXPORTER_OTLP_HEADERS="}))
+	})
+}
+
+// C71 (AC 51): with metrics on and a header variable set, Go's HTTP/2
+// debugging is refused: it prints every request header, value included,
+// past the logger. The error names the two variables and never the value.
+func TestLoadConfig_RefusesHTTP2DebugWithAHeaderVariable(t *testing.T) {
+	t.Parallel()
+
+	const header = "Authorization=Bearer%20HSECRETHSECRET"
+	metricsOn := []string{"--metrics-endpoint=https://collector:4318"}
+	for _, godebug := range []string{"http2debug=1", "http2debug=2", "gctrace=1,http2debug=2", "http2debug=1,madvdontneed=1"} {
+		for _, name := range []string{"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_HEADERS"} {
+			t.Run("refuses GODEBUG="+godebug+" with "+name, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := load(t, metricsOn, []string{"GODEBUG=" + godebug, name + "=" + header})
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "GODEBUG")
+				assert.Contains(t, err.Error(), name)
+				assert.NotContains(t, err.Error(), "HSECRET")
+			})
+		}
+	}
+	for name, tc := range map[string]struct{ args, env []string }{
+		"http2debug with no header variable":    {metricsOn, []string{"GODEBUG=http2debug=2"}},
+		"http2debug with a blank header":        {metricsOn, []string{"GODEBUG=http2debug=2", "OTEL_EXPORTER_OTLP_HEADERS= "}},
+		"another GODEBUG setting with a header": {metricsOn, []string{"GODEBUG=gctrace=1,http2client=0", "OTEL_EXPORTER_OTLP_HEADERS=" + header}},
+		"http2debug=0 with a header":            {metricsOn, []string{"GODEBUG=http2debug=0", "OTEL_EXPORTER_OTLP_HEADERS=" + header}},
+		"http2debug with a header, metrics off": {nil, []string{"GODEBUG=http2debug=2", "OTEL_EXPORTER_OTLP_HEADERS=" + header}},
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, tc.args, tc.env)
+
+			assert.NoError(t, err)
+		})
 	}
 }

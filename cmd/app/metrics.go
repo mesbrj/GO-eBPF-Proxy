@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel"
@@ -53,7 +54,7 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 	exportLog := log.Limited(exportLogInterval, exportLogBurst)
 	otel.SetLogger(logr.New(sdkLogSink{log: exportLog}))
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		exportLog.Warn("metrics export failed", slog.String("error", err.Error()))
+		exportLog.Warn("metrics export failed", slog.String("error", peerText(exportLog, err.Error())))
 	}))
 
 	ctx := context.Background()
@@ -134,6 +135,29 @@ func stopMetrics(mp *sdkmetric.MeterProvider, log *logger.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
 	defer cancel()
 	if err := mp.Shutdown(ctx); err != nil {
-		log.Warn("metrics shutdown failed", slog.String("error", err.Error()))
+		log.Warn("metrics shutdown failed", slog.String("error", peerText(log, err.Error())))
 	}
+}
+
+// maxPeerText bounds, in bytes, a logged text whose length a peer decides.
+// The exporter copies what the collector answered into the error of a failed
+// push, up to 4 MiB of response body, so without a bound the collector sizes
+// the line.
+const maxPeerText = 1024
+
+// peerText renders, for a log line, a text a peer had a hand in: its first
+// maxPeerText bytes, cut at a character boundary, then the number of bytes
+// left out. The text is masked before it is cut: the logger masks what it
+// writes, but a cut made first could leave the head of a masked value, which
+// no longer matches it.
+func peerText(log *logger.Logger, text string) string {
+	text = log.Mask(text)
+	if len(text) <= maxPeerText {
+		return text
+	}
+	cut := maxPeerText
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s… (%d more bytes)", text[:cut], len(text)-cut)
 }
