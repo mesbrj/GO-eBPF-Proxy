@@ -881,14 +881,16 @@ func TestLoadConfig_BlankHeadersVariableIsAccepted(t *testing.T) {
 }
 
 // C68 (AC 43): what the log masks of the header variables: each value the
-// exporter sends and each whitespace-separated part of it, as sent and
-// percent-encoded, from both variables, and nothing shorter than 8 bytes.
+// exporter sends and each whitespace-separated part of it, from both
+// variables, as sent, percent-encoded and as Go's %q quotes it, and nothing
+// shorter than 8 bytes.
 func TestOTLPHeaderSecrets(t *testing.T) {
 	t.Parallel()
 
 	got := otlpHeaderSecrets([]string{
 		"PATH=/usr/bin",
-		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20tok-0123456789abcdef, X-Scope = tap ,X-Seven=1234567,X-Eight=abcdefgh",
+		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20tok-0123456789abcdef, X-Scope = tap ,X-Seven=1234567,X-Eight=abcdefgh," +
+			`X-Dom=dom\svc-0123456789,X-Tab=Token%09tabbed-0123456789,X-Wide=Token%20%20%20spaced-0123456789`,
 		"OTEL_EXPORTER_OTLP_METRICS_HEADERS=signoz-ingestion-key=key/with+odd=chars&more",
 		"OTEL_EXPORTER_OTLP_TRACES_HEADERS=Authorization=Bearer%20traces-only-token",
 	})
@@ -899,6 +901,11 @@ func TestOTLPHeaderSecrets(t *testing.T) {
 		"tok-0123456789abcdef",
 		// eight bytes is the shortest value masked; "1234567", "tap" and "Bearer" are not
 		"abcdefgh",
+		// a backslash: Go's %q doubles it, a URL escapes it
+		`dom\svc-0123456789`, `dom\\svc-0123456789`, "dom%5Csvc-0123456789",
+		// parts are separated by any whitespace, a tab here, and by runs of it
+		"Token\ttabbed-0123456789", `Token\ttabbed-0123456789`, "Token%09tabbed-0123456789", "tabbed-0123456789",
+		"Token   spaced-0123456789", "Token+++spaced-0123456789", "Token%20%20%20spaced-0123456789", "spaced-0123456789",
 		// the ingestion key, with its characters that a URL escapes
 		"key/with+odd=chars&more", "key%2Fwith%2Bodd%3Dchars%26more", "key%2Fwith+odd=chars&more",
 	}, got)

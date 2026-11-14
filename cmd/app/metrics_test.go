@@ -1081,3 +1081,84 @@ func TestMetrics_UnsolicitedAnswerWithTheHeaderIsMasked(t *testing.T) {
 	requireNoHeaderValue(t, stdLogs.String())
 	requireNoHeaderValue(t, logs.String())
 }
+
+// A collector credential whose values hold characters Go escapes when it
+// quotes a text with %q: a double quote and a backslash.
+const (
+	quotedHeaderVar = `Authorization=Token token="tok-0123456789abcdef",X-Api-Key=dom\svc-0123456789abcdef`
+	quotedToken     = "tok-0123456789abcdef"
+	quotedAPIKey    = "svc-0123456789abcdef"
+)
+
+// C69 (AC 43): Go quotes a redirect's URL with %q in the error of the failed
+// push, so a header value with a double quote or a backslash reaches the log
+// escaped. It is masked in that spelling too, as it is when the collector
+// sends it back as it was sent.
+func TestMetrics_QuotedHeaderSentBackIsMasked(t *testing.T) {
+	moved := "http://" + closedAddr(t).String() + "/moved"
+	for name, answer := range map[string]http.HandlerFunc{
+		"as sent, in a 401 body": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key"), http.StatusUnauthorized)
+		},
+		"as sent, in the URL of a redirect, which Go quotes": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", moved+"?auth="+r.Header.Get("Authorization")+"&key="+r.Header.Get("X-Api-Key"))
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", quotedHeaderVar)
+			c := newAnsweringCollector(t, answer)
+			mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+			meteredRelay(t, missEverything, mp)
+
+			require.Eventually(t, func() bool { return len(logRecords(t, logs, "metrics export failed")) > 0 },
+				5*time.Second, 10*time.Millisecond)
+			require.NotEmpty(t, c.requests())
+			require.Equal(t, `Token token="`+quotedToken+`"`, c.requests()[0].header.Get("Authorization"), "precondition: the collector was sent the header")
+			require.Equal(t, `dom\`+quotedAPIKey, c.requests()[0].header.Get("X-Api-Key"))
+			stopMetrics(mp, sidecarLogger(logs))
+
+			for _, rec := range append(logRecords(t, logs, "metrics export failed"), logRecords(t, logs, "metrics shutdown failed")...) {
+				assert.Contains(t, rec.Context["error"], "***REDACTED***")
+			}
+			assert.NotContains(t, logs.String(), quotedToken)
+			assert.NotContains(t, logs.String(), quotedAPIKey)
+		})
+	}
+}
+
+// C75 (AC 52): Go's HTTP client quotes a server's unsolicited bytes with %q,
+// so a header value with a double quote or a backslash arrives escaped. It is
+// masked in that spelling.
+func TestCaptureStdLog_MasksAValueGoQuoted(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", quotedHeaderVar)
+	restoreStdLog(t)
+	logs := &syncBuffer{}
+	captureStdLog(sidecarLogger(logs))
+
+	echoed := []byte("HTTP/1.1 400 Bad Request\r\nX-Echo: Token token=\"" + quotedToken + "\"\r\nX-Key: dom\\" + quotedAPIKey + "\r\n\r\n")
+	stdlog.Printf("Unsolicited response received on idle HTTP channel starting with %q; err=%v", echoed, nil)
+
+	records := logRecords(t, logs, "go library log")
+	require.Len(t, records, 1)
+	assert.Equal(t, `Unsolicited response received on idle HTTP channel starting with "HTTP/1.1 400 Bad Request\r\nX-Echo: ***REDACTED***\r\nX-Key: ***REDACTED***\r\n\r\n"; err=<nil>`, records[0].Context["text"])
+	assert.NotContains(t, logs.String(), quotedToken)
+	assert.NotContains(t, logs.String(), quotedAPIKey)
+}
+
+// C75 (AC 52): a peer can make Go's libraries log at will, so at most 10 of
+// their messages a minute become records; the rest are dropped.
+func TestCaptureStdLog_KeepsTenMessagesAMinute(t *testing.T) {
+	restoreStdLog(t)
+	logs := &syncBuffer{}
+	captureStdLog(sidecarLogger(logs))
+
+	for i := range 25 {
+		stdlog.Printf("message %d", i)
+	}
+
+	records := logRecords(t, logs, "go library log")
+	require.Len(t, records, 10)
+	assert.Equal(t, "message 0", records[0].Context["text"])
+	assert.Equal(t, "message 9", records[9].Context["text"])
+}
