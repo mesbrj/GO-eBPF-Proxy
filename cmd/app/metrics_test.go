@@ -1083,11 +1083,13 @@ func TestMetrics_UnsolicitedAnswerWithTheHeaderIsMasked(t *testing.T) {
 }
 
 // A collector credential whose values hold characters Go escapes when it
-// quotes a text with %q: a double quote and a backslash.
+// quotes a text with %q, a double quote and a backslash, and one it does not
+// escape, a printable letter outside ASCII.
 const (
-	quotedHeaderVar = `Authorization=Token token="tok-0123456789abcdef",X-Api-Key=dom\svc-0123456789abcdef`
+	quotedHeaderVar = `Authorization=Token token="tok-0123456789abcdef",X-Api-Key=dom\svc-0123456789abcdef,X-Pass=p%C3%A4"ss-0123456789abcdef`
 	quotedToken     = "tok-0123456789abcdef"
 	quotedAPIKey    = "svc-0123456789abcdef"
+	quotedPass      = "ss-0123456789abcdef"
 )
 
 // C69 (AC 43): Go quotes a redirect's URL with %q in the error of the failed
@@ -1098,10 +1100,10 @@ func TestMetrics_QuotedHeaderSentBackIsMasked(t *testing.T) {
 	moved := "http://" + closedAddr(t).String() + "/moved"
 	for name, answer := range map[string]http.HandlerFunc{
 		"as sent, in a 401 body": func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key"), http.StatusUnauthorized)
+			http.Error(w, "invalid credentials: "+r.Header.Get("Authorization")+" / "+r.Header.Get("X-Api-Key")+" / "+r.Header.Get("X-Pass"), http.StatusUnauthorized)
 		},
 		"as sent, in the URL of a redirect, which Go quotes": func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Location", moved+"?auth="+r.Header.Get("Authorization")+"&key="+r.Header.Get("X-Api-Key"))
+			w.Header().Set("Location", moved+"?auth="+r.Header.Get("Authorization")+"&key="+r.Header.Get("X-Api-Key")+"&pass="+r.Header.Get("X-Pass"))
 			w.WriteHeader(http.StatusTemporaryRedirect)
 		},
 	} {
@@ -1116,13 +1118,17 @@ func TestMetrics_QuotedHeaderSentBackIsMasked(t *testing.T) {
 			require.NotEmpty(t, c.requests())
 			require.Equal(t, `Token token="`+quotedToken+`"`, c.requests()[0].header.Get("Authorization"), "precondition: the collector was sent the header")
 			require.Equal(t, `dom\`+quotedAPIKey, c.requests()[0].header.Get("X-Api-Key"))
+			require.Equal(t, `pä"`+quotedPass, c.requests()[0].header.Get("X-Pass"))
 			stopMetrics(mp, sidecarLogger(logs))
+			stopped := logRecords(t, logs, "metrics shutdown failed")
+			require.Len(t, stopped, 1)
 
-			for _, rec := range append(logRecords(t, logs, "metrics export failed"), logRecords(t, logs, "metrics shutdown failed")...) {
+			for _, rec := range append(logRecords(t, logs, "metrics export failed"), stopped...) {
 				assert.Contains(t, rec.Context["error"], "***REDACTED***")
 			}
 			assert.NotContains(t, logs.String(), quotedToken)
 			assert.NotContains(t, logs.String(), quotedAPIKey)
+			assert.NotContains(t, logs.String(), quotedPass)
 		})
 	}
 }
@@ -1136,14 +1142,15 @@ func TestCaptureStdLog_MasksAValueGoQuoted(t *testing.T) {
 	logs := &syncBuffer{}
 	captureStdLog(sidecarLogger(logs))
 
-	echoed := []byte("HTTP/1.1 400 Bad Request\r\nX-Echo: Token token=\"" + quotedToken + "\"\r\nX-Key: dom\\" + quotedAPIKey + "\r\n\r\n")
+	echoed := []byte("HTTP/1.1 400 Bad Request\r\nX-Echo: Token token=\"" + quotedToken + "\"\r\nX-Key: dom\\" + quotedAPIKey + "\r\nX-Pass: pä\"" + quotedPass + "\r\n\r\n")
 	stdlog.Printf("Unsolicited response received on idle HTTP channel starting with %q; err=%v", echoed, nil)
 
 	records := logRecords(t, logs, "go library log")
 	require.Len(t, records, 1)
-	assert.Equal(t, `Unsolicited response received on idle HTTP channel starting with "HTTP/1.1 400 Bad Request\r\nX-Echo: ***REDACTED***\r\nX-Key: ***REDACTED***\r\n\r\n"; err=<nil>`, records[0].Context["text"])
+	assert.Equal(t, `Unsolicited response received on idle HTTP channel starting with "HTTP/1.1 400 Bad Request\r\nX-Echo: ***REDACTED***\r\nX-Key: ***REDACTED***\r\nX-Pass: ***REDACTED***\r\n\r\n"; err=<nil>`, records[0].Context["text"])
 	assert.NotContains(t, logs.String(), quotedToken)
 	assert.NotContains(t, logs.String(), quotedAPIKey)
+	assert.NotContains(t, logs.String(), quotedPass)
 }
 
 // C75 (AC 52): a peer can make Go's libraries log at will, so at most 10 of
@@ -1161,4 +1168,70 @@ func TestCaptureStdLog_KeepsTenMessagesAMinute(t *testing.T) {
 	require.Len(t, records, 10)
 	assert.Equal(t, "message 0", records[0].Context["text"])
 	assert.Equal(t, "message 9", records[9].Context["text"])
+}
+
+// C69 (AC 43): a header value is masked in every spelling it can come back
+// in, each proven on a failed push. A collector that redirects with a header
+// as it received it, in any one part of the URL: Go writes the URL out again
+// for the error and escapes the path, the fragment and the userinfo each in
+// its own way; the query it keeps as received and then quotes. And a
+// collector that percent-encodes the header itself, as a query or as a path
+// segment. Each value is one that only its own case spells the way the log
+// shows it, so every spelling is needed.
+func TestMetrics_HeaderInEachSpellingIsMasked(t *testing.T) {
+	const headers = `X-Path=p/a!t"h-0123456789abcdef,X-Frag=f!r"ag-0123456789abcdef,X-User=us@e%2Cr-0123456789abcdef,` +
+		`X-Query=q"ry-0123456789abcdef,X-B64=abc+def/0123456789abcdef==,X-Seg=a%2Cb+c-0123456789abcdef`
+	closed := closedAddr(t).String()
+	redirect := func(location func(r *http.Request) string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", location(r))
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		}
+	}
+	for name, answer := range map[string]http.HandlerFunc{
+		"as received, in a redirect's path": redirect(func(r *http.Request) string {
+			return "http://" + closed + "/moved/" + r.Header.Get("X-Path")
+		}),
+		"as received, in a redirect's fragment": redirect(func(r *http.Request) string {
+			return "http://" + closed + "/moved#" + r.Header.Get("X-Frag")
+		}),
+		"as received, in a redirect's userinfo": redirect(func(r *http.Request) string {
+			return "http://" + r.Header.Get("X-User") + "@" + closed + "/moved"
+		}),
+		"as received, in a redirect's query": redirect(func(r *http.Request) string {
+			return "http://" + closed + "/moved?auth=" + r.Header.Get("X-Query")
+		}),
+		"query-escaped by the collector, in a redirect's query": redirect(func(r *http.Request) string {
+			return "http://" + closed + "/moved?auth=" + url.QueryEscape(r.Header.Get("X-B64"))
+		}),
+		"path-escaped by the collector, in a 400 body": func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "bad header "+url.PathEscape(r.Header.Get("X-Seg")), http.StatusBadRequest)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", headers)
+			c := newAnsweringCollector(t, answer)
+			mp, logs := metricsOn(t, c.url, 50*time.Millisecond, 2000)
+			meteredRelay(t, missEverything, mp)
+
+			var failed []logRecord
+			require.Eventually(t, func() bool {
+				failed = logRecords(t, logs, "metrics export failed")
+				return len(failed) > 0
+			}, 5*time.Second, 10*time.Millisecond)
+			require.NotEmpty(t, c.requests())
+			sent := c.requests()[0].header
+			require.Equal(t, `p/a!t"h-0123456789abcdef`, sent.Get("X-Path"), "precondition: the collector was sent the headers")
+			require.Equal(t, `f!r"ag-0123456789abcdef`, sent.Get("X-Frag"))
+			require.Equal(t, "us@e,r-0123456789abcdef", sent.Get("X-User"))
+			require.Equal(t, `q"ry-0123456789abcdef`, sent.Get("X-Query"))
+			require.Equal(t, "abc+def/0123456789abcdef==", sent.Get("X-B64"))
+			require.Equal(t, "a,b+c-0123456789abcdef", sent.Get("X-Seg"))
+
+			text, ok := failed[0].Context["error"].(string)
+			require.True(t, ok)
+			assert.Contains(t, text, "***REDACTED***")
+			assert.NotContains(t, logs.String(), "0123456789abcdef", "the tail all six values share")
+		})
+	}
 }
