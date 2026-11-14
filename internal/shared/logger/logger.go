@@ -74,13 +74,14 @@ func WithLevel(level slog.Leveler) Option {
 }
 
 // WithMasked makes the logger write redactedValue in place of every
-// occurrence of each of values, in a record's message and in every field
-// but its level and timestamp, whatever the field's key or type. It is for a
-// secret whose text can come back from outside the sidecar under any key,
+// occurrence of each of values, in a record's message and in the text the
+// handler writes for every field but its level and timestamp, whatever the
+// field's key (see writtenText for which text that is, per type). It is for
+// a secret whose text can come back from outside the sidecar under any key,
 // such as a credential a server repeats in the error it answers with; the
 // key match cannot catch that. Empty values are ignored. Where occurrences
-// overlap or touch, the whole run is written as one redactedValue, so no
-// part of a value is left beside it.
+// overlap, touch or lie one inside another, the whole run is written as one
+// redactedValue, so no part of a value is left beside it.
 func WithMasked(values ...string) Option {
 	return func(o *options) { o.masked = append(o.masked, values...) }
 }
@@ -158,9 +159,10 @@ func (m mask) text(s string) string {
 // renamed.
 //
 // Last, the message and every other attribute that passed have the values
-// of m masked in their text (see WithMasked). An attribute of another type
-// whose text holds one, say a number equal to an all-digit secret, is
-// written as the masked string.
+// of m masked in the text the handler writes for them (see WithMasked and
+// writtenText). An attribute that is not a string and whose text holds one,
+// say a number equal to an all-digit secret, is written as the masked
+// string.
 func (m mask) replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	if len(groups) == 0 {
 		switch a.Key {
@@ -204,6 +206,12 @@ func (m mask) attr(a slog.Attr) slog.Attr {
 // duration, a float and a time that is not what v.String returns: a duration
 // is written as its nanoseconds, a float as encoding/json formats it, a time
 // in RFC 3339.
+//
+// Three values the handler does not write as themselves: a float JSON cannot
+// encode (NaN, an infinity) and a time whose year is outside 0 to 9999, for
+// which it writes an error text of its own, and a nil, for which it writes
+// null. None of those texts carries anything of the caller's, so for them
+// writtenText may differ from the handler and nothing is masked.
 func writtenText(v slog.Value) string {
 	switch v.Kind() {
 	case slog.KindDuration:

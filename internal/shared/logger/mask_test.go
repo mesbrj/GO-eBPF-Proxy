@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -193,4 +194,68 @@ func TestMask_ReturnsTheTextAsLogged(t *testing.T) {
 	require.Equal(t, strings.Repeat("x", 20)+redactedValue+strings.Repeat("y", 20), masked)
 	assert.NotContains(t, masked[:25], maskedToken[:5], "a cut after masking holds no head of the value")
 	assert.Empty(t, masking.Mask(""))
+}
+
+// The text the mask compares is the text the handler writes, for every kind
+// of field the logger takes: the token in the JSON line, without the quotes
+// of a string.
+func TestWrittenText_IsWhatTheHandlerWrites(t *testing.T) {
+	berlin := time.FixedZone("CET", 3600)
+	for name, v := range map[string]slog.Value{
+		"string":                  slog.StringValue("plain text"),
+		"int64":                   slog.Int64Value(-9223372036854775808),
+		"uint64":                  slog.Uint64Value(18446744073709551615),
+		"bool":                    slog.BoolValue(false),
+		"float, integral":         slog.Float64Value(123456789),
+		"float, fraction":         slog.Float64Value(0.1),
+		"float, exponent":         slog.Float64Value(1e21),
+		"float, small exponent":   slog.Float64Value(1.5e-9),
+		"float, negative zero":    slog.Float64Value(-1 * 0.0),
+		"duration":                slog.DurationValue(90 * time.Minute),
+		"duration, negative":      slog.DurationValue(-12345678 * time.Nanosecond),
+		"time, UTC, nanoseconds":  slog.TimeValue(time.Date(2026, 11, 14, 2, 7, 25, 123456789, time.UTC)),
+		"time, another zone":      slog.TimeValue(time.Date(2026, 11, 14, 3, 7, 25, 120000000, berlin)),
+		"time, whole second":      slog.TimeValue(time.Date(2026, 11, 14, 2, 7, 25, 0, time.UTC)),
+		"error, through slog.Any": slog.AnyValue(errors.New("dial refused")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			New(&buf).Info("m", slog.Any("v", v))
+
+			line := buf.String()
+			_, after, found := strings.Cut(line, `"context":{"v":`)
+			require.True(t, found, "line: %s", line)
+			written := strings.Trim(strings.TrimSuffix(strings.TrimSpace(after), "}}"), `"`)
+			// What reaches the mask is the attribute as replaceAttr holds it:
+			// an opaque value already flattened by scalarAttr.
+			attr := slog.Any("v", v)
+			if attr.Value.Kind() == slog.KindAny {
+				attr = scalarAttr(attr)
+			}
+			assert.Equal(t, written, writtenText(attr.Value))
+		})
+	}
+}
+
+// Three values the handler does not write as themselves: for a float JSON
+// cannot encode and a time outside years 0 to 9999 it writes an error text
+// of its own, and for a nil it writes null. None of those texts carries
+// anything of the caller's, and a masking logger writes them as a plain one
+// does.
+func TestWithMasked_LeavesTheHandlersOwnTextsAlone(t *testing.T) {
+	attrs := []slog.Attr{
+		slog.Float64("nan", math.NaN()),
+		slog.Float64("inf", math.Inf(1)),
+		slog.Time("far", time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)),
+		slog.Any("nil", nil),
+	}
+	var plain, masking bytes.Buffer
+	New(&plain).Info("m", attrs...)
+	New(&masking, WithMasked(maskedToken)).Info("m", attrs...)
+
+	want := decode(t, &plain)["context"].(map[string]any)
+	got := decode(t, &masking)["context"].(map[string]any)
+	assert.Equal(t, want, got)
+	assert.Equal(t, "!ERROR:json: unsupported value: NaN", got["nan"])
+	assert.Nil(t, got["nil"])
 }
