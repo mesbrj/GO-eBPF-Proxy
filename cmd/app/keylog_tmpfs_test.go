@@ -49,6 +49,18 @@ func offTmpfsDir(t *testing.T) (string, string) {
 	return dir, fmt.Sprintf("0x%x", st.Type)
 }
 
+// buildSidecar builds the sidecar binary, statically linked as it ships, into
+// a fresh temp directory and returns its path.
+func buildSidecar(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "app")
+	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := build.CombinedOutput()
+	require.NoError(t, err, "build the sidecar binary: %s", out)
+	return bin
+}
+
 // runSidecar builds the sidecar binary and runs it unprivileged with
 // --keylog-path=keylogPath and every other path under a fresh temp directory,
 // then returns its exit code and stderr. env is the whole environment, so no
@@ -57,11 +69,7 @@ func offTmpfsDir(t *testing.T) (string, string) {
 func runSidecar(t *testing.T, keylogPath string, env []string, extraArgs ...string) (int, string) {
 	t.Helper()
 	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "app")
-	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build the sidecar binary: %s", out)
+	bin := buildSidecar(t)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -77,7 +85,7 @@ func runSidecar(t *testing.T, keylogPath string, env []string, extraArgs ...stri
 	cmd.Env = append([]string{}, env...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	err := cmd.Run()
 
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr, "the sidecar must exit with a status; stderr: %s", stderr.String())

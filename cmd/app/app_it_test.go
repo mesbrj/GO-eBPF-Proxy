@@ -292,61 +292,97 @@ func TestApp_StartsAndStopsWithUnreachableCollector(t *testing.T) {
 	require.NoError(t, a.Close())
 }
 
+// sidecarRun is one privileged run of the built sidecar.
+type sidecarRun struct {
+	cmd    *exec.Cmd
+	stderr *syncBuffer
+	exited chan error
+}
+
+// startSidecar builds the sidecar and starts it with every subsystem of cfg,
+// plus extraArgs, in the environment env and nothing else. A run still alive
+// when the test ends is killed.
+func startSidecar(t *testing.T, cfg Config, env []string, extraArgs ...string) *sidecarRun {
+	t.Helper()
+	args := append([]string{
+		"--cgroup-path=" + cfg.CgroupPath,
+		"--pin-dir=" + cfg.PinDir,
+		"--relay-listen=" + cfg.RelayListen,
+		"--keylog-socket=" + cfg.KeylogSocketPath,
+		"--keylog-path=" + cfg.KeylogPath,
+		"--capture-iface=" + cfg.CaptureIface,
+		"--capture-path=" + cfg.CapturePath,
+	}, extraArgs...)
+	r := &sidecarRun{stderr: &syncBuffer{}, exited: make(chan error, 1)}
+	r.cmd = exec.Command(buildSidecar(t), args...) // #nosec G204 -- the binary and every path are test-generated, not external input
+	r.cmd.Env = append([]string{}, env...)
+	r.cmd.Stderr = r.stderr
+	require.NoError(t, r.cmd.Start())
+	t.Cleanup(func() { _ = r.cmd.Process.Kill() })
+	go func() { r.exited <- r.cmd.Wait() }()
+	return r
+}
+
+// logged reports whether the sidecar's log holds text so far.
+func (r *sidecarRun) logged(text string) bool {
+	return strings.Contains(r.stderr.String(), text)
+}
+
+// waitUntil returns once ready holds, checking every poll, or without pausing
+// when poll is zero so the caller can act at the earliest moment. It skips
+// the test when the sidecar exits because the kernel refused the privileged
+// capture or attach, and fails it when the sidecar exits for any other reason
+// or ready does not hold within 20 s. what names the awaited state.
+func (r *sidecarRun) waitUntil(t *testing.T, what string, poll time.Duration, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for !ready() {
+		select {
+		case err := <-r.exited:
+			if r.logged("operation not permitted") || r.logged("permission denied") {
+				t.Skipf("privileged capture/attach not permitted: %s", r.stderr.String())
+			}
+			t.Fatalf("the sidecar exited before it %s (%v): %s", what, err, r.stderr.String())
+		default:
+		}
+		require.True(t, time.Now().Before(deadline), "the sidecar never %s: %s", what, r.stderr.String())
+		time.Sleep(poll)
+	}
+}
+
+// sigterm sends the sidecar SIGTERM, waits for it to exit and returns its
+// exit code, which is -1 when the signal itself killed the process.
+func (r *sidecarRun) sigterm(t *testing.T) int {
+	t.Helper()
+	require.NoError(t, r.cmd.Process.Signal(syscall.SIGTERM))
+	select {
+	case err := <-r.exited:
+		// A sidecar that exits non-zero, or dies of the signal, is reported
+		// through the returned code; anything else failed the wait itself.
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			t.Fatalf("wait for the sidecar: %v; stderr: %s", err, r.stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("the sidecar did not exit: %s", r.stderr.String())
+	}
+	return r.cmd.ProcessState.ExitCode()
+}
+
 // C52 (AC 36, the sidecar process's exit 0): the built sidecar, started with
 // every subsystem and a collector that is down, exits 0 on SIGTERM, and says
 // in its log that the final push failed rather than that shutdown did.
 func TestMain_SigtermExitsZeroWithUnreachableCollector(t *testing.T) {
-	cfg := itConfig(t)
-	bin := filepath.Join(t.TempDir(), "app")
-	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build the sidecar binary: %s", out)
-
-	stderr := &syncBuffer{}
-	cmd := exec.Command(bin, // #nosec G204 -- bin and every path are test-generated, not external input
-		"--cgroup-path="+cfg.CgroupPath,
-		"--pin-dir="+cfg.PinDir,
-		"--relay-listen="+cfg.RelayListen,
-		"--keylog-socket="+cfg.KeylogSocketPath,
-		"--keylog-path="+cfg.KeylogPath,
-		"--capture-iface="+cfg.CaptureIface,
-		"--capture-path="+cfg.CapturePath,
-		"--metrics-endpoint=http://"+closedAddr(t).String(),
-	)
-	cmd.Env = []string{}
-	cmd.Stderr = stderr
-	require.NoError(t, cmd.Start())
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-
-	started := func() bool { return strings.Contains(stderr.String(), "metrics export started") }
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-	deadline := time.After(20 * time.Second)
-	for !started() {
-		select {
-		case err := <-exited:
-			if strings.Contains(stderr.String(), "operation not permitted") || strings.Contains(stderr.String(), "permission denied") {
-				t.Skipf("privileged capture/attach not permitted: %s", stderr.String())
-			}
-			t.Fatalf("the sidecar exited before it started (%v): %s", err, stderr.String())
-		case <-deadline:
-			t.Fatalf("the sidecar did not start: %s", stderr.String())
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
+	run := startSidecar(t, itConfig(t), nil, "--metrics-endpoint=http://"+closedAddr(t).String())
 	// main installs its signal handler before Start, so the signal is safe to
 	// send as soon as the sidecar logs anything from inside Start.
-	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
-	select {
-	case err := <-exited:
-		require.NoError(t, err, "the sidecar must exit 0; stderr: %s", stderr.String())
-	case <-time.After(20 * time.Second):
-		t.Fatalf("the sidecar did not exit: %s", stderr.String())
-	}
-	assert.Equal(t, 0, cmd.ProcessState.ExitCode())
-	assert.Contains(t, stderr.String(), "metrics shutdown failed")
-	assert.NotContains(t, stderr.String(), "app: shutdown failed")
+	run.waitUntil(t, "started its metrics", 20*time.Millisecond, func() bool { return run.logged("metrics export started") })
+
+	code := run.sigterm(t)
+
+	assert.Equal(t, 0, code, "the sidecar must exit 0; stderr: %s", run.stderr.String())
+	assert.True(t, run.logged("metrics shutdown failed"), "stderr: %s", run.stderr.String())
+	assert.False(t, run.logged("app: shutdown failed"), "stderr: %s", run.stderr.String())
 }
 
 // C62 (PR #30 review F2): a SIGTERM that arrives while Start is still running
@@ -355,55 +391,17 @@ func TestMain_SigtermExitsZeroWithUnreachableCollector(t *testing.T) {
 // checks, long before it returns.
 func TestMain_SigtermDuringStartStillExitsZero(t *testing.T) {
 	cfg := itConfig(t)
-	bin := filepath.Join(t.TempDir(), "app")
-	build := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- bin is a test-generated temp path, not external input
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := build.CombinedOutput()
-	require.NoError(t, err, "build the sidecar binary: %s", out)
-
-	stderr := &syncBuffer{}
-	cmd := exec.Command(bin, // #nosec G204 -- bin and every path are test-generated, not external input
-		"--cgroup-path="+cfg.CgroupPath,
-		"--pin-dir="+cfg.PinDir,
-		"--relay-listen="+cfg.RelayListen,
-		"--keylog-socket="+cfg.KeylogSocketPath,
-		"--keylog-path="+cfg.KeylogPath,
-		"--capture-iface="+cfg.CaptureIface,
-		"--capture-path="+cfg.CapturePath,
-	)
-	cmd.Env = []string{}
-	cmd.Stderr = stderr
-	require.NoError(t, cmd.Start())
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-
+	run := startSidecar(t, cfg, nil)
 	pinned := filepath.Join(cfg.PinDir, "origdst_by_tuple")
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if _, err := os.Lstat(pinned); err == nil {
-			break
-		}
-		select {
-		case err := <-exited:
-			if strings.Contains(stderr.String(), "operation not permitted") || strings.Contains(stderr.String(), "permission denied") {
-				t.Skipf("privileged capture/attach not permitted: %s", stderr.String())
-			}
-			t.Fatalf("the sidecar exited before it pinned its maps (%v): %s", err, stderr.String())
-		default:
-		}
-		require.True(t, time.Now().Before(deadline), "the sidecar never pinned its maps: %s", stderr.String())
-	}
-	require.NotContains(t, stderr.String(), "capture started", "precondition: Start is still running when the signal is sent")
-	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	run.waitUntil(t, "pinned its maps", 0, func() bool {
+		_, err := os.Lstat(pinned)
+		return err == nil
+	})
+	require.False(t, run.logged("capture started"), "precondition: Start is still running when the signal is sent")
 
-	select {
-	case err := <-exited:
-		require.NoError(t, err, "the sidecar must exit 0; stderr: %s", stderr.String())
-	case <-time.After(20 * time.Second):
-		t.Fatalf("the sidecar did not exit: %s", stderr.String())
-	}
-	assert.Equal(t, 0, cmd.ProcessState.ExitCode())
-	assert.Contains(t, stderr.String(), "capture started", "Start ran to its end before the signal was acted on")
-	assert.NotContains(t, stderr.String(), "app: shutdown failed")
+	code := run.sigterm(t)
+
+	assert.Equal(t, 0, code, "the sidecar must exit 0; stderr: %s", run.stderr.String())
+	assert.True(t, run.logged("capture started"), "Start must run to its end before the signal is acted on; stderr: %s", run.stderr.String())
+	assert.False(t, run.logged("app: shutdown failed"), "stderr: %s", run.stderr.String())
 }
