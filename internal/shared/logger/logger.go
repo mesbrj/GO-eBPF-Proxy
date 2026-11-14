@@ -9,12 +9,15 @@ import (
 	"cmp"
 	"context"
 	"encoding"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // sensitiveKeys never appear in cleartext. Security requirement: the sidecar
@@ -183,17 +186,36 @@ func (m mask) replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	return m.attr(a)
 }
 
-// attr returns a with the values of m masked in its text. An attr that holds
-// none is returned as it is, keeping its type.
+// attr returns a with the values of m masked in the text the handler would
+// write for it. An attr that holds none is returned as it is, keeping its
+// type.
 func (m mask) attr(a slog.Attr) slog.Attr {
 	if len(m) == 0 {
 		return a
 	}
-	text := a.Value.String()
+	text := writtenText(a.Value)
 	if masked := m.text(text); masked != text {
 		return slog.String(a.Key, masked)
 	}
 	return a
+}
+
+// writtenText returns the text slog's JSON handler writes for v. For a
+// duration, a float and a time that is not what v.String returns: a duration
+// is written as its nanoseconds, a float as encoding/json formats it, a time
+// in RFC 3339.
+func writtenText(v slog.Value) string {
+	switch v.Kind() {
+	case slog.KindDuration:
+		return strconv.FormatInt(int64(v.Duration()), 10)
+	case slog.KindFloat64:
+		if text, err := json.Marshal(v.Float64()); err == nil {
+			return string(text)
+		}
+	case slog.KindTime:
+		return v.Time().Format(time.RFC3339Nano)
+	}
+	return v.String()
 }
 
 // scalarAttr rewrites an opaque attr as a single string, number or bool, or

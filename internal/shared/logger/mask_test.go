@@ -48,31 +48,84 @@ func TestWithMasked_MasksEveryOccurrence(t *testing.T) {
 	assert.Equal(t, "93.184.216.34:443", ctx["orig_dst"])
 }
 
-// Where occurrences of two values overlap or touch, the whole run is masked:
-// masking the first must not leave the tail of the second beside it.
+// Where occurrences overlap, touch or lie one inside another, the whole run
+// is masked: masking one occurrence must never leave part of another beside
+// it, in whichever order the values were given.
 func TestWithMasked_OverlappingOccurrencesLeaveNoPart(t *testing.T) {
-	for name, tc := range map[string]struct{ text, want string }{
-		"second value overlaps the first": {"<AAAABBBBCCCCDDDD>", "<" + redactedValue + ">"},
-		"first value overlaps the second": {"<BBBBCCCCDDDD> and <AAAABBBBCCCC>", "<" + redactedValue + "> and <" + redactedValue + ">"},
-		"touching":                        {"<AAAABBBBCCCCBBBBCCCCDDDD>", "<" + redactedValue + ">"},
-		"a value overlapping itself":      {"<AAAABBBBCCCCAAAABBBBCCCC>", "<" + redactedValue + ">"},
-		"apart":                           {"AAAABBBBCCCC-BBBBCCCCDDDD", redactedValue + "-" + redactedValue},
-		"a part alone is not a value":     {"<AAAABBBB>", "<AAAABBBB>"},
+	for name, tc := range map[string]struct {
+		values     []string
+		text, want string
+	}{
+		"the second value starts inside the first": {
+			[]string{"AAAABBBBCCCC", "BBBBCCCCDDDD"}, "<AAAABBBBCCCCDDDD>", "<" + redactedValue + ">",
+		},
+		"the same, with the values given in the other order": {
+			[]string{"BBBBCCCCDDDD", "AAAABBBBCCCC"}, "<AAAABBBBCCCCDDDD>", "<" + redactedValue + ">",
+		},
+		"touching": {
+			[]string{"AAAABBBBCCCC", "BBBBCCCCDDDD"}, "<AAAABBBBCCCCBBBBCCCCDDDD>", "<" + redactedValue + ">",
+		},
+		"a value that overlaps its own next occurrence": {
+			[]string{"XYXYXYXY"}, "<XYXYXYXYXY>", "<" + redactedValue + ">",
+		},
+		"one value inside another, at its start": {
+			[]string{"tenant-0123456789abcdef-secretpart", "tenant-0123456789abcdef"}, "<tenant-0123456789abcdef-secretpart>", "<" + redactedValue + ">",
+		},
+		"one value inside another, in its middle": {
+			[]string{"OUTER-inner-value-TAIL", "inner-value"}, "<OUTER-inner-value-TAIL>", "<" + redactedValue + ">",
+		},
+		"one value inside another, at its end": {
+			[]string{"Bearer tok-0123456789", "tok-0123456789"}, "<Bearer tok-0123456789>", "<" + redactedValue + ">",
+		},
+		"the inner value given first": {
+			[]string{"inner-value", "OUTER-inner-value-TAIL"}, "<OUTER-inner-value-TAIL>", "<" + redactedValue + ">",
+		},
+		"apart": {
+			[]string{"AAAABBBBCCCC", "BBBBCCCCDDDD"}, "AAAABBBBCCCC-BBBBCCCCDDDD", redactedValue + "-" + redactedValue,
+		},
+		"a part of a value alone is not a value": {
+			[]string{"AAAABBBBCCCC", "BBBBCCCCDDDD"}, "<AAAABBBB>", "<AAAABBBB>",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
-			New(&buf, WithMasked("AAAABBBBCCCC", "BBBBCCCCDDDD", "XYXYXYXY")).Info("m", slog.String("v", tc.text))
+			New(&buf, WithMasked(tc.values...)).Info("m", slog.String("v", tc.text))
 
 			assert.Equal(t, tc.want, decode(t, &buf)["context"].(map[string]any)["v"])
 		})
 	}
+}
 
-	t.Run("a value that overlaps its own next occurrence", func(t *testing.T) {
-		var buf bytes.Buffer
-		New(&buf, WithMasked("XYXYXYXY")).Info("m", slog.String("v", "<XYXYXYXYXY>"))
+// A field of any type is masked in the text the handler writes for it: a
+// duration is written as nanoseconds, a float as JSON formats it, a time in
+// RFC 3339. A field that holds no value keeps its type.
+func TestWithMasked_MasksEveryFieldKindAsWritten(t *testing.T) {
+	at := time.Date(2026, 11, 14, 2, 7, 25, 123456789, time.UTC)
+	var buf bytes.Buffer
+	New(&buf, WithMasked("12345678", "07:25.123456789", "true-ish")).Info("m",
+		slog.Int64("int", 12345678),
+		slog.Uint64("uint", 9912345678),
+		slog.Float64("float", 123456789),
+		slog.Duration("duration", 12345678*time.Nanosecond),
+		slog.Time("time", at),
+		slog.Bool("bool", true),
+		slog.Float64("other_float", 1.5),
+		slog.Duration("other_duration", 5*time.Second),
+		slog.Time("other_time", at.Add(time.Hour).Truncate(time.Second)),
+	)
 
-		assert.Equal(t, "<"+redactedValue+">", decode(t, &buf)["context"].(map[string]any)["v"])
-	})
+	assert.NotContains(t, buf.String(), "12345678")
+	assert.NotContains(t, buf.String(), "07:25.123456789")
+	ctx := decode(t, &buf)["context"].(map[string]any)
+	assert.Equal(t, redactedValue, ctx["int"])
+	assert.Equal(t, "99"+redactedValue, ctx["uint"])
+	assert.Equal(t, redactedValue+"9", ctx["float"])
+	assert.Equal(t, redactedValue, ctx["duration"])
+	assert.Equal(t, "2026-11-14T02:"+redactedValue+"Z", ctx["time"])
+	assert.Equal(t, true, ctx["bool"])
+	assert.InDelta(t, 1.5, ctx["other_float"], 0)
+	assert.InDelta(t, 5e9, ctx["other_duration"], 0)
+	assert.Equal(t, "2026-11-14T03:07:25Z", ctx["other_time"])
 }
 
 // An empty value occurs everywhere, so it is ignored instead of masking the
