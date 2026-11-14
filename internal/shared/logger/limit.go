@@ -13,7 +13,7 @@ import (
 // record is gone, and drops at the end of a burst are reported only once
 // another record is kept.
 func (l *Logger) Limited(interval time.Duration, burst int) *Logger {
-	return &Logger{inner: l.inner, limit: &limiter{interval: interval, burst: burst, now: time.Now}}
+	return &Logger{inner: l.inner, mask: l.mask, limit: &limiter{interval: interval, burst: burst, now: time.Now}}
 }
 
 // limiter admits at most burst records per fixed window of interval.

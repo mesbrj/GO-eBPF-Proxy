@@ -1,10 +1,12 @@
 // Package logger provides the sidecar's structured JSON logger. It emits
 // operator-facing telemetry only and redacts known secret-bearing fields so
-// TLS key material and decrypted plaintext can never leak into logs.
+// TLS key material and decrypted plaintext can never leak into logs. It also
+// masks, wherever they occur, the values it is told are secret (WithMasked).
 package logger
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 )
 
 // sensitiveKeys never appear in cleartext. Security requirement: the sidecar
@@ -45,16 +48,20 @@ const unloggableValue = "***UNLOGGABLE***"
 // is logged only as a single string, number or bool; anything else is masked
 // with unloggableValue. A type logged as several fields implements
 // slog.LogValuer, which slog resolves into attrs the key match does see.
+//
+// Masking matches text instead: see WithMasked.
 type Logger struct {
 	inner *slog.Logger
 	limit *limiter // nil unless built by Limited
+	mask  mask     // empty unless built WithMasked
 }
 
 // Option configures a Logger built by New.
 type Option func(*options)
 
 type options struct {
-	level slog.Leveler
+	level  slog.Leveler
+	masked []string
 }
 
 // WithLevel sets the minimum level logged; records below it are dropped.
@@ -63,14 +70,78 @@ func WithLevel(level slog.Leveler) Option {
 	return func(o *options) { o.level = level }
 }
 
+// WithMasked makes the logger write redactedValue in place of every
+// occurrence of each of values, in a record's message and in every field
+// but its level and timestamp, whatever the field's key or type. It is for a
+// secret whose text can come back from outside the sidecar under any key,
+// such as a credential a server repeats in the error it answers with; the
+// key match cannot catch that. Empty values are ignored. Where occurrences
+// overlap or touch, the whole run is written as one redactedValue, so no
+// part of a value is left beside it.
+func WithMasked(values ...string) Option {
+	return func(o *options) { o.masked = append(o.masked, values...) }
+}
+
 // New returns a Logger writing JSON records to w.
 func New(w io.Writer, opts ...Option) *Logger {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: o.level, ReplaceAttr: replaceAttr})
-	return &Logger{inner: slog.New(h)}
+	m := newMask(o.masked)
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: o.level, ReplaceAttr: m.replaceAttr})
+	return &Logger{inner: slog.New(h), mask: m}
+}
+
+// Mask returns s as the logger would write it, with every masked value
+// replaced. A caller that shortens a text before logging it masks it first,
+// so the cut cannot leave the head of a masked value behind.
+func (l *Logger) Mask(s string) string {
+	return l.mask.text(s)
+}
+
+// mask is the set of values a Logger never writes (see WithMasked).
+type mask []string
+
+// newMask returns the mask of values, without the empty ones: an empty value
+// occurs everywhere.
+func newMask(values []string) mask {
+	return slices.DeleteFunc(slices.Clone(values), func(v string) bool { return v == "" })
+}
+
+// text returns s with each run of bytes that belong to an occurrence of a
+// masked value replaced by one redactedValue.
+func (m mask) text(s string) string {
+	var spans [][2]int // [start, end) of every occurrence, overlapping ones included
+	for _, v := range m {
+		for from := 0; ; from++ {
+			i := strings.Index(s[from:], v)
+			if i < 0 {
+				break
+			}
+			from += i
+			spans = append(spans, [2]int{from, from + len(v)})
+		}
+	}
+	if len(spans) == 0 {
+		return s
+	}
+	slices.SortFunc(spans, func(a, b [2]int) int { return cmp.Compare(a[0], b[0]) })
+	var b strings.Builder
+	written, run := 0, spans[0] // s[:written] is written; run is the run being grown
+	for _, span := range spans[1:] {
+		if span[0] <= run[1] {
+			run[1] = max(run[1], span[1])
+			continue
+		}
+		b.WriteString(s[written:run[0]])
+		b.WriteString(redactedValue)
+		written, run = run[1], span
+	}
+	b.WriteString(s[written:run[0]])
+	b.WriteString(redactedValue)
+	b.WriteString(s[run[1]:])
+	return b.String()
 }
 
 // replaceAttr renames slog's built-in time and message keys to the sidecar's
@@ -82,7 +153,12 @@ func New(w io.Writer, opts ...Option) *Logger {
 // nested in groups, after resolving LogValuers. The built-ins are matched
 // only at the top level, so a caller attr named "time" or "msg" is never
 // renamed.
-func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+//
+// Last, the message and every other attribute that passed have the values
+// of m masked in their text (see WithMasked). An attribute of another type
+// whose text holds one, say a number equal to an all-digit secret, is
+// written as the masked string.
+func (m mask) replaceAttr(groups []string, a slog.Attr) slog.Attr {
 	if len(groups) == 0 {
 		switch a.Key {
 		case slog.TimeKey:
@@ -93,7 +169,7 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 			return a
 		case slog.MessageKey:
 			a.Key = "message"
-			return a
+			return m.attr(a)
 		case slog.LevelKey, slog.SourceKey:
 			return a
 		}
@@ -102,7 +178,20 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 		return slog.String(a.Key, redactedValue)
 	}
 	if a.Value.Kind() == slog.KindAny {
-		return scalarAttr(a)
+		a = scalarAttr(a)
+	}
+	return m.attr(a)
+}
+
+// attr returns a with the values of m masked in its text. An attr that holds
+// none is returned as it is, keeping its type.
+func (m mask) attr(a slog.Attr) slog.Attr {
+	if len(m) == 0 {
+		return a
+	}
+	text := a.Value.String()
+	if masked := m.text(text); masked != text {
+		return slog.String(a.Key, masked)
 	}
 	return a
 }
