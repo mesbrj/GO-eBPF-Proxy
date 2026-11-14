@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -71,7 +72,9 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 		resource.WithAttributes(attribute.String("service.name", serviceName)),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("metrics resource: %w", err)
+		// The only fallible source is the environment, and its error quotes
+		// the entry it could not parse.
+		return nil, errors.New("metrics resource: OTEL_RESOURCE_ATTRIBUTES or OTEL_SERVICE_NAME does not parse")
 	}
 
 	mp := sdkmetric.NewMeterProvider(
@@ -92,9 +95,11 @@ func startMetrics(cfg Config, log *logger.Logger) (*sdkmetric.MeterProvider, err
 }
 
 // sdkLogSink carries the OpenTelemetry SDK's own error diagnostics into the
-// sidecar's log as WARN lines, with the SDK's message and error only. It
-// drops the key/value pairs, where the SDK puts the input it was handling,
-// and every informational message.
+// sidecar's log as WARN lines holding the SDK's message alone, a constant
+// such as "parse url". It drops the error and the key/value pairs: the SDK
+// puts the input it was handling in both, and that input can be a credential
+// (an endpoint variable that does not parse is quoted whole in its error).
+// Informational messages are dropped too.
 type sdkLogSink struct{ log *logger.Logger }
 
 func (sdkLogSink) Init(logr.RuntimeInfo)            {}
@@ -102,12 +107,8 @@ func (sdkLogSink) Enabled(int) bool                 { return false }
 func (sdkLogSink) Info(int, string, ...any)         {}
 func (s sdkLogSink) WithValues(...any) logr.LogSink { return s }
 func (s sdkLogSink) WithName(string) logr.LogSink   { return s }
-func (s sdkLogSink) Error(err error, msg string, _ ...any) {
-	attrs := []slog.Attr{slog.String("sdk_message", msg)}
-	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
-	}
-	s.log.Warn("metrics sdk error", attrs...)
+func (s sdkLogSink) Error(_ error, msg string, _ ...any) {
+	s.log.Warn("metrics sdk error", slog.String("sdk_message", msg))
 }
 
 // metricsTemporality exports what only grows as deltas, so each push carries

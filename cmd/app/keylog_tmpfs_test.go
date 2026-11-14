@@ -240,6 +240,11 @@ func TestMain_MetricsSecretsAreRefusedAndNeverPrinted(t *testing.T) {
 			env:   []string{"OTEL_EXPORTER_OTLP_HEADERS=Authorization: Bearer XSECRET"},
 			names: "OTEL_EXPORTER_OTLP_HEADERS",
 		},
+		"malformed metrics header variable": {
+			flag:  "--metrics-endpoint=http://collector:4318",
+			env:   []string{"OTEL_EXPORTER_OTLP_METRICS_HEADERS=Authorization: Bearer XSECRET"},
+			names: "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code, stderr := runSidecar(t, filepath.Join(shmDir(t), "sslkeylog.log"), tc.env, tc.flag)

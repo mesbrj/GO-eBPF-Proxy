@@ -286,6 +286,9 @@ destination.
 - The push is best effort. A collector that is down never affects the relay or the exit code: each
   failed push is a WARN `metrics export failed` line (at most 10 a minute), and the final push at
   shutdown is abandoned after 5 seconds.
+- A problem the OpenTelemetry SDK reports with its own settings, such as an `OTEL_EXPORTER_OTLP_*`
+  variable it cannot parse, is a WARN `metrics sdk error` line. It carries the SDK's message
+  only, for example `parse url`, and never the value the SDK was reading.
 - The sidecar's own export requests are captured, and count toward `--max-bytes`, when the collector is reached over `--capture-iface`. A collector reached over loopback is not captured.
 - With metrics on, the relay copies bytes through user space to count them, instead of the
   kernel's `splice(2)` path it uses otherwise.
